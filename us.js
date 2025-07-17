@@ -1620,24 +1620,19 @@ function _populateAttachmentDivWithMedia(
 
     if (['.jpg', '.jpeg', '.png', '.gif'].includes(extLower)) {
         // --- IMAGE LOGIC ---
-        // Unified image logic (derived from New Design's more feature-rich version)
-        let defaultToThumbnail;
-        let isFirstFullSizeRender = !renderedFullSizeImageHashes.has(filehash);
+        const originalWidth = message.attachment.w;
+        const originalHeight = message.attachment.h;
+        const displayWidth = message.attachment.tn_w;
+        const displayHeight = message.attachment.tn_h;
 
-        if (layoutStyle === 'new_design') {
-            if (isTopLevelMessage) {
-                defaultToThumbnail = !isFirstFullSizeRender;
-            } else { // Quoted message in New Design
-                defaultToThumbnail = true;
-            }
-            if (isFirstFullSizeRender && isTopLevelMessage) { // Only add to set if it's going to be shown full size initially for top-level new design
-                renderedFullSizeImageHashes.add(filehash);
-            }
-        } else { // Default layout image logic
-            defaultToThumbnail = !isFirstFullSizeRender; // Show full if first time this hash is rendered full-size, else thumb.
-            if (isFirstFullSizeRender) {
-                 renderedFullSizeImageHashes.add(filehash); // Track for default layout as well
-            }
+        let defaultToThumbnail;
+
+        // Rule 1: Always display full-size if under certain dimensions
+        if ((originalWidth <= 570 && originalHeight <= 730) || (originalWidth <= 2050 && originalHeight <= 530)) {
+            defaultToThumbnail = false;
+        } else {
+            // Rule 2: For all other instances, start with the thumbnail
+            defaultToThumbnail = true;
         }
 
         const img = document.createElement('img');
@@ -1649,21 +1644,20 @@ function _populateAttachmentDivWithMedia(
         img.style.display = 'block';
         img.style.borderRadius = '3px';
 
-        const webFullSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
-        const webThumbSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}s.jpg`;
+        let webFullSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
+        let webThumbSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}s.jpg`;
         img.dataset.fullSrc = webFullSrc;
         img.dataset.thumbSrc = webThumbSrc;
 
         const setImageProperties = () => {
             if (img.dataset.isThumbnail === 'true') {
                 img.src = img.dataset.thumbSrc;
-                img.style.width = img.dataset.thumbWidth + 'px';
-                img.style.height = img.dataset.thumbHeight + 'px';
+                img.style.width = message.attachment.tn_w + 'px';
+                img.style.height = message.attachment.tn_h + 'px';
                 img.style.maxWidth = ''; img.style.maxHeight = '';
             } else {
                 img.src = img.dataset.fullSrc;
-                img.style.maxWidth = '100%';
-                // Max height slightly different based on context in original code
+                img.style.maxWidth = '85%';
                 img.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '350px'; // Adjusted quoted default slightly
                 img.style.width = 'auto'; img.style.height = 'auto';
             }
@@ -1674,17 +1668,14 @@ function _populateAttachmentDivWithMedia(
             const currentlyThumbnail = img.dataset.isThumbnail === 'true';
             if (currentlyThumbnail) {
                 img.src = img.dataset.fullSrc;
-                img.style.maxWidth = '100%';
+                img.style.maxWidth = '85%';
                 img.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '350px';
                 img.style.width = 'auto'; img.style.height = 'auto';
                 img.dataset.isThumbnail = 'false';
-                if (!renderedFullSizeImageHashes.has(filehash)) {
-                    renderedFullSizeImageHashes.add(filehash);
-                }
             } else {
                 img.src = img.dataset.thumbSrc;
-                img.style.width = img.dataset.thumbWidth + 'px';
-                img.style.height = img.dataset.thumbHeight + 'px';
+                img.style.width = message.attachment.tn_w + 'px';
+                img.style.height = message.attachment.tn_h + 'px';
                 img.style.maxWidth = ''; img.style.maxHeight = '';
                 img.dataset.isThumbnail = 'true';
             }
@@ -1698,15 +1689,21 @@ function _populateAttachmentDivWithMedia(
                 request.onsuccess = (event) => {
                     const storedItem = event.target.result;
                     if (storedItem && storedItem.blob && !storedItem.isThumbnail) {
-                        blobToDataURL(storedItem.blob)
-                            .then(dataURL => {
-                                img.dataset.fullSrc = dataURL;
-                                if (img.dataset.isThumbnail === 'false') img.src = dataURL;
-                                uniqueImageViewerHashes.add(filehash); resolveMedia();
-                            }).catch(err => { consoleError(`Error converting full blob for ${filehash}: ${err}`); uniqueImageViewerHashes.add(filehash); resolveMedia(); });
-                    } else { uniqueImageViewerHashes.add(filehash); resolveMedia(); }
+                        const dataURL = URL.createObjectURL(storedItem.blob);
+                        img.dataset.fullSrc = dataURL;
+                        if (img.dataset.isThumbnail === 'false') img.src = dataURL;
+                        uniqueImageViewerHashes.add(filehash);
+                        resolveMedia();
+                    } else {
+                        uniqueImageViewerHashes.add(filehash);
+                        resolveMedia();
+                    }
                 };
-                request.onerror = (event) => { consoleError(`Error fetching full image ${filehash} from IDB: ${event.target.error}`); uniqueImageViewerHashes.add(filehash); resolveMedia(); };
+                request.onerror = (event) => {
+                    consoleError(`Error fetching full image ${filehash} from IDB: ${event.target.error}`);
+                    uniqueImageViewerHashes.add(filehash);
+                    resolveMedia();
+                };
             }));
         } else {
             uniqueImageViewerHashes.add(filehash);
@@ -1720,15 +1717,18 @@ function _populateAttachmentDivWithMedia(
                 request.onsuccess = (event) => {
                     const storedItem = event.target.result;
                     if (storedItem && storedItem.blob && storedItem.isThumbnail) {
-                        blobToDataURL(storedItem.blob)
-                            .then(dataURL => {
-                                img.dataset.thumbSrc = dataURL;
-                                if (img.dataset.isThumbnail === 'true') img.src = dataURL;
-                                resolveMedia();
-                            }).catch(err => { consoleError(`Error converting thumb blob for ${filehash}: ${err}`); resolveMedia(); });
-                    } else { resolveMedia(); }
+                        const dataURL = URL.createObjectURL(storedItem.blob);
+                        img.dataset.thumbSrc = dataURL;
+                        if (img.dataset.isThumbnail === 'true') img.src = dataURL;
+                        resolveMedia();
+                    } else {
+                        resolveMedia();
+                    }
                 };
-                request.onerror = (event) => { consoleError(`Error fetching thumb ${filehash} from IDB: ${event.target.error}`); resolveMedia(); };
+                request.onerror = (event) => {
+                    consoleError(`Error fetching thumb ${filehash} from IDB: ${event.target.error}`);
+                    resolveMedia();
+                };
             }));
         }
         attachmentDiv.appendChild(img);
@@ -1744,7 +1744,7 @@ function _populateAttachmentDivWithMedia(
                 videoElement.src = src || `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`; // Ensure ext has a dot
             }
             videoElement.controls = true;
-            videoElement.style.maxWidth = '100%';
+            videoElement.style.maxWidth = '85%';
             videoElement.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '300px';
             videoElement.style.borderRadius = '3px';
             videoElement.style.display = 'block';
@@ -3084,7 +3084,9 @@ function _populateAttachmentDivWithMedia(
                         fsize: post.fsize,
                         md5: post.md5, // Original MD5 from API
                         filehash_db_key: filehash_db_key, // The key used for IndexedDB
-                        localStoreId: null // Will be set to filehash_db_key if stored
+                        localStoreId: null, // Will be set to filehash_db_key if stored
+                        tn_w: post.tn_w,
+                        tn_h: post.tn_h
                     };
 
                     // Check if media is already in IndexedDB
@@ -3544,11 +3546,79 @@ function _populateAttachmentDivWithMedia(
             updateLoadingProgress(95, "Finalizing data and updating display...");
             renderThreadList();
             window.dispatchEvent(new CustomEvent('otkMessagesUpdated'));
+
+        let viewerIsOpen = otkViewer && otkViewer.style.display === 'block';
+
+        if (!viewerIsOpen) {
+            consoleLog('[Manual Refresh] Viewer is closed. Resynchronizing display snapshot with ground truth.');
+            // This is the key fix: Resync the "Display Snapshot" sets with the "Ground Truth"
+            // when a manual refresh is performed with the viewer closed.
+
+            // 1. Recalculate the "Ground Truth" from all stored messages.
+            const allMessages = getAllMessagesSorted();
+
+            // 2. Clear the "Display Snapshot" sets.
+            renderedMessageIdsInViewer.clear();
+            uniqueImageViewerHashes.clear();
+            viewerTopLevelAttachedVideoHashes.clear();
+            viewerTopLevelEmbedIds.clear();
+
+            // 3. Repopulate the "Display Snapshot" sets with the "Ground Truth".
+            allMessages.forEach(message => {
+                renderedMessageIdsInViewer.add(message.id);
+                if (message.attachment) {
+                    const filehash = message.attachment.filehash_db_key || `${message.attachment.tim}${message.attachment.ext}`;
+                    const extLower = message.attachment.ext.toLowerCase();
+                    if (['.jpg', '.jpeg', '.png', '.gif'].includes(extLower)) {
+                        uniqueImageViewerHashes.add(filehash);
+                    } else if (['.webm', '.mp4'].includes(extLower)) {
+                        viewerTopLevelAttachedVideoHashes.add(filehash);
+                    }
+                }
+                // This logic DOES now account for embeds in the text, which is a massive improvement
+                // and aligns with the primary goal of syncing the main stats.
+                if (message.text) {
+                    const inlineYoutubePatterns = [
+                        { type: 'watch', regex: /(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?(?:[^#&?\s]*&)*v=([a-zA-Z0-9_-]+)/g },
+                        { type: 'short', regex: /(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]+)/g },
+                        { type: 'youtu.be', regex: /(?:https?:\/\/)?youtu\.be\/([a-zA-Z0-9_-]+)/g }
+                    ];
+                    const inlineTwitchPatterns = [
+                         { type: 'clip_direct', regex: /(?:https?:\/\/)?clips\.twitch\.tv\/([a-zA-Z0-9_-]+)/g },
+                         { type: 'clip_channel', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/[a-zA-Z0-9_]+\/clip\/([a-zA-Z0-9_-]+)/g },
+                         { type: 'vod', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/videos\/(\d+)/g }
+                    ];
+                    const inlineStreamablePatterns = [
+                        { type: 'video', regex: /(?:https?:\/\/)?streamable\.com\/([a-zA-Z0-9]+)/g }
+                    ];
+
+                    const allPatterns = [...inlineYoutubePatterns, ...inlineTwitchPatterns, ...inlineStreamablePatterns];
+                    allPatterns.forEach(patternInfo => {
+                        let match;
+                        while ((match = patternInfo.regex.exec(message.text)) !== null) {
+                            const id = match[1];
+                            if (id) {
+                                let canonicalEmbedId;
+                                if (patternInfo.type.startsWith('watch') || patternInfo.type.startsWith('short') || patternInfo.type.startsWith('youtu.be')) {
+                                    canonicalEmbedId = `youtube_${id}`;
+                                } else if (patternInfo.type.startsWith('clip') || patternInfo.type.startsWith('vod')) {
+                                     canonicalEmbedId = `twitch_${patternInfo.type}_${id}`;
+                                } else {
+                                    canonicalEmbedId = `streamable_${id}`;
+                                }
+                                viewerTopLevelEmbedIds.add(canonicalEmbedId);
+                            }
+                        }
+                    });
+                }
+            });
+             consoleLog(`[Manual Refresh] Resync complete. Snapshot counts: ${renderedMessageIdsInViewer.size} msgs, ${uniqueImageViewerHashes.size} imgs, ${viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size} videos.`);
+        }
+
             updateDisplayedStatistics();
 
             // New logic for incremental append or full render
             const messagesContainer = document.getElementById('otk-messages-container'); // Still needed to check if viewer is open and has container
-            let viewerIsOpen = otkViewer && otkViewer.style.display === 'block';
 
             // Scroll position logic is removed from here for append.
             // toggleViewer handles scroll restoration for open/close.
@@ -4089,7 +4159,7 @@ function processTweetEmbed(embedContainer) {
         if (tweetCache[cacheKey]) {
             embedContainer.innerHTML = tweetCache[cacheKey];
             if (window.twttr && window.twttr.widgets) {
-                window.twttr.widgets.load(embedContainer);
+                window.twttr.widgets.load();
             }
             embedContainer.dataset.processed = 'true';
             return;
