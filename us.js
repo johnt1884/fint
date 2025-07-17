@@ -482,72 +482,22 @@ function createTweetEmbedElement(tweetId) {
         return disabledSpan;
     }
 
-    const cacheKey = `${tweetId}-${embedMode}`;
     const embedContainer = document.createElement('div');
-    embedContainer.className = 'otk-tweet-embed';
+    embedContainer.className = 'otk-tweet-embed-wrapper'; // New wrapper class for the observer
+    embedContainer.dataset.tweetId = tweetId; // Store tweetId for the observer
     embedContainer.style.display = 'inline-block';
-    embedContainer.style.minHeight = '100px';
+    embedContainer.style.minHeight = '100px'; // Placeholder height
 
-    const processTweet = () => {
-        if (tweetCache[cacheKey]) {
-            embedContainer.innerHTML = tweetCache[cacheKey];
-            if (window.twttr && window.twttr.widgets) {
-                window.twttr.widgets.load(embedContainer);
-            }
-            return;
-        }
+    // The IntersectionObserver will now be responsible for calling a function to process the tweet.
+    // We no longer call processTweet directly from here.
+    // The logic from processTweet will be moved into a new function or integrated into the observer's callback.
 
-        const embedUrl = `https://publish.x.com/oembed?url=https://twitter.com/any/status/${tweetId}&theme=${embedMode}&omit_script=true`;
-        GM_xmlhttpRequest({
-            method: "GET",
-            url: embedUrl,
-            onload: function(response) {
-                try {
-                    const data = JSON.parse(response.responseText);
-                    if (data.html) {
-                        tweetCache[cacheKey] = data.html;
-                        localStorage.setItem('otk-tweet-cache', JSON.stringify(tweetCache));
-embedContainer.innerHTML = data.html;
-
-// Defer widget loading until it's visible in DOM
-requestAnimationFrame(() => {
-    if (document.body.contains(embedContainer)) {
-        if (window.twttr && window.twttr.widgets) {
-            window.twttr.widgets.load(embedContainer);
-        }
+    if (mediaIntersectionObserver) {
+        mediaIntersectionObserver.observe(embedContainer);
     } else {
-        // Retry once more after slight delay
-        setTimeout(() => {
-            if (document.body.contains(embedContainer)) {
-                window.twttr.widgets.load(embedContainer);
-            }
-        }, 300);
-    }
-});
-                    } else {
-                        embedContainer.textContent = "[Tweet not found]";
-                    }
-                } catch (e) {
-                    embedContainer.textContent = "[Tweet parse error]";
-                    console.error("Error parsing tweet embed JSON", e);
-                }
-            },
-            onerror: function(err) {
-                embedContainer.textContent = "[Tweet fetch error]";
-                console.error("Error loading tweet embed:", err);
-            }
-        });
-    };
-
-    if (window.twttr && window.twttr.widgets) {
-        processTweet();
-    } else {
-        const script = document.createElement("script");
-        script.src = "https://platform.twitter.com/widgets.js";
-        script.onload = () => {
-            processTweet();
-        };
-        document.head.appendChild(script);
+        // Fallback or error, though the observer should be ready.
+        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready for Tweet. Tweet will not load.", tweetId);
+        embedContainer.textContent = "[Lazy load error - Tweet not loaded]";
     }
 
     return embedContainer;
@@ -1553,7 +1503,7 @@ requestAnimationFrame(() => {
             const messageElement = createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, true, 0, threadColor, null); // Top-level messages have no parent
             if (messageElement) {
                 messagesContainer.appendChild(messageElement);
-                const wrappers = messageElement.querySelectorAll('.otk-youtube-embed-wrapper, .otk-twitch-embed-wrapper, .otk-streamable-embed-wrapper, .twitter-tweet');
+                const wrappers = messageElement.querySelectorAll('.otk-youtube-embed-wrapper, .otk-twitch-embed-wrapper, .otk-streamable-embed-wrapper, .otk-tweet-embed-wrapper');
                 wrappers.forEach(wrapper => embedWrappers.push(wrapper));
             }
 
@@ -4126,66 +4076,102 @@ function _populateAttachmentDivWithMedia(
         }
     }
 
+function processTweetEmbed(embedContainer) {
+    const tweetId = embedContainer.dataset.tweetId;
+    if (!tweetId || embedContainer.dataset.processed === 'true') {
+        return; // Don't process if no ID or already processed
+    }
+
+    const embedMode = localStorage.getItem('otk-tweet-embed-mode') || 'default';
+    const cacheKey = `${tweetId}-${embedMode}`;
+
+    const processTweet = () => {
+        if (tweetCache[cacheKey]) {
+            embedContainer.innerHTML = tweetCache[cacheKey];
+            if (window.twttr && window.twttr.widgets) {
+                window.twttr.widgets.load(embedContainer);
+            }
+            embedContainer.dataset.processed = 'true';
+            return;
+        }
+
+        const embedUrl = `https://publish.x.com/oembed?url=https://twitter.com/any/status/${tweetId}&theme=${embedMode}&omit_script=true`;
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: embedUrl,
+            onload: function(response) {
+                try {
+                    const data = JSON.parse(response.responseText);
+                    if (data.html) {
+                        tweetCache[cacheKey] = data.html;
+                        localStorage.setItem('otk-tweet-cache', JSON.stringify(tweetCache));
+                        embedContainer.innerHTML = data.html;
+                        if (window.twttr && window.twttr.widgets) {
+                            window.twttr.widgets.load(embedContainer);
+                        }
+                    } else {
+                        embedContainer.textContent = "[Tweet not found]";
+                    }
+                } catch (e) {
+                    embedContainer.textContent = "[Tweet parse error]";
+                    console.error("Error parsing tweet embed JSON", e);
+                }
+                embedContainer.dataset.processed = 'true';
+            },
+            onerror: function(err) {
+                embedContainer.textContent = "[Tweet fetch error]";
+                console.error("Error loading tweet embed:", err);
+                embedContainer.dataset.processed = 'true';
+            }
+        });
+    };
+
+    if (window.twttr && window.twttr.widgets) {
+        processTweet();
+    } else {
+        const script = document.createElement("script");
+        script.src = "https://platform.twitter.com/widgets.js";
+        script.onload = () => {
+            processTweet();
+        };
+        document.head.appendChild(script);
+    }
+}
+
 // --- IIFE Scope Helper for Intersection Observer ---
 function handleIntersection(entries, observerInstance) {
     entries.forEach(entry => {
-        // The outer if (entry.isIntersecting) was removed in the previous correction,
-        // which was good. The issue is the double declaration.
-        // The structure should be:
-        // entries.forEach(entry => {
-        //    const wrapper = entry.target;
-        //    const iframe = wrapper.querySelector('iframe'); // Declared ONCE
-        //    if (iframe) {
-        //        if (entry.isIntersecting) { ... } else { ... }
-        //    }
-        // });
-        // The file content provided in the last read_files shows this structure:
-        // function handleIntersection(entries, observerInstance) {
-        //    entries.forEach(entry => {
-        //        if (entry.isIntersecting) { // This 'if' is from my analysis, not the actual code block that had the error.
-        //            const wrapper = entry.target;
-        //            const iframe = wrapper.querySelector('iframe'); // Second - THIS IS THE ERROR
-        //
-        //            if (iframe) { ...
-        // Let's correct based on the actual problematic code block.
-        // The `if (entry.isIntersecting)` was part of my *description* of the error location,
-        // not necessarily the code structure itself that contained the double declaration.
-        // The actual error is simpler: two `const iframe` lines back-to-back.
+        const wrapper = entry.target;
+        const iframe = wrapper.querySelector('iframe');
 
-            const wrapper = entry.target;
-            const iframe = wrapper.querySelector('iframe'); // Keep this one
-
-            // const iframe = wrapper.querySelector('iframe'); // REMOVE THIS REDECLARATION
-
-            if (iframe) { // Ensure iframe exists
-                if (entry.isIntersecting) {
-                    // Element is now visible
-                    if (iframe.dataset.src && (!iframe.src || iframe.src === 'about:blank')) {
-                        consoleLog('[LazyLoad] Loading iframe for:', iframe.dataset.src);
-                        iframe.src = iframe.dataset.src;
-                        // Do NOT unobserve: observerInstance.unobserve(wrapper);
-                        // We want to keep observing to handle scroll-out for unloading.
-                    }
-                } else {
-                    // Element is no longer visible
-                    if (iframe.src && iframe.src !== 'about:blank') {
-                        consoleLog('[LazyLoad] Unloading iframe (scrolled out of view):', iframe.src);
-                        // Attempt to pause YouTube videos via postMessage (best effort)
-                    if (iframe.contentWindow && iframe.src.includes("youtube.com/embed")) { // Check 2: src is a YouTube embed & contentWindow exists
-                            try {
-                                iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', 'https://www.youtube.com');
-                            } catch (e) {
-                                consoleWarn('[LazyLoad] Error attempting to postMessage pause to YouTube:', e);
-                            }
+        if (wrapper.dataset.tweetId) { // Handle Tweet embeds
+            if (entry.isIntersecting) {
+                processTweetEmbed(wrapper);
+                // Once processed, we don't need to observe it anymore.
+                observerInstance.unobserve(wrapper);
+            }
+        } else if (iframe) { // Handle video embeds
+            if (entry.isIntersecting) {
+                // Element is now visible
+                if (iframe.dataset.src && (!iframe.src || iframe.src === 'about:blank')) {
+                    consoleLog('[LazyLoad] Loading iframe for:', iframe.dataset.src);
+                    iframe.src = iframe.dataset.src;
+                }
+            } else {
+                // Element is no longer visible
+                if (iframe.src && iframe.src !== 'about:blank') {
+                    consoleLog('[LazyLoad] Unloading iframe (scrolled out of view):', iframe.src);
+                    if (iframe.contentWindow && iframe.src.includes("youtube.com/embed")) {
+                        try {
+                            iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', 'https://www.youtube.com');
+                        } catch (e) {
+                            consoleWarn('[LazyLoad] Error attempting to postMessage pause to YouTube:', e);
                         }
-                        // For other platforms, pausing via postMessage is less standardized or might require their specific player APIs.
-                        // This part would need expansion for Twitch, Streamable, Rumble if simple src reset isn't enough.
-
-                        iframe.src = 'about:blank'; // Unload the content to save resources
-                        // The data-src attribute remains, so it can be reloaded if it scrolls back into view.
                     }
+                    iframe.src = 'about:blank';
                 }
             }
+        }
     });
 }
 
