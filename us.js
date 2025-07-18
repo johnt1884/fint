@@ -1,4 +1,7 @@
 // ==UserScript==
+// @grant        GM.getValue
+// @grant        GM.setValue
+
 // @name         Thread Tracker
 // @namespace    http://tampermonkey.net/
 // @version      2.7
@@ -20,6 +23,9 @@
     const DEBUG_MODE_KEY = 'otkDebugModeEnabled'; // For localStorage
     const LOCAL_IMAGE_COUNT_KEY = 'otkLocalImageCount';
     const LOCAL_VIDEO_COUNT_KEY = 'otkLocalVideoCount';
+    const LAST_SEEN_MESSAGES_KEY = 'otkLastSeenMessagesCount';
+    const LAST_SEEN_IMAGES_KEY = 'otkLastSeenImagesCount';
+    const LAST_SEEN_VIDEOS_KEY = 'otkLastSeenVideosCount';
     const VIEWER_OPEN_KEY = 'otkViewerOpen'; // For viewer open/closed state
     const ANCHORED_MESSAGE_ID_KEY = 'otkAnchoredMessageId'; // For storing anchored message ID
     const ANCHORED_MESSAGE_CLASS = 'otk-anchored-message'; // CSS class for highlighting anchored message
@@ -1453,19 +1459,6 @@ function createTweetEmbedElement(tweetId) {
             mediaIntersectionObserver.disconnect(); // Clean up previous observer if any
             consoleLog('[LazyLoad] Disconnected previous mediaIntersectionObserver.');
         }
-
-        // Define handleIntersection here if it's not accessible globally or from main's scope
-        // For this structure, assuming handleIntersection defined in main() is accessible.
-        // If not, it would need to be passed or redefined.
-        // Let's assume it's accessible from main's scope for now.
-        // To be certain, we can define it again or ensure it's truly global to the IIFE.
-        // For safety, let's make sure `handleIntersection` is available.
-        // It was defined in main(), so it should be in scope for functions called after main's execution.
-        // However, renderMessagesInViewer can be called independently.
-        // Let's ensure handleIntersection is defined at a scope accessible by renderMessagesInViewer.
-        // Moving its definition to be globally available within the IIFE.
-        // (This will be a separate change if current diff doesn't cover that move) - *Actually, previous diff added it inside main, let's adjust that assumption.*
-        // For now, let's assume it's available. If ReferenceError, we'll move it.
 
         mediaIntersectionObserver = new IntersectionObserver(handleIntersection, {
             root: messagesContainer,
@@ -3407,6 +3400,66 @@ function _populateAttachmentDivWithMedia(
                 // Do not append, just update the "(+N new)" stats
             }
 
+            const viewerIsOpen = otkViewer && otkViewer.style.display === 'block';
+            if (!viewerIsOpen) {
+                consoleLog('[BG Refresh] Viewer is closed. Resynchronizing display snapshot with ground truth.');
+                const allMessages = getAllMessagesSorted();
+
+                renderedMessageIdsInViewer.clear();
+                uniqueImageViewerHashes.clear();
+                viewerTopLevelAttachedVideoHashes.clear();
+                viewerTopLevelEmbedIds.clear();
+
+                allMessages.forEach(message => {
+                    renderedMessageIdsInViewer.add(message.id);
+                    if (message.attachment) {
+                        const filehash = message.attachment.filehash_db_key || `${message.attachment.tim}${message.attachment.ext}`;
+                        const extLower = message.attachment.ext.toLowerCase();
+                        if (['.jpg', '.jpeg', '.png', '.gif'].includes(extLower)) {
+                            uniqueImageViewerHashes.add(filehash);
+                        } else if (['.webm', '.mp4'].includes(extLower)) {
+                            viewerTopLevelAttachedVideoHashes.add(filehash);
+                        }
+                    }
+                    if (message.text) {
+                        const inlineYoutubePatterns = [
+                            { type: 'watch', regex: /(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?(?:[^#&?\s]*&)*v=([a-zA-Z0-9_-]+)/g },
+                            { type: 'short', regex: /(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]+)/g },
+                            { type: 'youtu.be', regex: /(?:https?:\/\/)?youtu\.be\/([a-zA-Z0-9_-]+)/g }
+                        ];
+                        const inlineTwitchPatterns = [
+                             { type: 'clip_direct', regex: /(?:https?:\/\/)?clips\.twitch\.tv\/([a-zA-Z0-9_-]+)/g },
+                             { type: 'clip_channel', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/[a-zA-Z0-9_]+\/clip\/([a-zA-Z0-9_-]+)/g },
+                             { type: 'vod', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/videos\/(\d+)/g }
+                        ];
+                        const inlineStreamablePatterns = [
+                            { type: 'video', regex: /(?:https?:\/\/)?streamable\.com\/([a-zA-Z0-9]+)/g }
+                        ];
+
+                        const allPatterns = [...inlineYoutubePatterns, ...inlineTwitchPatterns, ...inlineStreamablePatterns];
+                        allPatterns.forEach(patternInfo => {
+                            let match;
+                            while ((match = patternInfo.regex.exec(message.text)) !== null) {
+                                const id = match[1];
+                                if (id) {
+                                    let canonicalEmbedId;
+                                    if (patternInfo.type.startsWith('watch') || patternInfo.type.startsWith('short') || patternInfo.type.startsWith('youtu.be')) {
+                                        canonicalEmbedId = `youtube_${id}`;
+                                    } else if (patternInfo.type.startsWith('clip') || patternInfo.type.startsWith('vod')) {
+                                         canonicalEmbedId = `twitch_${patternInfo.type}_${id}`;
+                                    } else {
+                                        canonicalEmbedId = `streamable_${id}`;
+                                    }
+                                    viewerTopLevelEmbedIds.add(canonicalEmbedId);
+                                }
+                            }
+                        });
+                    }
+                });
+                consoleLog(`[BG Refresh] Resync complete. Snapshot counts: ${renderedMessageIdsInViewer.size} msgs, ${uniqueImageViewerHashes.size} imgs, ${viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size} videos.`);
+                updateDisplayedStatistics(); // Re-run stats update after sync
+            }
+
             consoleLog('[BG] Background refresh complete.');
 
         } catch (error) {
@@ -3421,9 +3474,6 @@ function _populateAttachmentDivWithMedia(
         isManualRefreshInProgress = true;
         showLoadingScreen("Initializing refresh..."); // Initial message
         try {
-            localStorage.removeItem('otkNewMessagesCount');
-            localStorage.removeItem('otkNewImagesCount');
-            localStorage.removeItem('otkNewVideosCount');
             await new Promise(resolve => setTimeout(resolve, 50)); // Ensure loading screen renders
 
             updateLoadingProgress(5, "Scanning catalog for OTK threads...");
@@ -3546,6 +3596,26 @@ function _populateAttachmentDivWithMedia(
             updateLoadingProgress(95, "Finalizing data and updating display...");
             renderThreadList();
             window.dispatchEvent(new CustomEvent('otkMessagesUpdated'));
+
+            // After a manual refresh, the "last seen" counts should become the new ground truth totals.
+            let newTotalMessages = 0;
+            let newTotalImages = 0;
+            let newTotalVideos = 0;
+            for (const threadId in messagesByThreadId) {
+                const messages = messagesByThreadId[threadId] || [];
+                newTotalMessages += messages.length;
+                messages.forEach(msg => {
+                    if (msg.attachment) {
+                        const ext = msg.attachment.ext.toLowerCase();
+                        if (['.jpg', '.jpeg', '.png', '.gif'].includes(ext)) newTotalImages++;
+                        else if (['.webm', '.mp4'].includes(ext)) newTotalVideos++;
+                    }
+                });
+            }
+            localStorage.setItem(LAST_SEEN_MESSAGES_KEY, newTotalMessages);
+            localStorage.setItem(LAST_SEEN_IMAGES_KEY, newTotalImages);
+            localStorage.setItem(LAST_SEEN_VIDEOS_KEY, newTotalVideos);
+            consoleLog(`[Manual Refresh] Updated last seen counts to: ${newTotalMessages} msgs, ${newTotalImages} imgs, ${newTotalVideos} vids.`);
 
         let viewerIsOpen = otkViewer && otkViewer.style.display === 'block';
 
@@ -3686,9 +3756,9 @@ function _populateAttachmentDivWithMedia(
             localStorage.removeItem(SEEN_EMBED_URL_IDS_KEY);
             localStorage.setItem(LOCAL_IMAGE_COUNT_KEY, '0');
             localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, '0');
-            localStorage.removeItem('otkNewMessagesCount');
-            localStorage.removeItem('otkNewImagesCount');
-            localStorage.removeItem('otkNewVideosCount');
+            localStorage.removeItem(LAST_SEEN_MESSAGES_KEY);
+            localStorage.removeItem(LAST_SEEN_IMAGES_KEY);
+            localStorage.removeItem(LAST_SEEN_VIDEOS_KEY);
             localStorage.removeItem(THEME_SETTINGS_KEY);
             consoleLog('[Clear] LocalStorage (threads, messages, seen embeds, media counts, ACTIVE theme) cleared/reset. CUSTOM THEMES PRESERVED.');
 
@@ -3839,13 +3909,19 @@ function _populateAttachmentDivWithMedia(
             });
         }
 
-        const mainMessagesCount = renderedMessageIdsInViewer.size;
-        const mainImagesCount = uniqueImageViewerHashes.size;
-        const mainVideosCount = viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size;
+        const lastSeenMessages = parseInt(localStorage.getItem(LAST_SEEN_MESSAGES_KEY) || '0');
+        const lastSeenImages = parseInt(localStorage.getItem(LAST_SEEN_IMAGES_KEY) || '0');
+        const lastSeenVideos = parseInt(localStorage.getItem(LAST_SEEN_VIDEOS_KEY) || '0');
 
-        const newMessages = totalMessagesInStorage - mainMessagesCount;
-        const newImages = totalImagesInStorage - mainImagesCount;
-        const newVideos = totalVideosInStorage - mainVideosCount;
+        const newMessages = totalMessagesInStorage - lastSeenMessages;
+        const newImages = totalImagesInStorage - lastSeenImages;
+        const newVideos = totalVideosInStorage - lastSeenVideos;
+
+        const viewerIsOpen = otkViewer && otkViewer.style.display === 'block';
+
+        const mainMessagesCount = viewerIsOpen ? renderedMessageIdsInViewer.size : totalMessagesInStorage;
+        const mainImagesCount = viewerIsOpen ? uniqueImageViewerHashes.size : totalImagesInStorage;
+        const mainVideosCount = viewerIsOpen ? (viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size) : totalVideosInStorage;
 
         const liveThreadsCount = activeThreads.length;
 
