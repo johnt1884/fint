@@ -34,7 +34,6 @@
     const OTK_TRACKED_KEYWORDS_KEY = 'otkTrackedKeywords'; // For user-defined keywords
     const OTK_BG_UPDATE_FREQ_SECONDS_KEY = 'otkBgUpdateFrequencySeconds'; // For background update frequency
     const TWEET_EMBED_MODE_KEY = 'otkTweetEmbedMode'; // For tweet embed theme
-    const TWEET_CACHE_KEY = 'otkTweetCache'; // For caching tweet HTML
     const MAIN_THEME_KEY = 'otkMainTheme';
     const twitterPatterns = [
         { regex: /^(?:https?:\/\/)?(?:www\.)?(?:twitter|x)\.com\/\w+\/status\/(\d+)/, idGroup: 1 }
@@ -45,12 +44,6 @@
 
     // --- Global variables ---
     let otkViewer = null;
-    let tweetCache = {};
-    try {
-        tweetCache = JSON.parse(localStorage.getItem(TWEET_CACHE_KEY)) || {};
-    } catch (e) {
-        consoleError("Error parsing tweet cache from localStorage:", e);
-    }
     let viewerActiveImageCount = null; // For viewer-specific unique image count
     let viewerActiveVideoCount = null; // For viewer-specific unique video count
     let backgroundRefreshIntervalId = null;
@@ -258,6 +251,10 @@
 
     // --- Media Embedding Helper Functions ---
 function createYouTubeEmbedElement(videoId, timestampStr) { // Removed isInlineEmbed parameter
+    // --- LOAD POLICY: Lazy Loading ---
+    // YouTube embeds are lazy-loaded by default. The iframe's `src` is not set until the element
+    // is about to enter the viewport. This is controlled by the `otkLazyLoadYouTube` localStorage setting.
+    // If 'otkLazyLoadYouTube' is 'false', the embed will load eagerly.
     let startSeconds = 0;
     if (timestampStr) {
         // Try to parse timestamp like 1h2m3s or 2m3s or 3s or just 123 (YouTube takes raw seconds for ?t=)
@@ -311,18 +308,12 @@ function createYouTubeEmbedElement(videoId, timestampStr) { // Removed isInlineE
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('allow', 'accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
 
-    const lazyLoadEnabled = (localStorage.getItem('otkLazyLoadYouTube') || 'true') === 'true';
-
-    if (lazyLoadEnabled) {
-        iframe.dataset.src = embedUrl;
-        if (mediaIntersectionObserver) {
-            mediaIntersectionObserver.observe(wrapper);
-        } else {
-            consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-            iframe.src = iframe.dataset.src;
-        }
+    iframe.dataset.src = embedUrl;
+    if (mediaIntersectionObserver) {
+        mediaIntersectionObserver.observe(wrapper);
     } else {
-        iframe.src = embedUrl;
+        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
+        iframe.src = iframe.dataset.src;
     }
 
     wrapper.appendChild(iframe);
@@ -331,25 +322,20 @@ function createYouTubeEmbedElement(videoId, timestampStr) { // Removed isInlineE
 
 // Helper function for processing text segments (either append as text or handle as quote)
 function appendTextOrQuoteSegment(textElement, segment, quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, parentMessageId) {
-    // Note: mediaLoadPromises is passed down in case quote recursion generates media elements that need tracking.
-    // However, createMessageElementDOM for quotes currently passes an empty array for it. This could be enhanced.
     const quoteMatch = segment.match(quoteRegex);
 
-    if (quoteMatch && segment.startsWith(quoteMatch[0])) { // Process as quote only if segment starts with it
-        // Handle quote (potentially recursive)
+    if (quoteMatch && segment.startsWith(quoteMatch[0])) {
         if (currentDepth >= MAX_QUOTE_DEPTH) {
-            // At max depth, display quote link as text or a placeholder, but don't recurse
-            // To match original behavior of skipping pure ">>123" lines at max depth:
-            if (segment === quoteMatch[0]) return; // Skip pure quote link if it's the entire segment
-
-            // If "text >>123" or ">>123 text" at max depth, treat as text
+            if (segment.trim() === quoteMatch[0]) {
+                return true; // Indicate that the segment was fully consumed and should be skipped.
+            }
             textElement.appendChild(document.createTextNode(segment));
-            return;
+            return false;
         }
 
-        // Not at max depth, so process the quote
         const quotedMessageId = quoteMatch[1];
         let quotedMessageObject = null;
+        // ... (find quotedMessageObject logic remains the same)
         for (const threadIdKey in messagesByThreadId) {
             if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
                 const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === Number(quotedMessageId));
@@ -363,18 +349,17 @@ function appendTextOrQuoteSegment(textElement, segment, quoteRegex, currentDepth
         if (quotedMessageObject) {
             const quotedElement = createMessageElementDOM(
                 quotedMessageObject,
-                                mediaLoadPromises, // Pass down the array for mediaLoadPromises for quotes
+                mediaLoadPromises,
                 uniqueImageViewerHashes,
-                // uniqueVideoViewerHashes, // Removed
                 quotedMessageObject.board || boardForLink,
-                false, // isTopLevelMessage = false for quotes
+                false,
                 currentDepth + 1,
-                null, // threadColor is not used for quoted message accents
-                parentMessageId // Pass the PARENT message's ID for the quote
+                null,
+                parentMessageId
             );
             if (quotedElement) {
-                if (currentDepth >= MAX_QUOTE_DEPTH - 1 && !quotedMessageObject.text) {
-                    return;
+                if (currentDepth >= MAX_QUOTE_DEPTH - 1 && !quotedMessageObject.text && !quotedMessageObject.attachment) {
+                    return true; // Skip if it's a quote at max depth with no text/image
                 }
                 textElement.appendChild(quotedElement);
             }
@@ -388,19 +373,21 @@ function appendTextOrQuoteSegment(textElement, segment, quoteRegex, currentDepth
 
         const restOfSegment = segment.substring(quoteMatch[0].length);
         if (restOfSegment.length > 0) {
-            // Recursively process the rest of the segment for more quotes or text
-            // This is important if a line is like ">>123 >>456 text"
-            appendTextOrQuoteSegment(textElement, restOfSegment, quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, parentMessageId);
+            return appendTextOrQuoteSegment(textElement, restOfSegment, quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, parentMessageId);
         }
+        return segment.trim() === quoteMatch[0];
     } else {
-        // Not a quote at the start of the segment (or not a quote at all), just plain text for this segment
-        if (segment.length > 0) { // Ensure non-empty segment before creating text node
+        if (segment.length > 0) {
             textElement.appendChild(document.createTextNode(segment));
         }
+        return false;
     }
 }
 
 function createTwitchEmbedElement(type, id, timestampStr) {
+    // --- LOAD POLICY: Lazy Loading ---
+    // Twitch embeds are lazy-loaded by default, controlled by the `otkLazyLoadTwitch` localStorage setting.
+    // If 'otkLazyLoadTwitch' is 'false', the embed will load eagerly.
     let embedUrl;
     const parentDomain = 'boards.4chan.org'; // Or dynamically get current hostname if needed for wider use
 
@@ -450,18 +437,12 @@ function createTwitchEmbedElement(type, id, timestampStr) {
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('scrolling', 'no');
 
-    const lazyLoadEnabled = (localStorage.getItem('otkLazyLoadTwitch') || 'true') === 'true';
-
-    if (lazyLoadEnabled) {
-        iframe.dataset.src = embedUrl;
-        if (mediaIntersectionObserver) {
-            mediaIntersectionObserver.observe(wrapper);
-        } else {
-            consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-            iframe.src = iframe.dataset.src;
-        }
+    iframe.dataset.src = embedUrl;
+    if (mediaIntersectionObserver) {
+        mediaIntersectionObserver.observe(wrapper);
     } else {
-        iframe.src = embedUrl;
+        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
+        iframe.src = iframe.dataset.src;
     }
 
     wrapper.appendChild(iframe);
@@ -493,18 +474,12 @@ function createKickEmbedElement(clipId) {
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('scrolling', 'no');
 
-    const lazyLoadEnabled = (localStorage.getItem('otkLazyLoadKick') || 'true') === 'true';
-
-    if (lazyLoadEnabled) {
-        iframe.dataset.src = embedUrl;
-        if (mediaIntersectionObserver) {
-            mediaIntersectionObserver.observe(wrapper);
-        } else {
-            consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-            iframe.src = iframe.dataset.src;
-        }
+    iframe.dataset.src = embedUrl;
+    if (mediaIntersectionObserver) {
+        mediaIntersectionObserver.observe(wrapper);
     } else {
-        iframe.src = embedUrl;
+        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
+        iframe.src = iframe.dataset.src;
     }
 
     wrapper.appendChild(iframe);
@@ -536,18 +511,12 @@ function createTikTokEmbedElement(videoId) {
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('scrolling', 'no');
 
-    const lazyLoadEnabled = (localStorage.getItem('otkLazyLoadTikTok') || 'true') === 'true';
-
-    if (lazyLoadEnabled) {
-        iframe.dataset.src = embedUrl;
-        if (mediaIntersectionObserver) {
-            mediaIntersectionObserver.observe(wrapper);
-        } else {
-            consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-            iframe.src = iframe.dataset.src;
-        }
+    iframe.dataset.src = embedUrl;
+    if (mediaIntersectionObserver) {
+        mediaIntersectionObserver.observe(wrapper);
     } else {
-        iframe.src = embedUrl;
+        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
+        iframe.src = iframe.dataset.src;
     }
 
     wrapper.appendChild(iframe);
@@ -582,18 +551,12 @@ function createStreamableEmbedElement(videoId) {
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('scrolling', 'no');
 
-    const lazyLoadEnabled = (localStorage.getItem('otkLazyLoadStreamable') || 'true') === 'true';
-
-    if (lazyLoadEnabled) {
-        iframe.dataset.src = embedUrl;
-        if (mediaIntersectionObserver) {
-            mediaIntersectionObserver.observe(wrapper);
-        } else {
-            consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-            iframe.src = iframe.dataset.src;
-        }
+    iframe.dataset.src = embedUrl;
+    if (mediaIntersectionObserver) {
+        mediaIntersectionObserver.observe(wrapper);
     } else {
-        iframe.src = embedUrl;
+        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
+        iframe.src = iframe.dataset.src;
     }
 
     wrapper.appendChild(iframe);
@@ -1719,6 +1682,7 @@ consoleLog(`[StatsDebug] Unique image hashes for viewer: ${uniqueImageViewerHash
         Promise.all(mediaLoadPromises).then(() => {
             embedWrappers.forEach(wrapper => mediaIntersectionObserver.observe(wrapper));
             consoleLog("All inline media load attempts complete.");
+            forceRenderAllTweets();
             updateLoadingProgress(95, "Finalizing view...");
     viewerActiveImageCount = uniqueImageViewerHashes.size;
     viewerActiveVideoCount = viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size;
@@ -2024,13 +1988,13 @@ function _populateAttachmentDivWithMedia(
         const twitchPatterns = [
             { type: 'clip_direct', regex: /^(?:https?:\/\/)?clips\.twitch\.tv\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 },
             { type: 'clip_channel', regex: /^(?:https?:\/\/)?(?:www\.)?twitch\.tv\/[a-zA-Z0-9_]+\/clip\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 },
-            { type: 'vod', regex: /^(?:https?:\/\/)?(?:www\.)?twitch\.tv\/videos\/(\d+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 }
+            { type: 'vod', regex: /^(?:https?:\/\/)?(?:www\.)?twitch\.tv\/videos\/(\d+)(?:[?&%#\w\-=\.\/;:]*t=(?:(?:\d+h)?(?:\d+m)?(?:\d+s)?))?$/, idGroup: 1 }
         ];
         const twitchTimestampRegex = /[?&]t=((?:\d+h)?(?:\d+m)?(?:\d+s)?)/;
         const inlineTwitchPatterns = [
             { type: 'clip_direct', regex: /(?:https?:\/\/)?clips\.twitch\.tv\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 },
             { type: 'clip_channel', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/[a-zA-Z0-9_]+\/clip\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 },
-            { type: 'vod', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/videos\/(\d+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 }
+            { type: 'vod', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/videos\/(\d+)(?:[?&%#\w\-=\.\/;:]*t=(?:(?:\d+h)?(?:\d+m)?(?:\d+s)?))?/, idGroup: 1 }
         ];
 
         const streamablePatterns = [
@@ -2078,56 +2042,59 @@ function _populateAttachmentDivWithMedia(
                 const remainingLines = []; // Store lines that are not >>ddd quotes to be processed later
 
                 lines.forEach(line => {
-                    const quoteMatch = line.match(quoteRegex);
-                    if (quoteMatch && line.startsWith(quoteMatch[0]) && currentDepth < MAX_QUOTE_DEPTH) {
-                        // This line is a >>ddd quote and should be rendered as a block
-                        if (!quotedMessagesContainer) {
-                            quotedMessagesContainer = document.createElement('div');
-                            // No specific class for this container yet, styling comes from children
-                        }
-                        const quotedMessageId = quoteMatch[1];
-                        let quotedMessageObject = null;
-                        for (const threadIdKey in messagesByThreadId) {
-                            if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
-                                const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === Number(quotedMessageId));
-                                if (foundMsg) {
-                                    quotedMessageObject = foundMsg;
-                                    break;
+                    const trimmedLine = line.trim();
+                    const quoteMatch = trimmedLine.match(quoteRegex);
+
+                    // Check if the trimmed line IS a quote link and nothing else.
+                    if (quoteMatch && trimmedLine === quoteMatch[0]) {
+                        if (currentDepth < MAX_QUOTE_DEPTH) {
+                            // This line is a >>ddd quote and should be rendered as a block
+                            if (!quotedMessagesContainer) {
+                                quotedMessagesContainer = document.createElement('div');
+                                // No specific class for this container yet, styling comes from children
+                            }
+                            const quotedMessageId = quoteMatch[1];
+                            let quotedMessageObject = null;
+                            for (const threadIdKey in messagesByThreadId) {
+                                if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
+                                    const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === Number(quotedMessageId));
+                                    if (foundMsg) {
+                                        quotedMessageObject = foundMsg;
+                                        break;
+                                    }
                                 }
                             }
-                        }
 
-                        if (quotedMessageObject) {
-                            consoleLog(`[QuoteDebug] new_design: Calling createMessageElementDOM for quote ${quotedMessageId}. mediaLoadPromises is an array: ${Array.isArray(mediaLoadPromises)}`);
-                            const quotedElement = createMessageElementDOM(
-                                quotedMessageObject,
-                                mediaLoadPromises,
-                                uniqueImageViewerHashes,
-                                quotedMessageObject.board || boardForLink,
-                                false, // isTopLevelMessage = false for quotes
-                                currentDepth + 1,
-                                null, // threadColor is not used for quoted message accents in new design
-                                message.id // Pass the PARENT message's ID for the quote
-                            );
-                            if (quotedElement) {
-                                quotedMessagesContainer.appendChild(quotedElement);
+                            if (quotedMessageObject) {
+                                consoleLog(`[QuoteDebug] new_design: Calling createMessageElementDOM for quote ${quotedMessageId}. mediaLoadPromises is an array: ${Array.isArray(mediaLoadPromises)}`);
+                                const quotedElement = createMessageElementDOM(
+                                    quotedMessageObject,
+                                    mediaLoadPromises,
+                                    uniqueImageViewerHashes,
+                                    quotedMessageObject.board || boardForLink,
+                                    false, // isTopLevelMessage = false for quotes
+                                    currentDepth + 1,
+                                    null, // threadColor is not used for quoted message accents in new design
+                                    message.id // Pass the PARENT message's ID for the quote
+                                );
+                                if (quotedElement) {
+                                    quotedMessagesContainer.appendChild(quotedElement);
+                                }
+                            } else {
+                                const notFoundSpan = document.createElement('div'); // Render as a div for block display
+                                notFoundSpan.textContent = `${line} (Not Found)`;
+                                notFoundSpan.style.color = 'var(--otk-newdesign-header-text-color, #555)'; // Use a theme color
+                                notFoundSpan.style.padding = '4px 0';
+                                quotedMessagesContainer.appendChild(notFoundSpan);
                             }
-                        } else {
-                            const notFoundSpan = document.createElement('div'); // Render as a div for block display
-                            notFoundSpan.textContent = `${line} (Not Found)`;
-                            notFoundSpan.style.color = 'var(--otk-newdesign-header-text-color, #555)'; // Use a theme color
-                            notFoundSpan.style.padding = '4px 0';
-                            quotedMessagesContainer.appendChild(notFoundSpan);
                         }
-                        // Check if there's text after the quote on the same line
-                        const restOfLine = line.substring(quoteMatch[0].length).trim();
-                        if (restOfLine.length > 0) {
-                            remainingLines.push(restOfLine); // Add this trailing text to be processed with main content
-                        }
+                        // If the line is just a quote, we don't add it to remainingLines, effectively removing it from the main text flow.
                     } else {
+                        // The line is not solely a quote link, so it should be processed as regular text.
                         remainingLines.push(line);
                     }
                 });
+
 
                 if (quotedMessagesContainer) {
                     messageDiv.appendChild(quotedMessagesContainer);
@@ -2484,7 +2451,7 @@ function _populateAttachmentDivWithMedia(
                     }
                     // End of robust inline processing
 
-                    if (lineIndex < lines.length - 1 && (trimmedLine.length > 0 || processedAsEmbed)) {
+                    if (lineIndex < lines.length - 1 && (trimmedLine.length > 0 || processedAsEmbed) && !soleUrlEmbedMade) {
                         textElement.appendChild(document.createElement('br'));
                     }
                 });
@@ -2502,26 +2469,19 @@ function _populateAttachmentDivWithMedia(
 
             // Attachment handling (can be similar to original, appended to messageDiv)
             if (message.attachment && message.attachment.tim) {
-                const actualBoardForLink = boardForLink || message.board || 'b'; // Define actualBoardForLink here
+                const actualBoardForLink = boardForLink || message.board || 'b';
                 const attachmentDiv = document.createElement('div');
-                attachmentDiv.style.marginTop = '10px'; // Standard margin for attachments
-                // ... (rest of attachment logic is complex and largely reusable, will integrate carefully)
-                // For now, let's assume the attachment logic from the 'else' block can be adapted and called here.
-                // This includes filename link, image/video display, IDB loading.
-                // Key: ensure it appends to this 'messageDiv' or 'textWrapperDiv' as appropriate for new layout.
-                // Example.html doesn't show attachments, so standard placement below text is fine.
+                attachmentDiv.style.marginTop = '10px';
 
                 if (shouldDisplayFilenames) {
                     const filenameLink = document.createElement('a');
                     filenameLink.textContent = `${message.attachment.filename} (${message.attachment.ext.substring(1)})`;
                     filenameLink.href = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
                     filenameLink.target = "_blank";
-                    // Use shared link styling for attachments for consistency, or new design specific if needed
                     filenameLink.style.cssText = "color: #60a5fa; display: block; margin-bottom: 5px; text-decoration: underline;";
                     attachmentDiv.appendChild(filenameLink);
                 }
 
-                // Call helper function to populate media
                 _populateAttachmentDivWithMedia(
                     attachmentDiv,
                     message,
@@ -2529,16 +2489,15 @@ function _populateAttachmentDivWithMedia(
                     mediaLoadPromises,
                     uniqueImageViewerHashes,
                     isTopLevelMessage,
-                    'new_design', // layoutStyle
-                    renderedFullSizeImageHashes, // Specific to New Design image handling
+                    'new_design',
+                    renderedFullSizeImageHashes,
                     viewerTopLevelAttachedVideoHashes,
                     otkMediaDB
                 );
 
-                // Always append attachmentDiv if message.attachment.tim exists,
-                // trusting _populateAttachmentDivWithMedia to handle content.
-                // Removed: if (attachmentDiv.hasChildNodes())
-                textWrapperDiv.appendChild(attachmentDiv);
+                if (attachmentDiv.hasChildNodes()) {
+                    textWrapperDiv.appendChild(attachmentDiv);
+                }
             }
 
             // Click listener for anchoring
@@ -2628,7 +2587,7 @@ function _populateAttachmentDivWithMedia(
             } else { // Quoted message (Depth 1+)
                 marginLeft = '0px'; // No specific indent margin for quote itself
                 marginTop = '10px';    // Specific top margin for quoted messages
-                marginBottom = '0px';  // Specific bottom margin for quoted messages
+                marginBottom = '10px';  // Specific bottom margin for quoted messages
                 if (currentDepth === 1) {
                     backgroundColorVar = 'var(--otk-msg-depth1-bg-color)';
                 } else { // Covers currentDepth === 2 and potential deeper fallbacks
@@ -2917,162 +2876,12 @@ function _populateAttachmentDivWithMedia(
                     }
 
                     if (!soleUrlEmbedMade) {
-                        let currentTextSegment = line;
+                        let lineWasSkipped = appendTextOrQuoteSegment(textElement, line, quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, message.id);
 
-                        while (currentTextSegment.length > 0) {
-                            let earliestMatch = null;
-                            let earliestMatchPattern = null;
-                            let earliestMatchType = null;
-
-                            // Find earliest YouTube inline match
-                            for (const patternObj of inlineYoutubePatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt) {
-                                    if (earliestMatch === null || matchAttempt.index < earliestMatch.index) {
-                                        earliestMatch = matchAttempt;
-                                        earliestMatchPattern = patternObj;
-                                        earliestMatchType = 'youtube';
-                                    }
-                                }
-                            }
-
-                            // Find earliest Kick inline match
-                            for (const patternObj of inlineKickPatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt) {
-                                    if (earliestMatch === null || matchAttempt.index < earliestMatch.index) {
-                                        earliestMatch = matchAttempt;
-                                        earliestMatchPattern = patternObj;
-                                        earliestMatchType = 'kick';
-                                    }
-                                }
-                            }
-
-                            // Find earliest TikTok inline match
-                            for (const patternObj of inlineTiktokPatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt) {
-                                    if (earliestMatch === null || matchAttempt.index < earliestMatch.index) {
-                                        earliestMatch = matchAttempt;
-                                        earliestMatchPattern = patternObj;
-                                        earliestMatchType = 'tiktok';
-                                    }
-                                }
-                            }
-
-                            // Find earliest Twitter inline match
-                            for (const patternObj of inlineTwitterPatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt) {
-                                    if (earliestMatch === null || matchAttempt.index < earliestMatch.index) {
-                                        earliestMatch = matchAttempt;
-                                        earliestMatchPattern = patternObj;
-                                        earliestMatchType = 'twitter';
-                                    }
-                                }
-                            }
-                            // Find earliest Twitch inline match
-                            for (const patternObj of inlineTwitchPatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt) {
-                                    if (earliestMatch === null || matchAttempt.index < earliestMatch.index) {
-                                        earliestMatch = matchAttempt;
-                                        earliestMatchPattern = patternObj;
-                                        earliestMatchType = 'twitch';
-                                    }
-                                }
-                            }
-                            // Find earliest Streamable inline match
-                            for (const patternObj of inlineStreamablePatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt) {
-                                    if (earliestMatch === null || matchAttempt.index < earliestMatch.index) {
-                                        earliestMatch = matchAttempt;
-                                        earliestMatchPattern = patternObj; // type is 'video'
-                                        earliestMatchType = 'streamable';
-                                    }
-                                }
-                            }
-
-                            if (earliestMatch) {
-                                processedAsEmbed = true;
-
-                                if (earliestMatch.index > 0) {
-                                    appendTextOrQuoteSegment(textElement, currentTextSegment.substring(0, earliestMatch.index), quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, message.id);
-                                }
-
-                                const matchedUrl = earliestMatch[0];
-                                const id = earliestMatch[earliestMatchPattern.idGroup];
-                                let timestampStr = null; // Relevant for YT & Twitch VODs
-                                let embedElement = null;
-                                let canonicalEmbedId = null;
-
-                                if (earliestMatchType === 'youtube') {
-                                    const timeMatchInUrl = matchedUrl.match(youtubeTimestampRegex);
-                                    if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
-                                    if (id) {
-                                        canonicalEmbedId = `youtube_${id}`;
-                                        embedElement = createYouTubeEmbedElement(id, timestampStr);
-                                    }
-                                } else if (earliestMatchType === 'twitch') {
-                                    if (earliestMatchPattern.type === 'vod') {
-                                        const timeMatchInUrl = matchedUrl.match(twitchTimestampRegex);
-                                        if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
-                                    }
-                                    if (id) {
-                                        canonicalEmbedId = `twitch_${earliestMatchPattern.type}_${id}`;
-                                        embedElement = createTwitchEmbedElement(earliestMatchPattern.type, id, timestampStr);
-                                    }
-                                } else if (earliestMatchType === 'streamable') {
-                                    if (id) {
-                                        canonicalEmbedId = `streamable_${id}`;
-                                        embedElement = createStreamableEmbedElement(id);
-                                    }
-                                } else if (earliestMatchType === 'tiktok') {
-                                    if (id) {
-                                        canonicalEmbedId = `tiktok_${id}`;
-                                        embedElement = createTikTokEmbedElement(id);
-                                    }
-                                } else if (earliestMatchType === 'kick') {
-                                    if (id) {
-                                        canonicalEmbedId = `kick_${id}`;
-                                        embedElement = createKickEmbedElement(id);
-                                    }
-                                } else if (earliestMatchType === 'twitter') {
-                                    if (id) {
-                                        canonicalEmbedId = `twitter_${id}`;
-                                        embedElement = createTweetEmbedElement(id);
-                                    }
-                                }
-
-                                if (embedElement) {
-                                    if (isTopLevelMessage && canonicalEmbedId) {
-                                        // Add to viewer-specific top-level set
-                                        viewerTopLevelEmbedIds.add(canonicalEmbedId);
-
-                                        // Existing global stat update logic
-                                        if (!seenEmbeds.includes(canonicalEmbedId)) {
-                                            seenEmbeds.push(canonicalEmbedId);
-                                            localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
-                                            let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
-                                            localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics();
-                                        }
-                                    }
-                                    textElement.appendChild(embedElement);
-                                }
-
-                                currentTextSegment = currentTextSegment.substring(earliestMatch.index + matchedUrl.length);
-                            } else {
-                                if (currentTextSegment.length > 0) {
-                                    appendTextOrQuoteSegment(textElement, currentTextSegment, quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, message.id);
-                                }
-                                currentTextSegment = "";
-                            }
+                        if (lineIndex < lines.length - 1 && !lineWasSkipped) {
+                            textElement.appendChild(document.createElement('br'));
                         }
-                    }
-
-                    if (lineIndex < lines.length - 1 && (trimmedLine.length > 0 || processedAsEmbed)) {
+                    } else if (lineIndex < lines.length - 1) {
                         textElement.appendChild(document.createElement('br'));
                     }
                 });
@@ -3150,7 +2959,7 @@ function _populateAttachmentDivWithMedia(
             }
             // The erroneous duplicated block that was here has been removed.
             if (message.attachment && message.attachment.tim) {
-                const actualBoardForLink = boardForLink || message.board || 'b'; // Use passed boardForLink, fallback to message.board or 'b'
+                const actualBoardForLink = boardForLink || message.board || 'b';
                 const attachmentDiv = document.createElement('div');
                 attachmentDiv.style.marginTop = '10px';
 
@@ -3163,7 +2972,6 @@ function _populateAttachmentDivWithMedia(
                     attachmentDiv.appendChild(filenameLink);
                 }
 
-                // Call helper function to populate media
                 _populateAttachmentDivWithMedia(
                     attachmentDiv,
                     message,
@@ -3171,16 +2979,15 @@ function _populateAttachmentDivWithMedia(
                     mediaLoadPromises,
                     uniqueImageViewerHashes,
                     isTopLevelMessage,
-                    'default', // layoutStyle
-                    renderedFullSizeImageHashes, // Pass for consistent image thumbnail logic
+                    'default',
+                    renderedFullSizeImageHashes,
                     viewerTopLevelAttachedVideoHashes,
                     otkMediaDB
                 );
 
-                // Always append attachmentDiv if message.attachment.tim exists,
-                // trusting _populateAttachmentDivWithMedia to handle content.
-                // Removed: if (attachmentDiv.hasChildNodes())
-                messageDiv.appendChild(attachmentDiv);
+                if (attachmentDiv.hasChildNodes()) {
+                    messageDiv.appendChild(attachmentDiv);
+                }
             }
             return messageDiv;
         } // End of else (default layout)
@@ -4516,27 +4323,6 @@ function _populateAttachmentDivWithMedia(
             height: auto; /* Allow it to size based on content */
         `;
 
-        // Debug mode checkbox and label are removed from here.
-        // DEBUG_MODE is now only toggled via localStorage or by editing the script.
-
-        const bgUpdateCheckboxContainer = document.createElement('div');
-        bgUpdateCheckboxContainer.style.cssText = `display: flex; align-items: center;`;
-        const bgUpdateCheckbox = document.createElement('input');
-        bgUpdateCheckbox.type = 'checkbox';
-        bgUpdateCheckbox.id = 'otk-disable-bg-update-checkbox';
-        bgUpdateCheckbox.checked = localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) === 'true';
-        bgUpdateCheckbox.style.marginRight = '5px';
-
-        const bgUpdateLabel = document.createElement('label');
-        bgUpdateLabel.htmlFor = 'otk-disable-bg-update-checkbox';
-        bgUpdateLabel.textContent = 'Disable Background Updates'; // Restored full text
-        // Apply the new CSS variable for the font color
-        bgUpdateLabel.style.cssText = `font-size: 11px; color: var(--otk-disable-bg-font-color, #e6e6e6); white-space: normal; cursor: pointer; line-height: 1.2;`;
-
-        bgUpdateCheckboxContainer.appendChild(bgUpdateCheckbox);
-        bgUpdateCheckboxContainer.appendChild(bgUpdateLabel);
-        controlsWrapper.appendChild(bgUpdateCheckboxContainer);
-
         const btnClearRefresh = createTrackerButton('Restart Tracker', 'otk-restart-tracker-btn');
         btnClearRefresh.style.alignSelf = 'center'; // Override parent's align-items:stretch to allow natural width & centering
         btnClearRefresh.style.marginTop = '4px'; // Retain margin for spacing from checkbox if column is short
@@ -4548,20 +4334,20 @@ function _populateAttachmentDivWithMedia(
 
         const thirdButtonColumn = document.createElement('div');
         thirdButtonColumn.style.cssText = `
-            display: flex;          /* It's a flex container for controlsWrapper */
-            flex-direction: column; /* Stack its children (controlsWrapper) */
-            justify-content: center;/* Center controlsWrapper vertically */
-            align-items: center;    /* Center controlsWrapper horizontally */
-            /* height: 100%; Removed, let it size by content */
-            /* min-width: 130px; Removed, let it size by content */
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
         `;
-        // controlsWrapper has align-self: center and width: fit-content, which is good.
-        // Ensure controlsWrapper takes appropriate width for its content (checkbox + label)
-        // and centers itself within the stretched column.
-        controlsWrapper.style.width = 'fit-content';
-        controlsWrapper.style.alignSelf = 'center';
 
-        thirdButtonColumn.appendChild(controlsWrapper);
+        const countdownTimer = document.createElement('div');
+        countdownTimer.id = 'otk-countdown-timer';
+        countdownTimer.style.cssText = `
+            font-size: 11px;
+            color: var(--otk-countdown-timer-text-color, #FFD700);
+            white-space: nowrap;
+        `;
+        thirdButtonColumn.appendChild(countdownTimer);
         // btnClearRefresh is handled below
         // buttonContainer.appendChild(thirdButtonColumn); // This is now part of topRowContainer
 
@@ -4596,23 +4382,6 @@ function _populateAttachmentDivWithMedia(
             }
         });
 
-        if (bgUpdateCheckbox.checked) {
-            consoleLog('Background updates are initially disabled by user preference.');
-        } else {
-            // startBackgroundRefresh(); // Will be called in main() after DB init
-        }
-
-        bgUpdateCheckbox.addEventListener('change', () => {
-            if (bgUpdateCheckbox.checked) {
-                stopBackgroundRefresh();
-                localStorage.setItem(BACKGROUND_UPDATES_DISABLED_KEY, 'true');
-                consoleLog('Background updates disabled via checkbox.');
-            } else {
-                startBackgroundRefresh(true); // Start immediately
-                localStorage.setItem(BACKGROUND_UPDATES_DISABLED_KEY, 'false');
-                consoleLog('Background updates enabled via checkbox.');
-            }
-        });
 
     } else {
         consoleError('Button container not found. GUI buttons cannot be added.');
@@ -4660,6 +4429,7 @@ function _populateAttachmentDivWithMedia(
             } else {
                 consoleLog(`Background refresh scheduled in ${minUpdateMinutes}-${maxUpdateMinutes} minutes. Next update at ~${new Date(Date.now() + refreshIntervalMs).toLocaleTimeString()}`);
             }
+        updateCountdownTimer();
         }
     }
 
@@ -4671,6 +4441,44 @@ function _populateAttachmentDivWithMedia(
         } else {
             consoleLog('Background refresh was not running.');
         }
+    const countdownTimer = document.getElementById('otk-countdown-timer');
+    if (countdownTimer) {
+        countdownTimer.textContent = '';
+    }
+    if (countdownIntervalId) {
+        clearInterval(countdownIntervalId);
+        countdownIntervalId = null;
+    }
+}
+
+let countdownIntervalId = null;
+
+function updateCountdownTimer() {
+    const countdownTimer = document.getElementById('otk-countdown-timer');
+    if (!countdownTimer || localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) === 'true') {
+        if(countdownTimer) countdownTimer.textContent = '';
+        if(countdownIntervalId) clearInterval(countdownIntervalId);
+        return;
+    }
+
+    if (countdownIntervalId) {
+        clearInterval(countdownIntervalId);
+    }
+
+    countdownIntervalId = setInterval(() => {
+        const nextUpdateTimestamp = parseInt(localStorage.getItem('otkNextUpdateTimestamp') || '0', 10);
+        const now = Date.now();
+        const remaining = Math.max(0, nextUpdateTimestamp - now);
+
+        if (remaining === 0) {
+            countdownTimer.textContent = 'Refreshing...';
+            return;
+        }
+
+        const minutes = Math.floor(remaining / 60000);
+        const seconds = Math.floor((remaining % 60000) / 1000);
+        countdownTimer.textContent = `Next update in: ${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }, 1000);
     }
 
 function startAutoEmbedReloader() {
@@ -4692,118 +4500,120 @@ function startAutoEmbedReloader() {
     }, 5000); // Check every 5 seconds
 }
 
+function forceRenderAllTweets() {
+    if (!otkViewer || otkViewer.style.display === 'none') {
+        return;
+    }
+    const tweetEmbeds = otkViewer.querySelectorAll('.otk-tweet-embed-wrapper');
+    tweetEmbeds.forEach(embed => {
+        const iframe = embed.querySelector('iframe.twitter-tweet');
+        if (!iframe) {
+            consoleLog(`[ForceRender] Found tweet embed without iframe (${embed.dataset.tweetId}). Forcing re-render.`);
+            processTweetEmbed(embed);
+        }
+    });
+}
+
 function startTweetEmbedBackupSystem() {
     setInterval(() => {
-        if (!otkViewer || otkViewer.style.display === 'none' || !window.twttr || !window.twttr.widgets) {
+        if (!otkViewer || otkViewer.style.display === 'none') {
             return;
         }
 
-        const tweetEmbeds = otkViewer.querySelectorAll('.otk-tweet-embed-wrapper[data-processed="true"]');
+        const tweetEmbeds = otkViewer.querySelectorAll('.otk-tweet-embed-wrapper');
         tweetEmbeds.forEach(embed => {
-            const iframe = embed.querySelector('iframe');
-            if (!iframe) {
+            if (embed.classList.contains('twttr-rendered')) {
+                return; // Already rendered, do nothing.
+            }
+
+            const lastAttempt = parseInt(embed.dataset.lastRenderAttempt, 10);
+            const now = Date.now();
+            if (lastAttempt && (now - lastAttempt < 10000)) { // 10 second cooldown
+                return; // Still cooling down.
+            }
+
+            const blockquote = embed.querySelector('blockquote.twitter-tweet');
+            const iframe = embed.querySelector('iframe.twitter-tweet');
+
+            if (!iframe && !blockquote) {
+                consoleLog(`[TweetBackup] Found empty tweet embed (${embed.dataset.tweetId}). Retrying render.`);
+                embed.dataset.lastRenderAttempt = now;
+                processTweetEmbed(embed);
+            } else if (blockquote && !iframe) {
                 consoleLog(`[TweetBackup] Found failed tweet embed (${embed.dataset.tweetId}). Retrying render.`);
-                window.twttr.widgets.load(embed);
+                embed.dataset.lastRenderAttempt = now;
+                if (window.twttr && window.twttr.widgets) {
+                    window.twttr.widgets.load(embed);
+                }
             }
         });
-    }, 10000); // Check every 10 seconds
+    }, 3000); // Check every 3 seconds
 }
 
 
 function processTweetEmbed(embedContainer) {
     const tweetId = embedContainer.dataset.tweetId;
-    if (!tweetId || embedContainer.dataset.processed === 'true') {
-        return; // Don't process if no ID or already processed
+    if (!tweetId) {
+        return;
     }
 
     const embedMode = localStorage.getItem('otk-tweet-embed-mode') || 'default';
 
-    const processTweet = () => {
-        const renderTweet = (html) => {
-            embedContainer.innerHTML = html;
-            if (window.twttr && window.twttr.widgets) {
-                setTimeout(() => {
-                    try {
-                        window.twttr.widgets.load(embedContainer);
-                    } catch (e) {
-                        consoleError("Error executing twttr.widgets.load:", e);
-                    }
-                }, 0);
-            }
-            embedContainer.dataset.processed = 'true';
-        };
-
-        const embedUrl = `https://publish.x.com/oembed?url=https://twitter.com/any/status/${tweetId}&theme=${embedMode}&omit_script=true`;
-        const maxRetries = 3;
-        let attempt = 0;
-
-        function fetchTweet() {
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: embedUrl,
-                onload: function(response) {
-                    try {
-                        let data;
-                        try {
-                            data = JSON.parse(response.responseText);
-                        } catch (e) {
-                            if (attempt < maxRetries) {
-                                attempt++;
-                                const delay = Math.pow(2, attempt) * 1000;
-                                consoleWarn(`Failed to parse tweet JSON, retrying in ${delay}ms...`);
-                                setTimeout(fetchTweet, delay);
-                            } else {
-                                consoleError("Error parsing tweet embed JSON after max retries", e);
-                                embedContainer.textContent = "[Tweet parse error]";
-                                embedContainer.dataset.processed = 'true';
-                            }
-                            return;
-                        }
-                        if (data.html) {
-                            renderTweet(data.html);
-                        } else {
-                            embedContainer.textContent = "[Tweet not found]";
-                            embedContainer.dataset.processed = 'true';
-                        }
-                    } catch (e) {
-                        embedContainer.textContent = "[Tweet parse error]";
-                        embedContainer.dataset.processed = 'true';
-                        consoleError("Error parsing tweet embed JSON", e);
-                    }
-                },
-                onerror: function(err) {
-                    if (attempt < maxRetries) {
-                        attempt++;
-                        const delay = Math.pow(2, attempt) * 1000;
-                        consoleWarn(`Failed to fetch tweet, retrying in ${delay}ms...`);
-                        setTimeout(fetchTweet, delay);
-                    } else {
-                        consoleError("Error loading tweet embed after max retries:", err);
-                        embedContainer.textContent = "[Tweet fetch error]";
-                        embedContainer.dataset.processed = 'true';
-                    }
-                }
-            });
-        }
-
-        fetchTweet();
-    };
-
-    if (window.twttr && window.twttr.widgets && typeof window.twttr.widgets.load === 'function') {
-        processTweet();
-    } else {
+    const renderAndLoadTweet = (html) => {
+        embedContainer.innerHTML = html;
         const script = document.createElement("script");
         script.src = "https://platform.twitter.com/widgets.js";
         script.async = true;
-        script.onload = () => {
-            if (window.twttr && window.twttr.ready) {
-                window.twttr.ready(processTweet);
-            } else {
-                processTweet();
+        embedContainer.appendChild(script);
+    };
+
+    const embedUrl = `https://publish.x.com/oembed?url=https://twitter.com/any/status/${tweetId}&theme=${embedMode}&omit_script=true`;
+    const maxRetries = 3;
+    let attempt = 0;
+
+    function fetchTweet() {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: embedUrl,
+            onload: function(response) {
+                try {
+                    if (response.status === 404) {
+                        embedContainer.textContent = "[Tweet not found]";
+                        return;
+                    }
+                    const data = JSON.parse(response.responseText);
+                    if (data.html) {
+                        renderAndLoadTweet(data.html);
+                    } else {
+                        embedContainer.textContent = "[Tweet not found]";
+                    }
+                } catch (e) {
+                    if (attempt < maxRetries) {
+                        attempt++;
+                        const delay = Math.pow(2, attempt) * 1000;
+                        consoleWarn(`Failed to parse tweet JSON, retrying in ${delay}ms...`);
+                        setTimeout(fetchTweet, delay);
+                    } else {
+                        consoleError("Error parsing tweet embed JSON after max retries", e);
+                        embedContainer.textContent = "[Tweet parse error]";
+                    }
+                }
+            },
+            onerror: function(err) {
+                if (attempt < maxRetries) {
+                    attempt++;
+                    const delay = Math.pow(2, attempt) * 1000;
+                    consoleWarn(`Failed to fetch tweet, retrying in ${delay}ms...`);
+                    setTimeout(fetchTweet, delay);
+                } else {
+                    consoleError("Error loading tweet embed after max retries:", err);
+                    embedContainer.textContent = "[Tweet fetch error]";
+                }
             }
-        };
-        document.head.appendChild(script);
+        });
     }
+
+    fetchTweet();
 }
 
 // --- IIFE Scope Helper for Intersection Observer ---
@@ -4812,27 +4622,27 @@ function handleIntersection(entries, observerInstance) {
         const wrapper = entry.target;
         const iframe = wrapper.querySelector('iframe');
 
-        if (iframe) { // Handle video embeds
-            if (entry.isIntersecting) {
-                // Element is now visible
-                if (iframe.dataset.src && (!iframe.src || iframe.src === 'about:blank')) {
-                    console.log('[LazyLoad] Iframe is intersecting, loading src:', iframe.dataset.src);
-                    iframe.src = iframe.dataset.src;
-                }
-            } else {
-                // Element is no longer visible
-                const unloadEnabled = localStorage.getItem('otkUnloadVideos') === 'true';
-                if (unloadEnabled && iframe.src && iframe.src !== 'about:blank') {
-                    console.log('[LazyLoad] Iframe is no longer intersecting, unloading src:', iframe.src);
-                    if (iframe.contentWindow && iframe.src.includes("youtube.com/embed")) {
-                        try {
-                            iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', 'https://www.youtube.com');
-                        } catch (e) {
-                            consoleWarn('[LazyLoad] Error attempting to postMessage pause to YouTube:', e);
-                        }
+        if (entry.isIntersecting) {
+            // Element is now visible
+            wrapper.style.display = ''; // Restore display
+            if (wrapper.classList.contains('otk-tweet-embed-wrapper') && !iframe) {
+                processTweetEmbed(wrapper);
+            } else if (iframe && iframe.dataset.src && (!iframe.src || iframe.src === 'about:blank') && !wrapper.classList.contains('otk-tweet-embed-wrapper')) {
+                console.log('[LazyLoad] Iframe is intersecting, loading src:', iframe.dataset.src);
+                iframe.src = iframe.dataset.src;
+            }
+        } else {
+            // Element is no longer visible
+            if (iframe && iframe.src && iframe.src !== 'about:blank' && !wrapper.classList.contains('otk-tweet-embed-wrapper')) {
+                console.log('[LazyLoad] Iframe is no longer intersecting, unloading src:', iframe.src);
+                if (iframe.contentWindow && iframe.src.includes("youtube.com/embed")) {
+                    try {
+                        iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', 'https://www.youtube.com');
+                    } catch (e) {
+                        consoleWarn('[LazyLoad] Error attempting to postMessage pause to YouTube:', e);
                     }
-                    iframe.src = 'about:blank';
                 }
+                iframe.src = 'about:blank';
             }
         }
     });
@@ -4903,16 +4713,18 @@ async function applyMainTheme() {
         consoleLog("Applying main theme from GM storage.");
         try {
             const mainThemeSettings = JSON.parse(mainThemeJSON);
-            let currentSettings = {};
-            try {
-                currentSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-            } catch (e) {
-                consoleWarn("Could not parse current theme settings, will overwrite with main theme.", e);
+
+            // Apply all settings from the main theme
+            for (const key in mainThemeSettings) {
+                if (mainThemeSettings.hasOwnProperty(key)) {
+                    localStorage.setItem(key, mainThemeSettings[key]);
+                }
             }
 
-            // Overwrite current settings with main theme settings
+            // Persist the loaded theme as the active theme
             localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(mainThemeSettings));
-            consoleLog("Main theme settings merged and applied to active theme.");
+            consoleLog("Main theme settings have been applied as the active theme.");
+
         } catch (e) {
             consoleError("Error parsing or applying main theme from GM storage:", e);
         }
@@ -4921,12 +4733,15 @@ async function applyMainTheme() {
     }
 }
 
-function applyThemeSettings() {
-    let settings = {};
-    try {
-        settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-    } catch (e) {
-        consoleError("Error parsing theme settings from localStorage:", e);
+function applyThemeSettings(previewSettings = null) {
+    let settings = previewSettings;
+    if (!settings) {
+        try {
+            settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+        } catch (e) {
+            consoleError("Error parsing theme settings from localStorage:", e);
+            settings = {};
+        }
     }
     consoleLog("Applying theme settings:", settings);
 
@@ -5427,6 +5242,38 @@ function setupOptionsWindow() {
     const memoryReportControlsWrapper = document.createElement('div');
     memoryReportControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
 
+    const bgUpdateCheckboxContainer = document.createElement('div');
+    bgUpdateCheckboxContainer.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+    const bgUpdateLabel = document.createElement('label');
+    bgUpdateLabel.textContent = "Disable Background Updates:";
+    bgUpdateLabel.htmlFor = 'otk-disable-bg-update-checkbox';
+    bgUpdateLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+    const bgUpdateControlsWrapper = document.createElement('div');
+    bgUpdateControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
+
+    const bgUpdateCheckbox = document.createElement('input');
+    bgUpdateCheckbox.type = 'checkbox';
+    bgUpdateCheckbox.id = 'otk-disable-bg-update-checkbox';
+    bgUpdateCheckbox.style.cssText = "height: 16px; width: 16px;";
+    bgUpdateCheckbox.checked = localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) === 'true';
+
+    bgUpdateCheckbox.addEventListener('change', () => {
+        const isEnabled = bgUpdateCheckbox.checked;
+        localStorage.setItem(BACKGROUND_UPDATES_DISABLED_KEY, isEnabled);
+        if (isEnabled) {
+            stopBackgroundRefresh();
+        } else {
+            startBackgroundRefresh(true);
+        }
+    });
+
+    bgUpdateControlsWrapper.appendChild(bgUpdateCheckbox);
+    bgUpdateCheckboxContainer.appendChild(bgUpdateLabel);
+    bgUpdateCheckboxContainer.appendChild(bgUpdateControlsWrapper);
+    generalSettingsSection.appendChild(bgUpdateCheckboxContainer);
+
     const memoryReportCheckbox = document.createElement('input');
     memoryReportCheckbox.type = 'checkbox';
     memoryReportCheckbox.id = 'otk-memory-report-checkbox';
@@ -5819,6 +5666,7 @@ function setupOptionsWindow() {
     themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Text:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
     themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Cog Icon:", storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' }));
     themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Disable Background Update Text:", storageKey: 'disableBgFontColor', cssVariable: '--otk-disable-bg-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'disable-bg-font' }));
+    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Countdown Timer Text:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'countdown-timer-text' }));
 
     // Sub-section for GUI Buttons
     const guiButtonsSubHeading = document.createElement('h6');
@@ -5969,12 +5817,6 @@ function setupOptionsWindow() {
     tweetEmbedModeGroup.appendChild(tweetEmbedModeControlsWrapper);
     themeOptionsContainer.appendChild(tweetEmbedModeGroup);
 
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Lazy Load YouTube Embeds:", storageKey: 'otkLazyLoadYouTube', defaultValue: true, idSuffix: 'lazy-load-youtube', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Lazy Load Twitch Embeds:", storageKey: 'otkLazyLoadTwitch', defaultValue: true, idSuffix: 'lazy-load-twitch', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Lazy Load Streamable Embeds:", storageKey: 'otkLazyLoadStreamable', defaultValue: true, idSuffix: 'lazy-load-streamable', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Lazy Load TikTok Embeds:", storageKey: 'otkLazyLoadTikTok', defaultValue: true, idSuffix: 'lazy-load-tiktok', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Lazy Load Kick Clips:", storageKey: 'otkLazyLoadKick', defaultValue: true, idSuffix: 'lazy-load-kick', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Unload Videos When Scrolled Past:", storageKey: 'otkUnloadVideos', defaultValue: true, idSuffix: 'unload-videos', requiresRerender: true }));
 
     // --- Message Limiting Feature ---
     const messageLimitGroup = document.createElement('div');
@@ -6167,12 +6009,15 @@ function setupOptionsWindow() {
             return;
         }
 
+        const allConfigs = getAllOptionConfigs();
         let currentSettings = {};
-        try {
-            currentSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-        } catch (e) {
-            consoleError("Error parsing theme settings from localStorage:", e);
-        }
+        allConfigs.forEach(config => {
+            const value = localStorage.getItem(config.storageKey);
+            if (value !== null) {
+                currentSettings[config.storageKey] = value;
+            }
+        });
+
         let allCustomThemes = {};
         try {
             allCustomThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
@@ -6244,48 +6089,23 @@ function setupOptionsWindow() {
         if (selectedValue === "__REVERT__") {
             if (prePreviewSettings) {
                 consoleLog("[PreviewTheme] Reverting to pre-preview settings.");
-                localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(prePreviewSettings));
-                applyThemeSettings();
-                // prePreviewSettings = null; // Clear after reverting, or keep if user might toggle back and forth? Let's clear.
+                applyThemeSettings(prePreviewSettings);
                 currentlyPreviewingThemeName = null;
             } else {
-                // This case means "Active Settings" was selected but nothing was previewed yet,
-                // or it was re-selected after a load. Ensure current active settings are applied.
                 consoleLog("[PreviewTheme] 'Active Settings' selected. Ensuring current active settings are applied.");
-                const activeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-                localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(activeSettings)); // Re-affirm
                 applyThemeSettings();
                 currentlyPreviewingThemeName = null;
             }
-        } else { // A custom theme is selected for preview
-            const themeToPreview = Object.values(customThemes).find(t => t.name === selectedValue);
+        } else {
+            const themeToPreview = customThemes[selectedValue];
             if (themeToPreview) {
-                if (currentlyPreviewingThemeName === null) { // Only store pre-preview if not already previewing
-                    // Store current *active* settings (from THEME_SETTINGS_KEY) before applying preview
+                if (currentlyPreviewingThemeName === null) {
                     prePreviewSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
                     consoleLog("[PreviewTheme] Stored pre-preview settings:", JSON.parse(JSON.stringify(prePreviewSettings)));
                 }
 
-                consoleLog(`[PreviewTheme] Previewing theme "${selectedValue}". Settings:`, JSON.parse(JSON.stringify(themeToPreview.settings)));
-                // Apply theme settings for preview WITHOUT saving to THEME_SETTINGS_KEY yet.
-                // applyThemeSettings directly uses THEME_SETTINGS_KEY, so we need a way to apply settings without permanently saving them.
-                // Option 1: Modify applyThemeSettings to take an optional settings object.
-                // Option 2: Temporarily set THEME_SETTINGS_KEY, apply, then restore if needed (more complex).
-                // Let's go with Option 1. (This will require modifying applyThemeSettings later)
-
-                // For now, let's simulate by updating CSS vars and inputs directly from themeToPreview.settings
-                // This is a temporary approach until applyThemeSettings is refactored.
-                // This will be complex to do manually here.
-                //
-                // Revised approach for preview:
-                // 1. Store current active settings (from THEME_SETTINGS_KEY) into prePreviewSettings (if not already previewing).
-                // 2. Temporarily set THEME_SETTINGS_KEY to the preview theme's settings.
-                // 3. Call applyThemeSettings(). This will make the preview active.
-                // 4. The "Load" button will make this temporary state permanent.
-                // 5. Selecting "__REVERT__" will restore THEME_SETTINGS_KEY from prePreviewSettings and call applyThemeSettings().
-
-                localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(themeToPreview.settings)); // Temporarily set for applyThemeSettings
-                applyThemeSettings();
+                consoleLog(`[PreviewTheme] Previewing theme "${selectedValue}".`);
+                applyThemeSettings(themeToPreview);
                 currentlyPreviewingThemeName = selectedValue;
             }
         }
@@ -6305,7 +6125,7 @@ function setupOptionsWindow() {
         } catch (e) {
             consoleError("Error parsing custom themes from localStorage:", e);
         }
-        const themeToLoad = Object.values(customThemes).find(t => t.name === selectedThemeName);
+        const themeToLoad = customThemes[selectedThemeName];
 
         if (!themeToLoad) {
             alert(`Error: Could not find the theme "${selectedThemeName}" to load.`);
@@ -6314,26 +6134,31 @@ function setupOptionsWindow() {
 
         consoleLog(`Loading custom theme: "${selectedThemeName}"`);
 
-        // 1. Reset all theme settings to their base defaults first.
-        resetAllThemeSettingsToDefault(false); // Pass false to prevent confirmation prompt
+        // Apply all settings from the loaded theme
+        for (const key in themeToLoad) {
+            if (themeToLoad.hasOwnProperty(key)) {
+                localStorage.setItem(key, themeToLoad[key]);
+            }
+        }
 
-        // 2. Set the new theme's settings into the active settings key.
-        localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(themeToLoad.settings));
+        // Create a temporary theme settings object for applyThemeSettings
+        const tempThemeSettings = { ...themeToLoad };
+        applyThemeSettings(tempThemeSettings);
 
-        // 3. Apply the newly loaded settings.
-        applyThemeSettings();
+        // Persist the loaded theme as the active theme
+        localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(themeToLoad));
 
-        // 4. Clear any preview-related state.
+
         prePreviewSettings = null;
         currentlyPreviewingThemeName = null;
-        customThemesDropdown.value = "__REVERT__"; // Set dropdown to show "Active Settings"
+        customThemesDropdown.value = "__REVERT__";
 
         alert(`Theme "${selectedThemeName}" loaded successfully.`);
     });
 
     deleteThemeButton.addEventListener('click', () => {
         const selectedThemeName = customThemesDropdown.value;
-        if (!selectedThemeName || customThemesDropdown.selectedOptions.length === 0 || customThemesDropdown.selectedOptions[0].disabled) {
+        if (selectedThemeName === "__REVERT__" || !selectedThemeName || (customThemesDropdown.selectedOptions[0] && customThemesDropdown.selectedOptions[0].disabled)) {
             alert("Please select a theme to delete.");
             return;
         }
@@ -6348,17 +6173,16 @@ function setupOptionsWindow() {
         } catch (e) {
             consoleError("Error parsing custom themes from localStorage:", e);
         }
-        const updatedThemes = Object.values(customThemes).filter(t => t.name !== selectedThemeName);
 
-        if (customThemes.length === updatedThemes.length) {
-            alert(`Error: Theme "${selectedThemeName}" not found for deletion.`); // Should not happen if selected from dropdown
-            return;
+        if (customThemes[selectedThemeName]) {
+            delete customThemes[selectedThemeName];
+            localStorage.setItem(CUSTOM_THEMES_KEY, JSON.stringify(customThemes));
+            populateCustomThemesDropdown();
+            alert(`Theme "${selectedThemeName}" deleted successfully!`);
+            consoleLog(`Custom theme "${selectedThemeName}" deleted.`);
+        } else {
+            alert(`Error: Theme "${selectedThemeName}" not found for deletion.`);
         }
-
-        localStorage.setItem(CUSTOM_THEMES_KEY, JSON.stringify(updatedThemes));
-        populateCustomThemesDropdown(); // Refresh the dropdown
-        alert(`Theme "${selectedThemeName}" deleted successfully!`);
-        consoleLog(`Custom theme "${selectedThemeName}" deleted.`);
     });
 
 
@@ -6400,55 +6224,63 @@ function setupOptionsWindow() {
 
     // Helper function to get all theme configurations (used by save and reset)
     function getAllOptionConfigs() {
-        // Note: labelText is not part of this config object, it's passed directly to createThemeOptionRow.
-        // This function is primarily for mapping storageKey, cssVariable, defaultValue, inputType, etc.
-        // The spelling change from "Color" to "Colour" happens in the createThemeOptionRow calls.
         return [
+            // GUI
             { storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' },
             { storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'title-text' },
             { storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' },
             { storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' },
             { storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' },
-            { storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' },
-            { storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#555', inputType: 'color', idSuffix: 'gui-bottom-border' },
-            // { storageKey: 'viewerMessageFontSize', cssVariable: '--otk-viewer-message-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', idSuffix: 'fontsize-message-text' }, // Removed old global
-            // New Depth-Specific Content Font Sizes
-            { storageKey: 'msgDepth0ContentFontSize', cssVariable: '--otk-msg-depth0-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth0-content-fontsize'},
-            { storageKey: 'msgDepth1ContentFontSize', cssVariable: '--otk-msg-depth1-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth1-content-fontsize'},
-            { storageKey: 'msgDepth2plusContentFontSize', cssVariable: '--otk-msg-depth2plus-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth2plus-content-fontsize'},
-            // Existing depth-specific color options (no changes needed to these specific lines, just context for new font sizes)
-            { storageKey: 'msgDepth0BgColor', cssVariable: '--otk-msg-depth0-bg-color', defaultValue: '#343434', inputType: 'color', idSuffix: 'msg-depth0-bg' },
-            { storageKey: 'msgDepth0TextColor', cssVariable: '--otk-msg-depth0-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-text' },
-            { storageKey: 'msgDepth0HeaderTextColor', cssVariable: '--otk-msg-depth0-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-header-text' },
-            { storageKey: 'viewerHeaderBorderColor', cssVariable: '--otk-viewer-header-border-color', defaultValue: '#555', inputType: 'color', idSuffix: 'viewer-header-border' },
-            { storageKey: 'msgDepth1BgColor', cssVariable: '--otk-msg-depth1-bg-color', defaultValue: '#525252', inputType: 'color', idSuffix: 'msg-depth1-bg' },
-            { storageKey: 'msgDepth1TextColor', cssVariable: '--otk-msg-depth1-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-text' },
-            { storageKey: 'msgDepth1HeaderTextColor', cssVariable: '--otk-msg-depth1-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-header-text' },
-            { storageKey: 'viewerQuote1HeaderBorderColor', cssVariable: '--otk-viewer-quote1-header-border-color', defaultValue: '#343434', inputType: 'color', idSuffix: 'viewer-quote1-border' },
-            { storageKey: 'msgDepth2plusBgColor', cssVariable: '--otk-msg-depth2plus-bg-color', defaultValue: '#484848', inputType: 'color', idSuffix: 'msg-depth2plus-bg' },
-            { storageKey: 'msgDepth2plusTextColor', cssVariable: '--otk-msg-depth2plus-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-text' },
-            { storageKey: 'msgDepth2plusHeaderTextColor', cssVariable: '--otk-msg-depth2plus-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-header-text' },
-            { storageKey: 'viewerQuote2plusHeaderBorderColor', cssVariable: '--otk-viewer-quote2plus-header-border-color', defaultValue: '#2a2a2a', inputType: 'color', idSuffix: 'viewer-quote2plus-border' },
+            { storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' },
             { storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' },
             { storageKey: 'disableBgFontColor', cssVariable: '--otk-disable-bg-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'disable-bg-font' },
-            { storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' },
-            { storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'new-msg-divider' },
-            { storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'new-msg-font' },
-
-            // Anchor Highlight Colors
-            { storageKey: 'anchorHighlightBgColor', cssVariable: '--otk-anchor-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'anchor-bg' },
-            { storageKey: 'anchorHighlightBorderColor', cssVariable: '--otk-anchor-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'anchor-border' },
-
-            // GUI Button Colours
+            { storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'countdown-timer-text' },
+            // GUI Buttons
             { storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' },
             { storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' },
             { storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' },
             { storageKey: 'guiButtonHoverBgColor', cssVariable: '--otk-button-hover-bg-color', defaultValue: '#666666', inputType: 'color', idSuffix: 'gui-button-hover-bg' },
             { storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' },
-
-            // Loading Screen Colours
-            { storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' },
+            // Viewer
+            { storageKey: 'otkMessageLayoutStyle', defaultValue: 'default', inputType: 'dropdown' },
+            { storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' },
+            { storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#555', inputType: 'color', idSuffix: 'gui-bottom-border' },
+            { storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'new-msg-divider' },
+            { storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'new-msg-font' },
+            { storageKey: 'anchorHighlightBgColor', cssVariable: '--otk-anchor-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'anchor-bg', requiresRerender: true },
+            { storageKey: 'anchorHighlightBorderColor', cssVariable: '--otk-anchor-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'anchor-border', requiresRerender: true },
+            { storageKey: 'otkTweetEmbedMode', defaultValue: 'default', inputType: 'dropdown' },
+            { storageKey: 'otkMessageLimitEnabled', defaultValue: false, inputType: 'checkbox' },
+            { storageKey: 'otkMessageLimitValue', defaultValue: '500', inputType: 'number' },
+            // Depth 0 Messages
+            { storageKey: 'msgDepth0ContentFontSize', cssVariable: '--otk-msg-depth0-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth0-content-fontsize', requiresRerender: true },
+            { storageKey: 'msgDepth0BgColor', cssVariable: '--otk-msg-depth0-bg-color', defaultValue: '#343434', inputType: 'color', idSuffix: 'msg-depth0-bg', requiresRerender: true },
+            { storageKey: 'msgDepth0TextColor', cssVariable: '--otk-msg-depth0-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-text', requiresRerender: true },
+            { storageKey: 'msgDepth0HeaderTextColor', cssVariable: '--otk-msg-depth0-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-header-text', requiresRerender: true },
+            { storageKey: 'viewerHeaderBorderColor', cssVariable: '--otk-viewer-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border', requiresRerender: true },
+            { storageKey: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, inputType: 'checkbox', idSuffix: 'msg-depth0-disable-header-underline', requiresRerender: true },
+            { storageKey: 'otkMsgDepth0DisplayMediaFilename', defaultValue: true, inputType: 'checkbox', idSuffix: 'msg-depth0-display-media-filename', requiresRerender: true },
+            // Depth 1 Messages
+            { storageKey: 'msgDepth1ContentFontSize', cssVariable: '--otk-msg-depth1-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth1-content-fontsize', requiresRerender: true },
+            { storageKey: 'msgDepth1BgColor', cssVariable: '--otk-msg-depth1-bg-color', defaultValue: '#525252', inputType: 'color', idSuffix: 'msg-depth1-bg', requiresRerender: true },
+            { storageKey: 'msgDepth1TextColor', cssVariable: '--otk-msg-depth1-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-text', requiresRerender: true },
+            { storageKey: 'msgDepth1HeaderTextColor', cssVariable: '--otk-msg-depth1-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-header-text', requiresRerender: true },
+            { storageKey: 'viewerQuote1HeaderBorderColor', cssVariable: '--otk-viewer-quote1-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote1-border', requiresRerender: true },
+            { storageKey: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: false, inputType: 'checkbox', idSuffix: 'msg-depth1-disable-header-underline', requiresRerender: true },
+            { storageKey: 'otkMsgDepth1DisplayMediaFilename', defaultValue: true, inputType: 'checkbox', idSuffix: 'msg-depth1-display-media-filename', requiresRerender: true },
+            // Depth 2+ Messages
+            { storageKey: 'msgDepth2plusContentFontSize', cssVariable: '--otk-msg-depth2plus-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth2plus-content-fontsize', requiresRerender: true },
+            { storageKey: 'msgDepth2plusBgColor', cssVariable: '--otk-msg-depth2plus-bg-color', defaultValue: '#484848', inputType: 'color', idSuffix: 'msg-depth2plus-bg', requiresRerender: true },
+            { storageKey: 'msgDepth2plusTextColor', cssVariable: '--otk-msg-depth2plus-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-text', requiresRerender: true },
+            { storageKey: 'msgDepth2plusHeaderTextColor', cssVariable: '--otk-msg-depth2plus-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-header-text', requiresRerender: true },
+            { storageKey: 'viewerQuote2plusHeaderBorderColor', cssVariable: '--otk-viewer-quote2plus-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote2plus-border', requiresRerender: true },
+            { storageKey: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: false, inputType: 'checkbox', idSuffix: 'msg-depth2plus-disable-header-underline', requiresRerender: true },
+            { storageKey: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: true, inputType: 'checkbox', idSuffix: 'msg-depth2plus-display-media-filename', requiresRerender: true },
+            // Options Panel
+            { storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' },
+            // Loading Screen
             { storageKey: 'loadingOverlayOpacity', cssVariable: '--otk-loading-overlay-opacity', defaultValue: '0.8', inputType: 'number', unit: null, min:0.0, max:1.0, step:0.05, idSuffix: 'loading-overlay-opacity' },
+            { storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' },
             { storageKey: 'loadingTextColor', cssVariable: '--otk-loading-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-text' },
             { storageKey: 'loadingProgressBarBgColor', cssVariable: '--otk-loading-progress-bar-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'loading-progress-bg' },
             { storageKey: 'loadingProgressBarFillColor', cssVariable: '--otk-loading-progress-bar-fill-color', defaultValue: '#4CAF50', inputType: 'color', idSuffix: 'loading-progress-fill' },
@@ -6463,53 +6295,17 @@ function setupOptionsWindow() {
         }
 
         consoleLog("Resetting all theme settings to default...");
-        // Clear the active theme settings from localStorage.
-        localStorage.removeItem(THEME_SETTINGS_KEY);
 
         const allOptionConfigs = getAllOptionConfigs();
+        let defaultSettings = {};
 
         allOptionConfigs.forEach(opt => {
-            // Remove the inline style to revert to the stylesheet's default.
-            document.documentElement.style.removeProperty(opt.cssVariable);
-
-            // Update the input fields in the options panel to reflect the default values.
-            const mainInput = document.getElementById(`otk-${opt.idSuffix}`);
-            const hexInput = opt.inputType === 'color' ? document.getElementById(`otk-${opt.idSuffix}-hex`) : null;
-
-            // Get the default value from the stylesheet or the config's fallback.
-            let cssDefaultValue = getComputedStyle(document.documentElement).getPropertyValue(opt.cssVariable)?.trim() || opt.defaultValue;
-            if (opt.unit && cssDefaultValue.endsWith(opt.unit)) {
-                cssDefaultValue = cssDefaultValue.replace(opt.unit, '');
-            }
-
-            if (mainInput) mainInput.value = cssDefaultValue;
-            if (hexInput) hexInput.value = cssDefaultValue;
-
-            if (opt.storageKey === 'cogIconColor') {
-                const cogIcon = document.getElementById('otk-settings-cog');
-                if (cogIcon) cogIcon.style.color = ''; // Revert to stylesheet
-            }
+            localStorage.removeItem(opt.storageKey);
+            defaultSettings[opt.storageKey] = opt.defaultValue;
         });
 
-        // Also reset new boolean settings to their defaults
-        const newBooleanSettings = [
-            { key: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth0-disable-header-underline' },
-            { key: 'otkMsgDepth0DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth0-display-media-filename' },
-            { key: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth1-disable-header-underline' },
-            { key: 'otkMsgDepth1DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth1-display-media-filename' },
-            { key: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth2plus-disable-header-underline' },
-            { key: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth2plus-display-media-filename' }
-        ];
-        newBooleanSettings.forEach(opt => {
-            const checkbox = document.getElementById(`otk-${opt.idSuffix}-checkbox`);
-            if (checkbox) {
-                checkbox.checked = opt.defaultValue;
-            }
-        });
+        localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(defaultSettings));
 
-        // The applyThemeSettings() call is no longer needed here if called by the initiator.
-        // If called from the reset button, it should call it.
-        // Let's call it for the standalone reset case.
         if (promptUser) {
             applyThemeSettings();
             alert("All theme settings have been reset to their defaults.");
@@ -6532,22 +6328,26 @@ function setupOptionsWindow() {
     }
 
     closeButton.addEventListener('click', () => {
+        if (Object.keys(pendingThemeChanges).length > 0) {
+            if (confirm("You have unsaved changes that require a viewer refresh to apply. Do you want to discard them?")) {
+                pendingThemeChanges = {};
+                hideApplyDiscardButtons();
+                applyThemeSettings(); // Re-apply original settings
+            } else {
+                return; // Keep the options window open
+            }
+        }
+
         // Reversion logic for theme preview
         if (prePreviewSettings) {
             consoleLog("[OptionsClose] Reverting to pre-preview settings as options window is closing.");
-            localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(prePreviewSettings));
-            applyThemeSettings(); // Apply the restored settings
-
-            prePreviewSettings = null; // Clear the stored pre-preview settings
-            currentlyPreviewingThemeName = null; // Clear the currently previewing theme name
-
-            // Reset dropdown to "Active Settings"
+            applyThemeSettings(prePreviewSettings); // Apply the restored settings without saving
+            prePreviewSettings = null;
+            currentlyPreviewingThemeName = null;
             const dropdown = document.getElementById('otk-custom-themes-dropdown');
             if (dropdown) {
                 dropdown.value = "__REVERT__";
             }
-        } else {
-            consoleLog("[OptionsClose] No active preview to revert. Closing options window.");
         }
 
         optionsWindow.style.display = 'none';
@@ -6872,6 +6672,7 @@ async function main() {
             } else {
                 consoleLog("Background updates are disabled by user preference.");
             }
+            updateCountdownTimer();
 
             consoleLog("OTK Thread Tracker script initialized and running.");
 
@@ -6898,6 +6699,8 @@ async function main() {
             consoleWarn('[Final Check] centerInfoContainer not found for flex-grow check.');
         }
     });
+
+    // The Twitter widget script is now loaded dynamically in processTweetEmbed.
 
     window.addEventListener('scroll', () => {
         if (scrollTimeout) {
