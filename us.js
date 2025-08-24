@@ -4,15 +4,22 @@
 
 // @name         Thread Tracker
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  Tracks OTK threads on /b/, stores messages and media, shows top bar with colors and controls, removes inactive threads entirely
 // @match        https://boards.4chan.org/b/
 // @grant        GM_xmlhttpRequest
-// @connect      publish.x.com
 // ==/UserScript==
 
 (function () {
     'use strict';
+
+let statAnimationFrameId = null;
+let tabHidden = false;
+let statAnimationTimers = [];
+
+document.addEventListener("visibilitychange", () => {
+  tabHidden = document.hidden;
+});
 
     // Constants for storage keys
     const THREADS_KEY = 'otkActiveThreads';
@@ -34,16 +41,21 @@
     const OTK_TRACKED_KEYWORDS_KEY = 'otkTrackedKeywords'; // For user-defined keywords
     const OTK_BG_UPDATE_FREQ_SECONDS_KEY = 'otkBgUpdateFrequencySeconds'; // For background update frequency
     const TWEET_EMBED_MODE_KEY = 'otkTweetEmbedMode'; // For tweet embed theme
+    const TWEET_CACHE_KEY = 'otkTweetCache'; // For caching tweet HTML
     const MAIN_THEME_KEY = 'otkMainTheme';
-    const twitterPatterns = [
-        { regex: /^(?:https?:\/\/)?(?:www\.)?(?:twitter|x)\.com\/\w+\/status\/(\d+)/, idGroup: 1 }
-    ];
-    const inlineTwitterPatterns = [
-        { regex: /(?:https?:\/\/)?(?:www\.)?(?:twitter|x)\.com\/\w+\/status\/(\d+)/, idGroup: 1 }
-    ];
+    const BLURRED_IMAGES_KEY = 'otkBlurredImages';
+    const IMAGE_BLUR_AMOUNT_KEY = 'otkImageBlurAmount';
+    const BLOCKED_THREADS_KEY = 'otkBlockedThreads';
 
     // --- Global variables ---
     let otkViewer = null;
+    let cityData = [];
+    let tweetCache = {};
+    try {
+        tweetCache = JSON.parse(localStorage.getItem(TWEET_CACHE_KEY)) || {};
+    } catch (e) {
+        consoleError("Error parsing tweet cache from localStorage:", e);
+    }
     let viewerActiveImageCount = null; // For viewer-specific unique image count
     let viewerActiveVideoCount = null; // For viewer-specific unique video count
     let backgroundRefreshIntervalId = null;
@@ -60,6 +72,9 @@
     let renderedFullSizeImageHashes = new Set(); // Tracks image hashes already rendered full-size in current viewer session
     let mediaIntersectionObserver = null; // For lazy loading embeds
     let createdBlobUrls = new Set();
+    let blurredImages = new Set();
+    let blockedThreads = new Set();
+    let cachedNewMessages = [];
 
     // IndexedDB instance
     let otkMediaDB = null;
@@ -251,10 +266,6 @@
 
     // --- Media Embedding Helper Functions ---
 function createYouTubeEmbedElement(videoId, timestampStr) { // Removed isInlineEmbed parameter
-    // --- LOAD POLICY: Lazy Loading ---
-    // YouTube embeds are lazy-loaded by default. The iframe's `src` is not set until the element
-    // is about to enter the viewport. This is controlled by the `otkLazyLoadYouTube` localStorage setting.
-    // If 'otkLazyLoadYouTube' is 'false', the embed will load eagerly.
     let startSeconds = 0;
     if (timestampStr) {
         // Try to parse timestamp like 1h2m3s or 2m3s or 3s or just 123 (YouTube takes raw seconds for ?t=)
@@ -308,12 +319,18 @@ function createYouTubeEmbedElement(videoId, timestampStr) { // Removed isInlineE
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('allow', 'accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
 
-    iframe.dataset.src = embedUrl;
-    if (mediaIntersectionObserver) {
-        mediaIntersectionObserver.observe(wrapper);
+    const lazyLoadEnabled = (localStorage.getItem('otkLazyLoadYouTube') || 'true') === 'true';
+
+    if (lazyLoadEnabled) {
+        iframe.dataset.src = embedUrl;
+        if (mediaIntersectionObserver) {
+            mediaIntersectionObserver.observe(wrapper);
+        } else {
+            consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
+            iframe.src = iframe.dataset.src;
+        }
     } else {
-        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-        iframe.src = iframe.dataset.src;
+        iframe.src = embedUrl;
     }
 
     wrapper.appendChild(iframe);
@@ -322,20 +339,25 @@ function createYouTubeEmbedElement(videoId, timestampStr) { // Removed isInlineE
 
 // Helper function for processing text segments (either append as text or handle as quote)
 function appendTextOrQuoteSegment(textElement, segment, quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, parentMessageId) {
+    // Note: mediaLoadPromises is passed down in case quote recursion generates media elements that need tracking.
+    // However, createMessageElementDOM for quotes currently passes an empty array for it. This could be enhanced.
     const quoteMatch = segment.match(quoteRegex);
 
-    if (quoteMatch && segment.startsWith(quoteMatch[0])) {
+    if (quoteMatch && segment.startsWith(quoteMatch[0])) { // Process as quote only if segment starts with it
+        // Handle quote (potentially recursive)
         if (currentDepth >= MAX_QUOTE_DEPTH) {
-            if (segment.trim() === quoteMatch[0]) {
-                return true; // Indicate that the segment was fully consumed and should be skipped.
-            }
+            // At max depth, display quote link as text or a placeholder, but don't recurse
+            // To match original behavior of skipping pure ">>123" lines at max depth:
+            if (segment === quoteMatch[0]) return; // Skip pure quote link if it's the entire segment
+
+            // If "text >>123" or ">>123 text" at max depth, treat as text
             textElement.appendChild(document.createTextNode(segment));
-            return false;
+            return;
         }
 
+        // Not at max depth, so process the quote
         const quotedMessageId = quoteMatch[1];
         let quotedMessageObject = null;
-        // ... (find quotedMessageObject logic remains the same)
         for (const threadIdKey in messagesByThreadId) {
             if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
                 const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === Number(quotedMessageId));
@@ -349,17 +371,18 @@ function appendTextOrQuoteSegment(textElement, segment, quoteRegex, currentDepth
         if (quotedMessageObject) {
             const quotedElement = createMessageElementDOM(
                 quotedMessageObject,
-                mediaLoadPromises,
+                                mediaLoadPromises, // Pass down the array for mediaLoadPromises for quotes
                 uniqueImageViewerHashes,
+                // uniqueVideoViewerHashes, // Removed
                 quotedMessageObject.board || boardForLink,
-                false,
+                false, // isTopLevelMessage = false for quotes
                 currentDepth + 1,
-                null,
-                parentMessageId
+                null, // threadColor is not used for quoted message accents
+                parentMessageId // Pass the PARENT message's ID for the quote
             );
             if (quotedElement) {
-                if (currentDepth >= MAX_QUOTE_DEPTH - 1 && !quotedMessageObject.text && !quotedMessageObject.attachment) {
-                    return true; // Skip if it's a quote at max depth with no text/image
+                if (currentDepth >= MAX_QUOTE_DEPTH - 1 && !quotedMessageObject.text) {
+                    return;
                 }
                 textElement.appendChild(quotedElement);
             }
@@ -373,21 +396,19 @@ function appendTextOrQuoteSegment(textElement, segment, quoteRegex, currentDepth
 
         const restOfSegment = segment.substring(quoteMatch[0].length);
         if (restOfSegment.length > 0) {
-            return appendTextOrQuoteSegment(textElement, restOfSegment, quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, parentMessageId);
+            // Recursively process the rest of the segment for more quotes or text
+            // This is important if a line is like ">>123 >>456 text"
+            appendTextOrQuoteSegment(textElement, restOfSegment, quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, parentMessageId);
         }
-        return segment.trim() === quoteMatch[0];
     } else {
-        if (segment.length > 0) {
+        // Not a quote at the start of the segment (or not a quote at all), just plain text for this segment
+        if (segment.length > 0) { // Ensure non-empty segment before creating text node
             textElement.appendChild(document.createTextNode(segment));
         }
-        return false;
     }
 }
 
 function createTwitchEmbedElement(type, id, timestampStr) {
-    // --- LOAD POLICY: Lazy Loading ---
-    // Twitch embeds are lazy-loaded by default, controlled by the `otkLazyLoadTwitch` localStorage setting.
-    // If 'otkLazyLoadTwitch' is 'false', the embed will load eagerly.
     let embedUrl;
     const parentDomain = 'boards.4chan.org'; // Or dynamically get current hostname if needed for wider use
 
@@ -426,26 +447,27 @@ function createTwitchEmbedElement(type, id, timestampStr) {
     // Universal fixed size for all embeds
     wrapper.style.width = '480px';
     wrapper.style.height = '270px'; // 16:9 aspect ratio for 480px width
+    wrapper.dataset.embedUrl = embedUrl;
 
-    const iframe = document.createElement('iframe');
-    iframe.style.position = 'absolute';
-    iframe.style.top = '0';
-    iframe.style.left = '0';
-    iframe.style.width = '100%';
-    iframe.style.height = '100%';
-    iframe.setAttribute('frameborder', '0');
-    iframe.setAttribute('allowfullscreen', 'true');
-    iframe.setAttribute('scrolling', 'no');
+    const placeholder = document.createElement('div');
+    placeholder.textContent = 'Twitch embed hidden. Scroll to load.';
+    placeholder.style.cssText = `
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        background-color: #181818;
+        color: white;
+        font-size: 14px;
+    `;
+    wrapper.appendChild(placeholder);
 
-    iframe.dataset.src = embedUrl;
     if (mediaIntersectionObserver) {
         mediaIntersectionObserver.observe(wrapper);
     } else {
-        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-        iframe.src = iframe.dataset.src;
+        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Twitch embed will not lazy load.");
     }
-
-    wrapper.appendChild(iframe);
 
     return wrapper;
 }
@@ -474,12 +496,18 @@ function createKickEmbedElement(clipId) {
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('scrolling', 'no');
 
-    iframe.dataset.src = embedUrl;
-    if (mediaIntersectionObserver) {
-        mediaIntersectionObserver.observe(wrapper);
+    const lazyLoadEnabled = (localStorage.getItem('otkLazyLoadKick') || 'true') === 'true';
+
+    if (lazyLoadEnabled) {
+        iframe.dataset.src = embedUrl;
+        if (mediaIntersectionObserver) {
+            mediaIntersectionObserver.observe(wrapper);
+        } else {
+            consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
+            iframe.src = iframe.dataset.src;
+        }
     } else {
-        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-        iframe.src = iframe.dataset.src;
+        iframe.src = embedUrl;
     }
 
     wrapper.appendChild(iframe);
@@ -488,7 +516,7 @@ function createKickEmbedElement(clipId) {
 }
 
 function createTikTokEmbedElement(videoId) {
-    const embedUrl = `https://www.tiktok.com/embed/v2/${videoId}`;
+    const embedUrl = `https://www.tiktok.com/player/v1/${videoId}?autoplay=0`;
 
     const wrapper = document.createElement('div');
     wrapper.className = 'otk-tiktok-embed-wrapper otk-embed-inline';
@@ -511,12 +539,18 @@ function createTikTokEmbedElement(videoId) {
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('scrolling', 'no');
 
-    iframe.dataset.src = embedUrl;
-    if (mediaIntersectionObserver) {
-        mediaIntersectionObserver.observe(wrapper);
+    const lazyLoadEnabled = (localStorage.getItem('otkLazyLoadTikTok') || 'true') === 'true';
+
+    if (lazyLoadEnabled) {
+        iframe.dataset.src = embedUrl;
+        if (mediaIntersectionObserver) {
+            mediaIntersectionObserver.observe(wrapper);
+        } else {
+            consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
+            iframe.src = iframe.dataset.src;
+        }
     } else {
-        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-        iframe.src = iframe.dataset.src;
+        iframe.src = embedUrl;
     }
 
     wrapper.appendChild(iframe);
@@ -551,12 +585,18 @@ function createStreamableEmbedElement(videoId) {
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('scrolling', 'no');
 
-    iframe.dataset.src = embedUrl;
-    if (mediaIntersectionObserver) {
-        mediaIntersectionObserver.observe(wrapper);
+    const lazyLoadEnabled = (localStorage.getItem('otkLazyLoadStreamable') || 'true') === 'true';
+
+    if (lazyLoadEnabled) {
+        iframe.dataset.src = embedUrl;
+        if (mediaIntersectionObserver) {
+            mediaIntersectionObserver.observe(wrapper);
+        } else {
+            consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
+            iframe.src = iframe.dataset.src;
+        }
     } else {
-        consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
-        iframe.src = iframe.dataset.src;
+        iframe.src = embedUrl;
     }
 
     wrapper.appendChild(iframe);
@@ -566,22 +606,12 @@ function createStreamableEmbedElement(videoId) {
 
 
 function createTweetEmbedElement(tweetId) {
-    const embedMode = localStorage.getItem('otk-tweet-embed-mode') || 'default';
-    if (embedMode === 'disabled') {
-        const disabledSpan = document.createElement('span');
-        disabledSpan.style.display = 'none';
-        return disabledSpan;
-    }
-
-    const embedContainer = document.createElement('div');
-    embedContainer.className = 'otk-tweet-embed-wrapper';
-    embedContainer.dataset.tweetId = tweetId;
-    embedContainer.style.display = 'inline-block';
-    embedContainer.style.minHeight = '100px';
-
-    processTweetEmbed(embedContainer);
-
-    return embedContainer;
+    const tweetUrl = `https://twitter.com/any/status/${tweetId}`;
+    const link = document.createElement('a');
+    link.href = tweetUrl;
+    link.textContent = tweetUrl;
+    link.target = '_blank';
+    return link;
 }
 
 
@@ -702,7 +732,7 @@ function createTweetEmbedElement(tweetId) {
     const COLORS = [
         '#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
         '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe',
-        '#008080', '#e6beff', '#9A6324', '#fffac8', '#800000',
+        '#008080', '#e6beff', '#9A6324', '#800000',
         '#aaffc3', '#808000', '#ffd8b1', '#000075', '#808080'
     ];
 
@@ -720,9 +750,10 @@ function createTweetEmbedElement(tweetId) {
             left: 0;
             width: 100vw;
             z-index: 9999;
-            border-bottom: 1px solid var(--otk-gui-bottom-border-color);
+            border-bottom: 4px solid var(--otk-gui-bottom-border-color);
             background: var(--otk-gui-bg-color);
             box-sizing: border-box;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
         `;
 
         otkGui = document.createElement('div');
@@ -753,7 +784,7 @@ function createTweetEmbedElement(tweetId) {
             justify-content: flex-start;
             padding-top: 3px;
             padding-bottom: 5px;
-            max-width: 300px;
+            max-width: 450px;
             flex-grow: 0;
             flex-shrink: 0;
             justify-content: center;
@@ -780,6 +811,7 @@ function createTweetEmbedElement(tweetId) {
         const statsWrapper = document.createElement('div');
         statsWrapper.id = 'otk-stats-wrapper';
         statsWrapper.style.cssText = `
+            margin-bottom: 4px;
             display: flex;
             flex-direction: column;
             align-items: flex-start; /* Left-align title and stats */
@@ -806,7 +838,6 @@ function createTweetEmbedElement(tweetId) {
             margin-left: 10px;
             cursor: pointer;
             display: inline-block;
-            vertical-align: middle;
             color: var(--otk-cog-icon-color);
         `;
         cogIcon.title = "Open Settings";
@@ -814,12 +845,13 @@ function createTweetEmbedElement(tweetId) {
         const titleContainer = document.createElement('div');
         titleContainer.style.cssText = `
             display: flex;
-            align-items: center;
+            align-items: baseline;
             justify-content: flex-start; /* Left-align title and cog */
             margin-bottom: 4px;
         `;
         titleContainer.appendChild(otkThreadTitleDisplay);
         titleContainer.appendChild(cogIcon);
+
 
         const otkStatsDisplay = document.createElement('div');
         otkStatsDisplay.id = 'otk-stats-display';
@@ -889,7 +921,7 @@ function createTweetEmbedElement(tweetId) {
             display: flex;
             flex-direction: column;     /* Stack children vertically */
             align-items: flex-end;      /* Align children (top/bottom rows) to the right */
-            justify-content: space-between; /* Push top row to top, bottom row to bottom */
+            justify-content: center;    /* Center the buttons vertically */
             gap: 5px;                   /* Small gap between top and bottom rows if needed */
             height: 100%;               /* Occupy full height of parent for space-between */
         `;
@@ -928,7 +960,7 @@ function createTweetEmbedElement(tweetId) {
                 justify-content: flex-start;
                 padding-top: 3px;
                 padding-bottom: 5px;
-                max-width: 300px;
+                max-width: 450px;
                 flex-grow: 0;
                 flex-shrink: 0;
                 justify-content: center;
@@ -1143,7 +1175,46 @@ function createTweetEmbedElement(tweetId) {
     consoleLog('Initialized activeThreads from localStorage:', activeThreads);
 
 
-    // --- Utility functions ---
+    // (+n) Stat Update Logic
+function resetPlusN() {
+  const el = document.querySelector('.z-stats .z-new');
+  if (el) {
+    el.textContent = '';
+    el.style.opacity = '0';
+    el.classList.remove('active');
+  }
+  if (statAnimationFrameId) {
+    cancelAnimationFrame(statAnimationFrameId);
+    statAnimationFrameId = null;
+  }
+}
+
+function animateStatIncrease(statEl, plusNEl, from, to) {
+  const duration = 600;
+  const start = performance.now();
+
+  plusNEl.textContent = `+${to - from}`;
+  plusNEl.style.opacity = '1';
+  plusNEl.classList.add('active');
+
+  function animate(time) {
+    const progress = Math.min(1, (time - start) / duration);
+    const currentVal = Math.floor(from + (to - from) * progress);
+    statEl.textContent = currentVal;
+
+    if (progress < 1) {
+      statAnimationFrameId = requestAnimationFrame(animate);
+    } else {
+      statEl.textContent = to;
+      setTimeout(resetPlusN, 1200);
+      statAnimationFrameId = null;
+    }
+  }
+
+  statAnimationFrameId = requestAnimationFrame(animate);
+}
+
+// --- Utility functions ---
     function blobToDataURL(blob) {
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
@@ -1157,18 +1228,20 @@ function createTweetEmbedElement(tweetId) {
         return String(num).padStart(length, '0');
     }
 
-    function animateCounter(element, start, end, duration) {
-            element.style.color = 'var(--otk-background-updates-stats-text-color)';
-        let startTimestamp = null;
-        const step = (timestamp) => {
-            if (!startTimestamp) startTimestamp = timestamp;
-            const progress = Math.min((timestamp - startTimestamp) / duration, 1);
-            element.textContent = ` (+${Math.floor(progress * (end - start) + start)} new)`;
-            if (progress < 1) {
-                window.requestAnimationFrame(step);
-            }
-        };
-        window.requestAnimationFrame(step);
+    function updateCountdown() {
+        const nextUpdateTimestamp = parseInt(localStorage.getItem('otkNextUpdateTimestamp') || '0', 10);
+        const countdownTimer = document.getElementById('otk-countdown-timer');
+        if (!countdownTimer) {
+            return;
+        }
+
+        const now = Date.now();
+        const timeLeft = Math.max(0, nextUpdateTimestamp - now);
+        const hours = Math.floor(timeLeft / (1000 * 60 * 60));
+        const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
+        const seconds = Math.floor((timeLeft % (1000 * 60)) / 1000);
+
+        countdownTimer.textContent = `${padNumber(hours, 2)}:${padNumber(minutes, 2)}:${padNumber(seconds, 2)}`;
     }
 
     function hexToRgbParts(hex) {
@@ -1214,7 +1287,70 @@ function createTweetEmbedElement(tweetId) {
         return threadColors[threadId];
     }
 
+    function toggleImageBlur(filehash) {
+        if (blurredImages.has(filehash)) {
+            blurredImages.delete(filehash);
+        } else {
+            blurredImages.add(filehash);
+        }
+
+        localStorage.setItem(BLURRED_IMAGES_KEY, JSON.stringify(Array.from(blurredImages)));
+
+        // Update all images on the page
+        const allImagesOnPage = document.querySelectorAll(`img[data-filehash="${filehash}"]`);
+        const blurAmount = (localStorage.getItem(IMAGE_BLUR_AMOUNT_KEY) || 60) / 5;
+        const isBlurred = blurredImages.has(filehash);
+
+        allImagesOnPage.forEach(img => {
+            img.style.filter = isBlurred ? `blur(${blurAmount}px)` : 'none';
+        });
+        consoleLog(`Toggled blur for ${filehash}. Now blurred: ${isBlurred}`);
+    }
+
     // --- Core Logic: Rendering, Fetching, Updating ---
+
+    function parseFilterRule(ruleString) {
+        const textRegex = /"([^"]*)"/g;
+        const md5Regex = /md5:([a-zA-Z0-9+/=]+)/gi;
+        const parsed = { text: [], md5: [] };
+        let match;
+
+        while ((match = textRegex.exec(ruleString)) !== null) {
+            parsed.text.push(match[1].toLowerCase());
+        }
+        while ((match = md5Regex.exec(ruleString)) !== null) {
+            parsed.md5.push(match[1]);
+        }
+        return parsed;
+    }
+
+    function isMessageFiltered(message, parsedRules) {
+        const messageText = (message.text || '').toLowerCase();
+        const messageMd5 = message.attachment?.filehash_db_key || '';
+
+        for (const rule of parsedRules) {
+            const hasText = rule.text.length > 0;
+            const hasMd5 = rule.md5.length > 0;
+
+            if (!hasText && !hasMd5) continue;
+
+            let textMatch = !hasText;
+            if (hasText) {
+                textMatch = rule.text.every(t => messageText.includes(t));
+            }
+
+            let md5Match = !hasMd5;
+            if (hasMd5) {
+                md5Match = rule.md5.some(m => messageMd5 === m);
+            }
+
+            if (textMatch && md5Match) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     function renderThreadList() {
         const threadDisplayContainer = document.getElementById('otk-thread-display-container');
         if (!threadDisplayContainer) {
@@ -1295,7 +1431,7 @@ function createTweetEmbedElement(tweetId) {
             titleLink.href = thread.url;
             titleLink.target = '_blank';
             const fullTitle = thread.title;
-            titleLink.textContent = truncateTitleWithWordBoundary(fullTitle, 40); // Max length adjusted
+            titleLink.textContent = truncateTitleWithWordBoundary(fullTitle, 65); // Max length adjusted
             titleLink.title = fullTitle;
             let titleLinkStyle = `
                 color: var(--otk-gui-threadlist-title-color);
@@ -1311,7 +1447,7 @@ function createTweetEmbedElement(tweetId) {
             `;
 
             const time = new Date(thread.firstMessageTime * 1000);
-            const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
             const formattedTimestamp = `[${timeStr}]`;
             const timestampSpan = document.createElement('span');
             timestampSpan.textContent = formattedTimestamp;
@@ -1379,6 +1515,86 @@ function createTweetEmbedElement(tweetId) {
             titleTimeContainer.style.alignItems = 'baseline';
             titleTimeContainer.appendChild(titleLink);
             titleTimeContainer.appendChild(timestampSpan);
+
+            const crayonIcon = document.createElement('span');
+            crayonIcon.innerHTML = '🖍️';
+            crayonIcon.style.cssText = `
+                font-size: 12px;
+                cursor: pointer;
+                margin-left: 8px;
+                visibility: hidden;
+            `;
+            crayonIcon.title = "Reply to this thread";
+            titleTimeContainer.appendChild(crayonIcon);
+
+            crayonIcon.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+
+                const threadUrl = thread.url;
+                const popup = window.open(threadUrl, '_blank', 'width=460,height=425,resizable,scrollbars');
+
+                if (popup) {
+                    popup.addEventListener('load', () => {
+                        const script = popup.document.createElement('script');
+                        script.textContent = `
+                            const links = Array.from(document.querySelectorAll('a'));
+                            const replyLink = links.find(a => a.textContent.trim() === 'Post a Reply');
+                            if (replyLink) {
+                                replyLink.click();
+                            } else {
+                                console.log("Could not find 'Post a Reply' link.");
+                            }
+                        `;
+                        popup.document.body.appendChild(script);
+                    }, true);
+                } else {
+                    consoleError("Could not open popup window. Please check your browser's popup blocker settings.");
+                }
+            });
+
+            const blockIcon = document.createElement('span');
+            blockIcon.innerHTML = '&#x2715;'; // A simple 'X' icon
+            blockIcon.style.cssText = `
+                font-size: 12px;
+                color: #ff8080;
+                cursor: pointer;
+                margin-left: 5px;
+                visibility: hidden;
+            `;
+            blockIcon.title = "Block this thread";
+            titleTimeContainer.appendChild(blockIcon);
+
+            threadItemDiv.addEventListener('mouseenter', () => {
+                crayonIcon.style.visibility = 'visible';
+                blockIcon.style.visibility = 'visible';
+            });
+            threadItemDiv.addEventListener('mouseleave', () => {
+                crayonIcon.style.visibility = 'hidden';
+                blockIcon.style.visibility = 'hidden';
+            });
+
+            blockIcon.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+
+                blockedThreads.add(thread.id);
+                localStorage.setItem(BLOCKED_THREADS_KEY, JSON.stringify(Array.from(blockedThreads)));
+
+                activeThreads = activeThreads.filter(id => id !== thread.id);
+                localStorage.setItem(THREADS_KEY, JSON.stringify(activeThreads));
+
+                if (confirm(`Thread ${thread.id} blocked. Also remove its messages from the viewer?`)) {
+                    delete messagesByThreadId[thread.id];
+                    // Re-render viewer if it's open
+                    if (otkViewer && otkViewer.style.display === 'block') {
+                        renderMessagesInViewer();
+                    }
+                }
+
+                renderThreadList();
+        updateDisplayedStatistics(false);
+            });
 
             textContentDiv.appendChild(titleTimeContainer);
             threadItemDiv.appendChild(textContentDiv);
@@ -1456,7 +1672,7 @@ function createTweetEmbedElement(tweetId) {
                     z-index: 100001; /* Higher than GUI bar */
                     color: #e6e6e6; /* New font color */
                     font-size: 12px;
-                    max-width: 280px; /* Slightly narrower */
+                    max-width: 340px; /* Accommodate new icons */
                     box-shadow: 0 3px 8px rgba(0,0,0,0.6);
                     pointer-events: auto;
                     display: block;
@@ -1466,23 +1682,91 @@ function createTweetEmbedElement(tweetId) {
 
                 const additionalThreads = threadDisplayObjects.slice(3);
                 additionalThreads.forEach(thread => {
+                    const tooltipItemDiv = document.createElement('div');
+                    tooltipItemDiv.style.cssText = `
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        padding: 2px 0;
+                    `;
+
                     const tooltipLink = document.createElement('a');
                     tooltipLink.href = thread.url;
                     tooltipLink.target = '_blank';
-                    tooltipLink.textContent = truncateTitleWithWordBoundary(thread.title, 40); // Truncate here too
-                    tooltipLink.title = thread.title; // Full title on hover
+                    tooltipLink.textContent = truncateTitleWithWordBoundary(thread.title, 65);
+                    tooltipLink.title = thread.title;
                     tooltipLink.style.cssText = `
-                        display: block;
-                        color: #cccccc; /* Adjusted for new background */
+                        display: inline-block;
+                        color: #cccccc;
                         text-decoration: none;
-                        padding: 3px 0; /* More spacing */
                         white-space: nowrap;
                         overflow: hidden;
                         text-overflow: ellipsis;
+                        flex-grow: 1;
                     `;
                     tooltipLink.onmouseover = () => { tooltipLink.style.color = '#e6e6e6'; tooltipLink.style.textDecoration = 'underline';};
                     tooltipLink.onmouseout = () => { tooltipLink.style.color = '#cccccc'; tooltipLink.style.textDecoration = 'none';};
-                    tooltip.appendChild(tooltipLink);
+
+                    tooltipItemDiv.appendChild(tooltipLink);
+
+                    const iconsWrapper = document.createElement('div');
+                    iconsWrapper.style.cssText = 'display: flex; align-items: center;';
+
+                    const crayonIcon = document.createElement('span');
+                    crayonIcon.innerHTML = '🖍️';
+                    crayonIcon.style.cssText = `font-size: 12px; cursor: pointer; margin-left: 8px; visibility: hidden;`;
+                    crayonIcon.title = "Reply to this thread";
+
+                    crayonIcon.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        const threadUrl = thread.url;
+                        const popup = window.open(threadUrl, '_blank', 'width=460,height=425,resizable,scrollbars');
+                        if (popup) {
+                            popup.addEventListener('load', () => {
+                                const script = popup.document.createElement('script');
+                                script.textContent = `const links = Array.from(document.querySelectorAll('a')); const replyLink = links.find(a => a.textContent.trim() === 'Post a Reply'); if (replyLink) { replyLink.click(); }`;
+                                popup.document.body.appendChild(script);
+                            }, true);
+                        }
+                    });
+
+                    const blockIcon = document.createElement('span');
+                    blockIcon.innerHTML = '&#x2715;';
+                    blockIcon.style.cssText = `font-size: 12px; color: #ff8080; cursor: pointer; margin-left: 5px; visibility: hidden;`;
+                    blockIcon.title = "Block this thread";
+
+                    blockIcon.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        blockedThreads.add(thread.id);
+                        localStorage.setItem(BLOCKED_THREADS_KEY, JSON.stringify(Array.from(blockedThreads)));
+                        activeThreads = activeThreads.filter(id => id !== thread.id);
+                        localStorage.setItem(THREADS_KEY, JSON.stringify(activeThreads));
+                        if (confirm(`Thread ${thread.id} blocked. Also remove its messages from the viewer?`)) {
+                            delete messagesByThreadId[thread.id];
+                            if (otkViewer && otkViewer.style.display === 'block') {
+                                renderMessagesInViewer();
+                            }
+                        }
+                        renderThreadList();
+                        updateDisplayedStatistics(false);
+                    });
+
+                    iconsWrapper.appendChild(crayonIcon);
+                    iconsWrapper.appendChild(blockIcon);
+                    tooltipItemDiv.appendChild(iconsWrapper);
+
+                    tooltipItemDiv.addEventListener('mouseenter', () => {
+                        crayonIcon.style.visibility = 'visible';
+                        blockIcon.style.visibility = 'visible';
+                    });
+                    tooltipItemDiv.addEventListener('mouseleave', () => {
+                        crayonIcon.style.visibility = 'hidden';
+                        blockIcon.style.visibility = 'hidden';
+                    });
+
+                    tooltip.appendChild(tooltipItemDiv);
                 });
 
                 document.body.appendChild(tooltip);
@@ -1554,13 +1838,13 @@ function createTweetEmbedElement(tweetId) {
         };
     }
 
-    async function renderMessagesInViewer(options = {}) { // Added options parameter
+    async function renderMessagesInViewer(options = {}) {
+    const { isToggleOpen = false } = options;
         if (!otkViewer) {
             consoleError("Viewer element not found, cannot render messages.");
             return;
         }
-        // Determine loading text based on context if possible, or keep generic
-        const loadingText = options.isToggleOpen ? "Restoring view..." : "Loading all messages...";
+        const loadingText = isToggleOpen ? "Restoring view..." : "Loading all messages...";
         showLoadingScreen(loadingText);
 
         // Global sets uniqueImageViewerHashes and uniqueVideoViewerHashes are used directly.
@@ -1586,8 +1870,10 @@ function createTweetEmbedElement(tweetId) {
         otkViewer.innerHTML = ''; // Clear previous content
 
         let allMessages = getAllMessagesSorted();
-        const messageLimitEnabled = localStorage.getItem('otkMessageLimitEnabled') === 'true';
-        const messageLimitValue = parseInt(localStorage.getItem('otkMessageLimitValue') || '500', 10);
+
+    const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+    const messageLimitEnabled = themeSettings.otkMessageLimitEnabled !== false;
+    const messageLimitValue = parseInt(themeSettings.otkMessageLimitValue || '500', 10);
 
         if (messageLimitEnabled && allMessages.length > messageLimitValue) {
             allMessages = allMessages.slice(allMessages.length - messageLimitValue);
@@ -1641,6 +1927,7 @@ function createTweetEmbedElement(tweetId) {
 
         for (let i = 0; i < totalMessagesToRender; i++) {
             const message = allMessages[i];
+
             renderedMessageIdsInViewer.add(message.id);
 
             const boardForLink = message.board || 'b';
@@ -1682,21 +1969,20 @@ consoleLog(`[StatsDebug] Unique image hashes for viewer: ${uniqueImageViewerHash
         Promise.all(mediaLoadPromises).then(() => {
             embedWrappers.forEach(wrapper => mediaIntersectionObserver.observe(wrapper));
             consoleLog("All inline media load attempts complete.");
-            forceRenderAllTweets();
             updateLoadingProgress(95, "Finalizing view...");
     viewerActiveImageCount = uniqueImageViewerHashes.size;
     viewerActiveVideoCount = viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size;
     consoleLog(`[StatsDebug] Viewer counts updated: Images=${viewerActiveImageCount}, Videos (top-level attached + top-level embed)=${viewerActiveVideoCount}`);
-    updateDisplayedStatistics(); // Update stats after all media processing is attempted.
+updateDisplayedStatistics(false); // Update stats after all media processing is attempted.
 
             let anchorScrolled = false;
             const storedAnchoredInstanceId = localStorage.getItem(ANCHORED_MESSAGE_ID_KEY);
-            console.log("storedAnchoredInstanceId from localStorage:", storedAnchoredInstanceId);
+            consoleLog("storedAnchoredInstanceId from localStorage:", storedAnchoredInstanceId);
 
             setTimeout(() => {
                 if (storedAnchoredInstanceId) {
                     const anchoredElement = document.getElementById(storedAnchoredInstanceId);
-                    console.log("anchoredElement from getElementById:", anchoredElement);
+                    consoleLog("anchoredElement from getElementById:", anchoredElement);
 
                     if (anchoredElement && messagesContainer.contains(anchoredElement)) {
                         try {
@@ -1717,20 +2003,20 @@ consoleLog(`[StatsDebug] Unique image hashes for viewer: ${uniqueImageViewerHash
             }, 500);
 
             if (!anchorScrolled) {
-                if (options.isToggleOpen && lastViewerScrollTop > 0) {
+                if (isToggleOpen && lastViewerScrollTop > 0) {
                     messagesContainer.scrollTop = lastViewerScrollTop;
                     consoleLog(`Restored scroll position to: ${lastViewerScrollTop}`);
                 } else if (!storedAnchoredInstanceId) {
-                    // Only scroll to bottom if there's no anchor to handle
                     setTimeout(() => {
                         messagesContainer.scrollTop = messagesContainer.scrollHeight;
                         consoleLog(`No anchored message, scrolling to bottom.`);
-                    }, 550); // Delay slightly after anchor check
+                    }, 550);
                 }
             }
 
             updateLoadingProgress(100, "View ready!"); // Update text for 100%
             setTimeout(hideLoadingScreen, 200);
+            applyThemeSettings({ forceRerender: false }); // Re-apply theme settings to ensure styles are correct after render
         }).catch(err => {
             consoleError("Error occurred during media loading promises:", err);
             updateLoadingProgress(100, "Error loading some media. View may be incomplete.");
@@ -1738,6 +2024,123 @@ consoleLog(`[StatsDebug] Unique image hashes for viewer: ${uniqueImageViewerHash
             setTimeout(hideLoadingScreen, 500);
         });
     }
+
+    async function appendNewMessagesToViewer(newMessages) {
+        consoleLog(`[appendNewMessagesToViewer] Called with ${newMessages.length} new messages.`);
+        const messagesContainer = document.getElementById('otk-messages-container');
+        if (!messagesContainer) {
+            consoleError("[appendNewMessagesToViewer] messagesContainer not found. Aborting append.");
+            hideLoadingScreen();
+            return;
+        }
+
+        if (newMessages.length === 0) {
+            consoleLog("[appendNewMessagesToViewer] No new messages to append.");
+            hideLoadingScreen();
+            return;
+        }
+
+        let anchorInfo = { id: null, offset: 0 };
+        const containerRect = messagesContainer.getBoundingClientRect();
+        const messageElements = messagesContainer.querySelectorAll('.otk-message-container-main, .otk-message-container-quote-depth-1');
+        let anchorElement = null;
+
+        for (const el of messageElements) {
+            const elRect = el.getBoundingClientRect();
+            if (elRect.bottom > containerRect.top && elRect.top < containerRect.bottom) {
+                anchorElement = el;
+                break;
+            }
+        }
+
+        if (anchorElement) {
+            anchorInfo.id = anchorElement.id;
+            anchorInfo.offset = anchorElement.getBoundingClientRect().top - containerRect.top;
+            consoleLog(`[ScrollAnchor] Found anchor: ${anchorInfo.id}, offset: ${anchorInfo.offset}`);
+        } else {
+            consoleLog('[ScrollAnchor] No visible anchor element found. Will fallback to basic scroll restore.');
+        }
+
+        const oldScrollTop = messagesContainer.scrollTop; // Keep as fallback
+
+        const newContentDiv = document.createElement('div');
+
+        const separatorDiv = document.createElement('div');
+        separatorDiv.style.cssText = `
+            border-top: 2px dashed var(--otk-new-messages-divider-color);
+            margin: 20px 0;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            padding-left: 15px;
+            text-align: left;
+            color: var(--otk-new-messages-font-color);
+            font-size: var(--otk-new-messages-font-size);
+            font-style: italic;
+            width: 100%;
+            box-sizing: border-box;
+        `;
+        const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+        separatorDiv.textContent = `--- ${currentTime} : ${newMessages.length} New Messages Loaded ---`;
+        newContentDiv.appendChild(separatorDiv);
+
+        const mediaLoadPromises = [];
+        const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+        const messageLimitEnabled = themeSettings.otkMessageLimitEnabled !== false;
+        const messageLimitValue = parseInt(themeSettings.otkMessageLimitValue || '500', 10);
+
+        for (const message of newMessages) {
+            const boardForLink = message.board || 'b';
+            const threadColor = getThreadColor(message.originalThreadId);
+            const messageElement = createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, true, 0, threadColor, null);
+            newContentDiv.appendChild(messageElement);
+            renderedMessageIdsInViewer.add(message.id);
+        }
+
+        messagesContainer.appendChild(newContentDiv);
+
+        if (messageLimitEnabled) {
+            const messageElements = messagesContainer.querySelectorAll('.otk-message-container-main');
+            if (messageElements.length > messageLimitValue) {
+                const numToRemove = messageElements.length - messageLimitValue;
+                consoleLog(`[MessageLimit] Viewer message limit exceeded by ${numToRemove}. Removing oldest messages.`);
+                for (let i = 0; i < numToRemove; i++) {
+                    const messageToRemove = messageElements[i];
+                    const messageId = parseInt(messageToRemove.dataset.messageId, 10);
+                    if (!isNaN(messageId)) {
+                        renderedMessageIdsInViewer.delete(messageId);
+                    }
+                    messageToRemove.remove();
+                }
+            }
+        }
+
+        Promise.all(mediaLoadPromises).then(async () => {
+            hideLoadingScreen();
+
+            if (anchorInfo.id) {
+                const elementToScrollTo = document.getElementById(anchorInfo.id);
+                if (elementToScrollTo) {
+                    const newScrollTop = elementToScrollTo.offsetTop - anchorInfo.offset;
+                    messagesContainer.scrollTop = newScrollTop;
+                    consoleLog(`[ScrollAnchor] Restored scroll to anchor ${anchorInfo.id}. New scrollTop: ${newScrollTop}`);
+                } else {
+                    messagesContainer.scrollTop = oldScrollTop;
+                    consoleLog(`[ScrollAnchor] Anchor element ${anchorInfo.id} not found. Fell back to old scrollTop.`);
+                }
+            } else {
+                messagesContainer.scrollTop = oldScrollTop;
+                consoleLog(`[ScrollAnchor] No anchor found. Fell back to old scrollTop.`);
+            }
+
+            viewerActiveImageCount = uniqueImageViewerHashes.size;
+            viewerActiveVideoCount = viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size;
+            updateDisplayedStatistics();
+        }).catch(err => {
+            consoleError("[appendNewMessagesToViewer] Error in media promises:", err);
+            hideLoadingScreen();
+        });
+    }
+
 
 // Helper function to populate attachmentDiv with media (images/videos)
 function _populateAttachmentDivWithMedia(
@@ -1752,10 +2155,30 @@ function _populateAttachmentDivWithMedia(
     viewerTopLevelAttachedVideoHashes, // Set for video stats
     otkMediaDB // IndexedDB instance
 ) {
+    let resizeIcon;
+
+    const loadImageFromCache = (imgElement, isThumb) => {
+        const storeId = isThumb ? message.attachment.localThumbStoreId : message.attachment.localStoreId;
+        if (storeId && otkMediaDB) {
+            const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+            const store = transaction.objectStore('mediaStore');
+            const request = store.get(storeId);
+            request.onsuccess = (event) => {
+                const storedItem = event.target.result;
+                if (storedItem && storedItem.blob) {
+                    const dataURL = URL.createObjectURL(storedItem.blob);
+                    createdBlobUrls.add(dataURL);
+                    imgElement.src = dataURL;
+                }
+            };
+        }
+    };
+
     if (!message.attachment || !message.attachment.ext) {
         return;
     }
 
+    const mediaLoadMode = localStorage.getItem('otkMediaLoadMode') || 'source_first';
     const extLower = message.attachment.ext.toLowerCase();
     const filehash = message.attachment.filehash_db_key || `${message.attachment.tim}${extLower}`;
 
@@ -1763,8 +2186,6 @@ function _populateAttachmentDivWithMedia(
         // --- IMAGE LOGIC ---
         const fullsizeWidth = message.attachment.w;
         const fullsizeHeight = message.attachment.h;
-        const displayWidth = message.attachment.tn_w;
-        const displayHeight = message.attachment.tn_h;
 
         let defaultToThumbnail;
 
@@ -1772,134 +2193,251 @@ function _populateAttachmentDivWithMedia(
         const maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? 400 : 350;
 
         // --- SOLUTION START ---
-
-        let widthToTest;
-        let heightToTest;
-
-        // Check if the image is already shorter than the viewer's height constraint.
-        if (fullsizeHeight <= maxHeight) {
-            // If it is, the browser will NOT scale it up.
-            // We should test its REAL dimensions against our rules.
-            widthToTest = fullsizeWidth;
-            heightToTest = fullsizeHeight;
-            consoleLog(`[ImageRule] Image is short (${fullsizeHeight}px <= ${maxHeight}px). Testing real dimensions: ${widthToTest}px x ${heightToTest}px.`);
-        } else {
-            // If the image is taller, it WILL be scaled down.
-            // We must test its HYPOTHETICAL scaled dimensions.
-            const aspectRatio = fullsizeWidth / fullsizeHeight;
-            widthToTest = maxHeight * aspectRatio;
-            heightToTest = maxHeight;
-            consoleLog(`[ImageRule] Image is tall (${fullsizeHeight}px > ${maxHeight}px). Testing scaled dimensions: ${Math.round(widthToTest)}px x ${Math.round(heightToTest)}px.`);
-        }
-
-        // Now, use 'widthToTest' and 'heightToTest' in the decision rules.
-        if ((widthToTest <= 570 && heightToTest <= 730) || (widthToTest <= 2050 && heightToTest <= 530)) {
+        // New logic: Show full-size if image is small, panoramic, OR has a tiny thumbnail.
+        const tnW = message.attachment.tn_w;
+        const aspectRatio = fullsizeWidth / fullsizeHeight;
+        if ((fullsizeWidth <= 800 && fullsizeHeight <= 600) || aspectRatio > 3 || tnW < 75) {
             defaultToThumbnail = false; // Show the larger version
         } else {
-            defaultToThumbnail = true; // Show the thumbnail
+            defaultToThumbnail = true; // Show the thumbnail for other large images
         }
-
         // --- SOLUTION END ---
 
         const img = document.createElement('img');
         img.dataset.filehash = filehash;
         img.dataset.thumbWidth = message.attachment.tn_w;
         img.dataset.thumbHeight = message.attachment.tn_h;
-        img.dataset.isThumbnail = defaultToThumbnail ? 'true' : 'false';
         img.style.cursor = 'pointer';
         img.style.display = 'block';
         img.style.borderRadius = '3px';
+        img.style.transform = 'translateZ(0)';
+        img.style.backfaceVisibility = 'hidden';
+        img.style.userSelect = 'none';
 
-        let webFullSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
-        let webThumbSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}s.jpg`;
-        img.dataset.fullSrc = webFullSrc;
-        img.dataset.thumbSrc = webThumbSrc;
+        const hasLocalFull = message.attachment.localStoreId;
+        const hasLocalThumb = message.attachment.localThumbStoreId;
 
-        const setImageProperties = (isThumbnail) => {
-            if (isThumbnail) {
-                img.src = img.dataset.thumbSrc;
+        const setImageProperties = (mode) => {
+            img.dataset.mode = mode;
+            let isThumb = (mode === 'thumb');
+            const hasCache = isThumb ? hasLocalThumb : hasLocalFull;
+
+            // Set image dimensions
+            if (isThumb) {
                 img.style.width = message.attachment.tn_w + 'px';
                 img.style.height = message.attachment.tn_h + 'px';
-                img.style.maxWidth = ''; img.style.maxHeight = '';
-            } else {
-                img.src = img.dataset.fullSrc;
+                img.style.maxWidth = '';
+                img.style.maxHeight = '';
+            } else if (mode === 'full') {
                 img.style.maxWidth = '85%';
                 img.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '350px';
-                img.style.width = 'auto'; img.style.height = 'auto';
+                img.style.width = 'auto';
+                img.style.height = 'auto';
+            } else { // 'original'
+                img.style.maxWidth = '100%';
+                img.style.maxHeight = 'none';
+                img.style.width = 'auto';
+                img.style.height = 'auto';
+            }
+
+            // Set image source based on mode and cache availability
+            if (mediaLoadMode === 'cache_only') {
+                if (hasCache) {
+                    loadImageFromCache(img, isThumb);
+                } else {
+                    consoleWarn(`Image ${message.attachment.filename} (${mode}) not in cache, and mode is cache-only. Not loading from web.`);
+                    // Optionally set a placeholder 'broken image' src
+                    img.src = ''; // Or a placeholder image data URL
+                }
+            } else { // 'source_first' mode
+                const webImageUrl = isThumb
+                    ? `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}s.jpg`
+                    : `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
+                img.src = webImageUrl;
+                // The onerror handler will attempt to load from cache if the web request fails.
             }
         };
 
-        const webSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
-        const thumbSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}s.jpg`;
+        mediaLoadPromises.push(new Promise(resolve => {
+            img.onload = () => {
+                img.style.display = 'block';
+                resolve();
+            };
+            img.onerror = () => {
+                loadImageFromCache(img, img.dataset.mode === 'thumb');
+                resolve();
+            };
+        }));
 
-        img.onload = () => {
-            // Properties are already set, just need to ensure it's visible
-            img.style.display = 'block';
-        };
-        img.onerror = () => {
-            if (message.attachment.localStoreId && otkMediaDB) {
-                const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
-                const store = transaction.objectStore('mediaStore');
-                const request = store.get(defaultToThumbnail ? message.attachment.localThumbStoreId : message.attachment.localStoreId);
-                request.onsuccess = (event) => {
-                    const storedItem = event.target.result;
-                    if (storedItem && storedItem.blob) {
-                        const dataURL = URL.createObjectURL(storedItem.blob);
-                        createdBlobUrls.add(dataURL);
-                        img.src = dataURL;
-                    }
-                };
-            }
-        };
-
-        setImageProperties(defaultToThumbnail);
+        setImageProperties(defaultToThumbnail ? 'thumb' : 'full');
         uniqueImageViewerHashes.add(filehash);
 
         img.addEventListener('click', () => {
-            const currentlyThumbnail = img.dataset.isThumbnail === 'true';
-            img.dataset.isThumbnail = currentlyThumbnail ? 'false' : 'true';
-            setImageProperties(!currentlyThumbnail);
+            const tnW = parseInt(img.dataset.thumbWidth, 10) || 0;
+            const tnH = parseInt(img.dataset.thumbHeight, 10) || 0;
+            const isTinyThumbnail = tnW < 30 || tnH < 30;
+            const currentMode = img.dataset.mode;
+
+            if (isTinyThumbnail) {
+                if (currentMode === 'full') {
+                    setImageProperties('original');
+                } else {
+                    setImageProperties('full');
+                }
+            } else {
+                if (currentMode === 'thumb') {
+                    setImageProperties('full');
+                } else {
+                    setImageProperties('thumb');
+                }
+            }
         });
 
-        attachmentDiv.appendChild(img);
+        const imageWrapper = document.createElement('div');
+        imageWrapper.classList.add('image-wrapper');
+        imageWrapper.style.position = 'relative';
+        imageWrapper.style.display = 'inline-block';
+        imageWrapper.style.userSelect = 'none';
+
+        const blurIcon = document.createElement('div');
+        blurIcon.classList.add('blur-icon');
+        blurIcon.style.cssText = `
+            position: absolute;
+            top: 5px;
+            left: 5px;
+            width: 24px;
+            height: 24px;
+            background-color: var(--otk-blur-icon-bg-color);
+            border-radius: 4px;
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+        `;
+        blurIcon.title = 'Toggle blur for this image';
+
+        const blurIconForeground = document.createElement('div');
+        blurIconForeground.style.cssText = `
+            width: 16px;
+            height: 16px;
+            background-color: var(--otk-blur-icon-color);
+            -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px"><path d="m644-428-58-59q9-47-27-88t-93-32l-58-58q17-8 34.5-12t37.5-4q75 0 127.5 52.5T660-500q0 20-4 37.5T644-428Zm128 126-58-56q38-29 67.5-63.5T832-500q-50-101-143.5-160.5T480-720q-29 0-57 4t-55 12l-62-62q41-17 84-25.5t90-8.5q151 0 269 83.5T920-500q-23 59-60.5 109.5T772-302Zm20 246L624-222q-35 11-70.5 16.5T480-200q-151 0-269-83.5T40-500q21-53 53-98.5t73-81.5L56-792l56-56 736 736-56 56ZM222-624q-29 26-53 57t-41 67q50 101 143.5 160.5T480-280q20 0 39-2.5t39-5.5l-36-38q-11 3-21 4.5t-21 1.5q-75 0-127.5-52.5T300-500q0-11 1.5-21t4.5-21l-84-82Zm319 93Zm-151 75Z"/></svg>');
+            mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px"><path d="m644-428-58-59q9-47-27-88t-93-32l-58-58q17-8 34.5-12t37.5-4q75 0 127.5 52.5T660-500q0 20-4 37.5T644-428Zm128 126-58-56q38-29 67.5-63.5T832-500q-50-101-143.5-160.5T480-720q-29 0-57 4t-55 12l-62-62q41-17 84-25.5t90-8.5q151 0 269 83.5T920-500q-23 59-60.5 109.5T772-302Zm20 246L624-222q-35 11-70.5 16.5T480-200q-151 0-269-83.5T40-500q21-53 53-98.5t73-81.5L56-792l56-56 736 736-56 56ZM222-624q-29 26-53 57t-41 67q50 101 143.5 160.5T480-280q20 0 39-2.5t39-5.5l-36-38q-11 3-21 4.5t-21 1.5q-75 0-127.5-52.5T300-500q0-11 1.5-21t4.5-21l-84-82Zm319 93Zm-151 75Z"/></svg>');
+            -webkit-mask-size: contain;
+            mask-size: contain;
+            -webkit-mask-repeat: no-repeat;
+            mask-repeat: no-repeat;
+            -webkit-mask-position: center;
+            mask-position: center;
+        `;
+        blurIcon.appendChild(blurIconForeground);
+
+        blurIcon.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            toggleImageBlur(filehash);
+        });
+
+        resizeIcon = document.createElement('div');
+        resizeIcon.classList.add('resize-icon');
+        resizeIcon.style.cssText = `
+            position: absolute;
+            top: 5px;
+            width: 24px;
+            height: 24px;
+            background-color: var(--otk-resize-icon-bg-color);
+            border-radius: 4px;
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+        `;
+        resizeIcon.title = 'Toggle full size';
+
+        const resizeIconForeground = document.createElement('div');
+        resizeIconForeground.style.cssText = `
+            width: 16px;
+            height: 16px;
+            background-color: var(--otk-resize-icon-color);
+            -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 4 20 4 20 8"></polyline><line x1="20" y1="4" x2="14" y2="10"></line><polyline points="8 20 4 20 4 16"></polyline><line x1="4" y1="20" x2="10" y2="14"></line></svg>');
+            mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 4 20 4 20 8"></polyline><line x1="20" y1="4" x2="14" y2="10"></line><polyline points="8 20 4 20 4 16"></polyline><line x1="4" y1="20" x2="10" y2="14"></line></svg>');
+            -webkit-mask-size: contain;
+            mask-size: contain;
+            -webkit-mask-repeat: no-repeat;
+            mask-repeat: no-repeat;
+            -webkit-mask-position: center;
+            mask-position: center;
+        `;
+        resizeIcon.appendChild(resizeIconForeground);
+
+        resizeIcon.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            const currentMode = img.dataset.mode;
+            if (currentMode === 'original') {
+                const previousMode = img.dataset.previousMode || (defaultToThumbnail ? 'thumb' : 'full');
+                setImageProperties(previousMode);
+            } else {
+                img.dataset.previousMode = currentMode;
+                setImageProperties('original');
+            }
+        });
+
+        imageWrapper.addEventListener('mouseenter', () => {
+            blurIcon.style.display = 'flex';
+            resizeIcon.style.display = 'flex';
+        });
+        imageWrapper.addEventListener('mouseleave', () => {
+            blurIcon.style.display = 'none';
+            resizeIcon.style.display = 'none';
+        });
+
+        const blurAmount = (localStorage.getItem(IMAGE_BLUR_AMOUNT_KEY) || 60) / 5;
+        if (blurredImages.has(filehash)) {
+            img.style.filter = `blur(${blurAmount}px)`;
+        }
+
+        imageWrapper.appendChild(img);
+        imageWrapper.appendChild(blurIcon);
+        imageWrapper.appendChild(resizeIcon);
+        attachmentDiv.appendChild(imageWrapper);
+
+        const observer = new MutationObserver(updateIconPositions);
+
+        function updateIconPositions() {
+            observer.disconnect();
+            if (!resizeIcon || !img.isConnected) return;
+            const iconWidth = 24;
+            const offset = 5;
+            const imageWidth = img.offsetWidth;
+            if (imageWidth > 0) {
+                resizeIcon.style.top = offset + 'px';
+                resizeIcon.style.left = (imageWidth - iconWidth - offset) + 'px';
+                resizeIcon.style.right = 'auto';
+            }
+            observer.observe(img, { attributes: true, attributeFilter: ['style', 'src'] });
+        }
+
+        observer.observe(img, { attributes: true, attributeFilter: ['style', 'src'] });
+        img.addEventListener('load', updateIconPositions);
 
     } else if (extLower.endsWith('webm') || extLower.endsWith('mp4')) {
+        const videoWrapper = document.createElement('div');
+        videoWrapper.classList.add('video-wrapper');
+        videoWrapper.style.position = 'relative';
+        videoWrapper.style.display = 'inline-block';
+        videoWrapper.style.userSelect = 'none';
+
         const videoElement = document.createElement('video');
         videoElement.controls = true;
         videoElement.style.maxWidth = '85%';
-        videoElement.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '300px';
+        const defaultMaxHeight = isTopLevelMessage ? '400px' : '300px';
+        videoElement.style.maxHeight = defaultMaxHeight;
+        videoElement.dataset.defaultMaxHeight = defaultMaxHeight;
         videoElement.style.borderRadius = '3px';
         videoElement.style.display = 'block';
-        attachmentDiv.appendChild(videoElement);
-
-        const webVideoSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`;
-
-        const loadFromWeb = () => {
-            mediaLoadPromises.push(new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: "GET",
-                    url: webVideoSrc,
-                    responseType: 'blob',
-                    onload: function(response) {
-                        if (response.status === 200) {
-                            const blob = response.response;
-                            const videoUrl = URL.createObjectURL(blob);
-                            createdBlobUrls.add(videoUrl);
-                            videoElement.src = videoUrl;
-                            resolve();
-                        } else {
-                            loadFromCache();
-                            resolve();
-                        }
-                    },
-                    onerror: function(error) {
-                        consoleWarn(`[CSP Bypass] GM_xmlhttpRequest failed for ${webVideoSrc}. Falling back to cache.`, error);
-                        loadFromCache();
-                        resolve();
-                    }
-                });
-            }));
-        };
 
         const loadFromCache = () => {
             if (message.attachment.localStoreId && otkMediaDB) {
@@ -1913,18 +2451,103 @@ function _populateAttachmentDivWithMedia(
                         createdBlobUrls.add(dataURL);
                         videoElement.src = dataURL;
                     } else {
-                        consoleWarn(`Video ${message.attachment.filename} not found in cache.`);
+                        consoleWarn(`Video ${message.attachment.filename} not found in cache despite having a localStoreId.`);
                     }
                 };
-                 request.onerror = (event) => {
+                request.onerror = (event) => {
                     consoleError("Error reading video from cache:", event.target.error);
                 };
             } else {
-                consoleWarn(`Video ${message.attachment.filename} not available from web and no cache entry.`);
+                 consoleWarn(`Video ${message.attachment.filename} has no localStoreId for cache lookup.`);
             }
         };
 
-        loadFromWeb();
+        videoElement.onerror = () => {
+            consoleWarn(`Failed to load video from web source. Falling back to cache for ${message.attachment.filename}.`);
+            loadFromCache();
+        };
+
+        if (mediaLoadMode === 'cache_only') {
+            if (message.attachment.localStoreId) {
+                loadFromCache();
+            } else {
+                consoleWarn(`Video ${message.attachment.filename} not in cache, and mode is cache-only. Not loading from web.`);
+                // Optional: You could set a placeholder 'broken video' src here
+            }
+        } else { // 'source_first' mode
+            const webVideoSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`;
+            videoElement.src = webVideoSrc;
+        }
+
+        const resizeIcon = document.createElement('div');
+        resizeIcon.classList.add('resize-icon');
+        resizeIcon.style.cssText = `
+            position: absolute;
+            top: 5px;
+            width: 24px;
+            height: 24px;
+            background-color: var(--otk-resize-icon-bg-color);
+            border-radius: 4px;
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+        `;
+        resizeIcon.title = 'Toggle full size';
+        const resizeIconForeground = document.createElement('div');
+        resizeIconForeground.style.cssText = `
+            width: 16px;
+            height: 16px;
+            background-color: var(--otk-resize-icon-color);
+            -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 4 20 4 20 8"></polyline><line x1="20" y1="4" x2="14" y2="10"></line><polyline points="8 20 4 20 4 16"></polyline><line x1="4" y1="20" x2="10" y2="14"></line></svg>');
+            mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 4 20 4 20 8"></polyline><line x1="20" y1="4" x2="14" y2="10"></line><polyline points="8 20 4 20 4 16"></polyline><line x1="4" y1="20" x2="10" y2="14"></line></svg>');
+            -webkit-mask-size: contain;
+            mask-size: contain;
+            -webkit-mask-repeat: no-repeat;
+            mask-repeat: no-repeat;
+            -webkit-mask-position: center;
+            mask-position: center;
+        `;
+        resizeIcon.appendChild(resizeIconForeground);
+
+        resizeIcon.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            if (videoElement.style.maxHeight === 'none') {
+                videoElement.style.maxHeight = videoElement.dataset.defaultMaxHeight;
+            } else {
+                videoElement.style.maxHeight = 'none';
+            }
+        });
+
+        videoWrapper.addEventListener('mouseenter', () => {
+            resizeIcon.style.display = 'flex';
+        });
+        videoWrapper.addEventListener('mouseleave', () => {
+            resizeIcon.style.display = 'none';
+        });
+
+        videoWrapper.appendChild(videoElement);
+        videoWrapper.appendChild(resizeIcon);
+        attachmentDiv.appendChild(videoWrapper);
+
+        const observer = new MutationObserver(updateVideoIconPosition);
+        function updateVideoIconPosition() {
+            observer.disconnect();
+            if (!resizeIcon || !videoElement.isConnected) return;
+            const iconWidth = 24;
+            const offset = 5;
+            const videoWidth = videoElement.offsetWidth;
+            if (videoWidth > 0) {
+                resizeIcon.style.top = offset + 'px';
+                resizeIcon.style.left = (videoWidth - iconWidth - offset) + 'px';
+                resizeIcon.style.right = 'auto';
+            }
+            observer.observe(videoElement, { attributes: true, attributeFilter: ['style', 'src'] });
+        }
+        observer.observe(videoElement, { attributes: true, attributeFilter: ['style', 'src'] });
+        videoElement.addEventListener('loadeddata', updateVideoIconPosition);
 
         if (message.attachment.filehash_db_key && isTopLevelMessage) {
             viewerTopLevelAttachedVideoHashes.add(message.attachment.filehash_db_key);
@@ -1932,10 +2555,69 @@ function _populateAttachmentDivWithMedia(
     }
 }
 
-    // Signature now includes parentMessageId
-    function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId = null) {
-        const layoutStyle = localStorage.getItem('otkMessageLayoutStyle') || 'default';
-        consoleLog(`[DepthCheck] Rendering message: ${message.id}, parent: ${parentMessageId}, currentDepth: ${currentDepth}, MAX_QUOTE_DEPTH: ${MAX_QUOTE_DEPTH}, isTopLevel: ${isTopLevelMessage}, layoutStyle: ${layoutStyle}`);
+function wrapInCollapsibleContainer(elementsToWrap) {
+    const container = document.createElement('div');
+    container.className = 'otk-collapsible-container';
+
+    const placeholder = document.createElement('div');
+    placeholder.className = 'otk-collapsible-placeholder';
+    placeholder.innerHTML = '<span style="margin-right: 5px;">[+]</span>Blocked Content';
+    placeholder.style.cursor = 'pointer';
+    placeholder.style.color = 'var(--otk-blocked-content-font-color)';
+    placeholder.style.fontSize = '12px';
+    placeholder.style.fontStyle = 'italic';
+    placeholder.style.padding = '5px 0';
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'otk-collapsible-content';
+    contentDiv.style.display = 'none';
+
+    elementsToWrap.forEach(el => {
+        if (el) {
+            contentDiv.appendChild(el);
+        }
+    });
+
+    placeholder.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const isHidden = contentDiv.style.display === 'none';
+        contentDiv.style.display = isHidden ? 'block' : 'none';
+        placeholder.querySelector('span').textContent = isHidden ? '[-]' : '[+]';
+    });
+
+    container.appendChild(placeholder);
+    container.appendChild(contentDiv);
+
+    return container;
+}
+
+    // Signature now includes parentMessageId and ancestors
+    function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId = null, ancestors = new Set()) {
+        const filterRules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
+        const parsedRules = filterRules.map(parseFilterRule);
+        const isFiltered = isMessageFiltered(message, parsedRules);
+
+        if (isFiltered) {
+            if (currentDepth === 0 && (!message.text || !message.text.includes('>>'))) {
+                consoleLog(`[Filter] Removing filtered top-level message ${message.id} because it has no quotes.`);
+                return null;
+            }
+        }
+
+        // const layoutStyle = localStorage.getItem('otkMessageLayoutStyle') || 'default';
+        consoleLog(`[DepthCheck] Rendering message: ${message.id}, parent: ${parentMessageId}, currentDepth: ${currentDepth}, MAX_QUOTE_DEPTH: ${MAX_QUOTE_DEPTH}, isTopLevel: ${isTopLevelMessage}`);
+
+        // Stack overflow prevention: Check for circular references.
+        if (ancestors.has(message.id)) {
+            consoleWarn(`[CircularRef] Circular reference detected for message ID ${message.id}. Aborting render for this branch.`);
+            const circularRefSpan = document.createElement('span');
+            circularRefSpan.textContent = `>>${message.id} (Circular Reference Detected)`;
+            circularRefSpan.style.color = '#ff6b6b';
+            return circularRefSpan;
+        }
+
+        // Add current message ID to the set of ancestors for the recursive calls.
+        const newAncestors = new Set(ancestors).add(message.id);
 
         let seenEmbeds = [];
         try {
@@ -1962,14 +2644,20 @@ function _populateAttachmentDivWithMedia(
         const displayFilenamesKey = `otkMsgDepth${depthKeyPart}DisplayMediaFilename`;
 
         // Default for disableUnderline is false (meaning, underline is ON by default)
-        const shouldDisableUnderline = allThemeSettings[disableUnderlineKey] === true;
+        let shouldDisableUnderline;
+        if (allThemeSettings.hasOwnProperty(disableUnderlineKey)) {
+            shouldDisableUnderline = allThemeSettings[disableUnderlineKey];
+        } else {
+            // New default logic: Hide for depth 1 and 2+
+            shouldDisableUnderline = (depthKeyPart === '1' || depthKeyPart === '2plus');
+        }
 
         // Default for displayFilenames is true (meaning, filenames are SHOWN by default)
         let shouldDisplayFilenames;
         if (allThemeSettings.hasOwnProperty(displayFilenamesKey)) {
             shouldDisplayFilenames = allThemeSettings[displayFilenamesKey];
         } else {
-            shouldDisplayFilenames = true; // Default value
+            shouldDisplayFilenames = false; // New default: OFF for all depths
         }
 
         // --- Define all media patterns once at the top of the function ---
@@ -1988,13 +2676,13 @@ function _populateAttachmentDivWithMedia(
         const twitchPatterns = [
             { type: 'clip_direct', regex: /^(?:https?:\/\/)?clips\.twitch\.tv\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 },
             { type: 'clip_channel', regex: /^(?:https?:\/\/)?(?:www\.)?twitch\.tv\/[a-zA-Z0-9_]+\/clip\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 },
-            { type: 'vod', regex: /^(?:https?:\/\/)?(?:www\.)?twitch\.tv\/videos\/(\d+)(?:[?&%#\w\-=\.\/;:]*t=(?:(?:\d+h)?(?:\d+m)?(?:\d+s)?))?$/, idGroup: 1 }
+            { type: 'vod', regex: /^(?:https?:\/\/)?(?:www\.)?twitch\.tv\/(?:videos|v)\/(\d+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 }
         ];
         const twitchTimestampRegex = /[?&]t=((?:\d+h)?(?:\d+m)?(?:\d+s)?)/;
         const inlineTwitchPatterns = [
             { type: 'clip_direct', regex: /(?:https?:\/\/)?clips\.twitch\.tv\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 },
             { type: 'clip_channel', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/[a-zA-Z0-9_]+\/clip\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 },
-            { type: 'vod', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/videos\/(\d+)(?:[?&%#\w\-=\.\/;:]*t=(?:(?:\d+h)?(?:\d+m)?(?:\d+s)?))?/, idGroup: 1 }
+            { type: 'vod', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/(?:videos|v)\/(\d+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 }
         ];
 
         const streamablePatterns = [
@@ -2017,560 +2705,12 @@ function _populateAttachmentDivWithMedia(
         ];
         // --- End of media pattern definitions ---
 
-        if (layoutStyle === 'new_design') {
+        { // layoutStyle === 'default' or unknown (original logic)
             const messageDiv = document.createElement('div');
             messageDiv.setAttribute('data-message-id', message.id);
-            let currentMessageOwnText; // Declare here
-
-            // Apply base class for new design structure based on depth
             if (isTopLevelMessage) {
-                messageDiv.className = 'otk-message-container-main';
-            } else {
-                if (currentDepth === 1) {
-                    messageDiv.className = 'otk-message-container-quote-depth-1';
-                } else { // currentDepth >= 2
-                    messageDiv.className = 'otk-message-container-quote-depth-2';
-                }
+                messageDiv.classList.add('otk-message-container-main');
             }
-
-            const quoteRegex = /^>>(\d+)/;
-            let quotedMessagesContainer = null; // To hold >>123 quotes if any
-
-            // Process text to extract and render >>ddd quotes first
-            if (message.text && typeof message.text === 'string') {
-                const lines = message.text.split('\n');
-                const remainingLines = []; // Store lines that are not >>ddd quotes to be processed later
-
-                lines.forEach(line => {
-                    const trimmedLine = line.trim();
-                    const quoteMatch = trimmedLine.match(quoteRegex);
-
-                    // Check if the trimmed line IS a quote link and nothing else.
-                    if (quoteMatch && trimmedLine === quoteMatch[0]) {
-                        if (currentDepth < MAX_QUOTE_DEPTH) {
-                            // This line is a >>ddd quote and should be rendered as a block
-                            if (!quotedMessagesContainer) {
-                                quotedMessagesContainer = document.createElement('div');
-                                // No specific class for this container yet, styling comes from children
-                            }
-                            const quotedMessageId = quoteMatch[1];
-                            let quotedMessageObject = null;
-                            for (const threadIdKey in messagesByThreadId) {
-                                if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
-                                    const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === Number(quotedMessageId));
-                                    if (foundMsg) {
-                                        quotedMessageObject = foundMsg;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (quotedMessageObject) {
-                                consoleLog(`[QuoteDebug] new_design: Calling createMessageElementDOM for quote ${quotedMessageId}. mediaLoadPromises is an array: ${Array.isArray(mediaLoadPromises)}`);
-                                const quotedElement = createMessageElementDOM(
-                                    quotedMessageObject,
-                                    mediaLoadPromises,
-                                    uniqueImageViewerHashes,
-                                    quotedMessageObject.board || boardForLink,
-                                    false, // isTopLevelMessage = false for quotes
-                                    currentDepth + 1,
-                                    null, // threadColor is not used for quoted message accents in new design
-                                    message.id // Pass the PARENT message's ID for the quote
-                                );
-                                if (quotedElement) {
-                                    quotedMessagesContainer.appendChild(quotedElement);
-                                }
-                            } else {
-                                const notFoundSpan = document.createElement('div'); // Render as a div for block display
-                                notFoundSpan.textContent = `${line} (Not Found)`;
-                                notFoundSpan.style.color = 'var(--otk-newdesign-header-text-color, #555)'; // Use a theme color
-                                notFoundSpan.style.padding = '4px 0';
-                                quotedMessagesContainer.appendChild(notFoundSpan);
-                            }
-                        }
-                        // If the line is just a quote, we don't add it to remainingLines, effectively removing it from the main text flow.
-                    } else {
-                        // The line is not solely a quote link, so it should be processed as regular text.
-                        remainingLines.push(line);
-                    }
-                });
-
-
-                if (quotedMessagesContainer) {
-                    messageDiv.appendChild(quotedMessagesContainer);
-                }
-                // Assign to the block-scoped currentMessageOwnText
-                currentMessageOwnText = remainingLines.join('\n');
-            } else {
-                 // If message.text was initially null or not a string, or not processed above
-                currentMessageOwnText = message.text || '';
-            }
-
-
-            // Now create the main content block for the current message (color square, header, text)
-            const postDiv = document.createElement('div');
-            postDiv.className = 'otk-post-div';
-
-            if (isTopLevelMessage) {
-                const colorSquareDiv = document.createElement('div');
-                colorSquareDiv.className = 'otk-color-square';
-                // threadColor for the square is implicitly handled by --otk-newdesign-colorsquare-bg if that's how it's set up
-                // Or, if threadColor should override it:
-                if (threadColor) { // Only apply if a specific thread color is provided
-                   colorSquareDiv.style.backgroundColor = threadColor;
-                } else {
-                   colorSquareDiv.style.backgroundColor = 'var(--otk-newdesign-colorsquare-bg)';
-                }
-                postDiv.appendChild(colorSquareDiv);
-            }
-
-            const textWrapperDiv = document.createElement('div');
-            textWrapperDiv.className = 'otk-text-wrapper';
-
-            const messageHeader = document.createElement('div');
-            messageHeader.className = 'otk-header-div';
-            messageHeader.style.justifyContent = 'flex-start'; // Override CSS for left alignment
-
-            const timestampParts = formatTimestampForHeader(message.time);
-            const headerContent = document.createElement('span'); // Use a single span for all content
-
-            let prefix = "";
-            if (!isTopLevelMessage) {
-                prefix = "⤷ ";
-            }
-
-            headerContent.textContent = `${prefix}#${message.id} | ${timestampParts.time} | ${timestampParts.date}`;
-
-            messageHeader.appendChild(headerContent);
-            textWrapperDiv.appendChild(messageHeader);
-
-            if (shouldDisableUnderline) {
-                messageHeader.style.borderBottom = 'none';
-                messageHeader.style.paddingBottom = '0px';
-                messageHeader.style.marginBottom = '0px';
-                messageHeader.style.lineHeight = '1.1';
-                messageHeader.style.minHeight = '0';
-            }
-
-            const textElement = document.createElement('div');
-            textElement.className = 'otk-content-div'; // Apply class for styling
-            if (shouldDisableUnderline) { // Apply to all depths when underline is hidden
-                textElement.style.marginTop = '0px';
-                textElement.style.paddingTop = '0px';
-            }
-            // The white-space, overflow-wrap, word-break are handled by CSS class '.otk-content-div'
-
-            // Process currentMessageOwnText for embeds and remaining text
-            if (currentMessageOwnText && typeof currentMessageOwnText === 'string') {
-                const lines = currentMessageOwnText.split('\n');
-                // The quoteRegex here is for inline quotes like "text >>123 text", not block quotes.
-                // Block quotes >>123 on their own lines were handled above.
-                const inlineQuoteRegex = />>(\d+)/;
-
-
-                lines.forEach((line, lineIndex) => {
-                    const trimmedLine = line.trim();
-                    let processedAsEmbed = false;
-                    let soleUrlEmbedMade = false;
-
-                    // Check for Sole YouTube URL
-                    // Removed isTopLevelMessage restriction for new_design path
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of youtubePatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const videoId = match[patternObj.idGroup];
-                                let timestampStr = null;
-                                const timeMatch = trimmedLine.match(youtubeTimestampRegex);
-                                if (timeMatch && timeMatch[1]) timestampStr = timeMatch[1];
-                                if (videoId) {
-                                    const canonicalEmbedId = `youtube_${videoId}`;
-                                    viewerTopLevelEmbedIds.add(canonicalEmbedId); // Simplified tracking
-                                    if (!seenEmbeds.includes(canonicalEmbedId)) { /* ... update stats ... */ }
-
-                                    textElement.appendChild(createYouTubeEmbedElement(videoId, timestampStr));
-                                    soleUrlEmbedMade = true; processedAsEmbed = true; break;
-                                }
-                            }
-                        }
-                    }
-                    // Similar checks for Twitch and Streamable sole URLs... (omitted for brevity, but structure is the same)
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of tiktokPatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const videoId = match[patternObj.idGroup];
-                                if (videoId) {
-                                    const canonicalEmbedId = `tiktok_${videoId}`;
-                                    viewerTopLevelEmbedIds.add(canonicalEmbedId);
-                                    if (!seenEmbeds.includes(canonicalEmbedId)) { /* ... update stats ... */ }
-
-                                    textElement.appendChild(createTikTokEmbedElement(videoId));
-                                    soleUrlEmbedMade = true; processedAsEmbed = true; break;
-                                }
-                            }
-                        }
-                    }
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of kickPatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const clipId = match[patternObj.idGroup];
-                                if (clipId) {
-                                    const canonicalEmbedId = `kick_${clipId}`;
-                                    viewerTopLevelEmbedIds.add(canonicalEmbedId);
-                                    if (!seenEmbeds.includes(canonicalEmbedId)) { /* ... update stats ... */ }
-
-                                    textElement.appendChild(createKickEmbedElement(clipId));
-                                    soleUrlEmbedMade = true; processedAsEmbed = true; break;
-                                }
-                            }
-                        }
-                    }
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of kickPatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const clipId = match[patternObj.idGroup];
-                                if (clipId) {
-                                    const canonicalEmbedId = `kick_${clipId}`;
-                                    if (isTopLevelMessage) {
-                                        viewerTopLevelEmbedIds.add(canonicalEmbedId);
-                                        if (!seenEmbeds.includes(canonicalEmbedId)) {
-                                            seenEmbeds.push(canonicalEmbedId);
-                                            localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
-                                            let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
-                                            localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics();
-                                        }
-                                    }
-                                    textElement.appendChild(createKickEmbedElement(clipId));
-                                    soleUrlEmbedMade = true; processedAsEmbed = true; break;
-                                }
-                            }
-                        }
-                    }
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of twitterPatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const tweetId = match[patternObj.idGroup];
-                                if (tweetId) {
-                                    const tweetEmbed = createTweetEmbedElement(tweetId);
-                                    if (tweetEmbed) {
-                                        textElement.appendChild(tweetEmbed);
-                                    }
-                                    soleUrlEmbedMade = true;
-                                    processedAsEmbed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if (!soleUrlEmbedMade) {
-                        let currentTextSegment = line;
-                        // Simpler inline processing for the new theme: only look for >>ddd for "not found" or simple link.
-                        // Actual recursive quote rendering is handled by the block logic above.
-                        // This loop is for text lines that might contain inline links or simple text.
-                        // For new theme, appendTextOrQuoteSegment might be too complex if block quotes are already handled.
-                        // Let's simplify: just append text, and make >>ddd links clickable but not expanding.
-
-                        // Simplified text processing for new design:
-                        // Split by >>ddd to make them links, otherwise just text.
-                        // This avoids recursive expansion here as it's done at block level.
-                        // Robust inline processing for text, >>ddd links, and media embeds
-                        while (currentTextSegment.length > 0) {
-                            let earliestMatch = null;
-                            let earliestMatchPattern = null; // For media embeds
-                            let earliestMatchType = null;    // 'youtube', 'twitch', 'streamable'
-                            let earliestMatchIsQuoteLink = false;
-
-                            // Find earliest inline YouTube match
-                            for (const patternObj of inlineYoutubePatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt && (earliestMatch === null || matchAttempt.index < earliestMatch.index)) {
-                                    earliestMatch = matchAttempt;
-                                    earliestMatchPattern = patternObj;
-                                    earliestMatchType = 'youtube';
-                                    earliestMatchIsQuoteLink = false;
-                                }
-                            }
-
-                            // Find earliest inline Kick match
-                            for (const patternObj of inlineKickPatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt && (earliestMatch === null || matchAttempt.index < earliestMatch.index)) {
-                                    earliestMatch = matchAttempt;
-                                    earliestMatchPattern = patternObj;
-                                    earliestMatchType = 'kick';
-                                    earliestMatchIsQuoteLink = false;
-                                }
-                            }
-
-                            // Find earliest inline TikTok match
-                            for (const patternObj of inlineTiktokPatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt && (earliestMatch === null || matchAttempt.index < earliestMatch.index)) {
-                                    earliestMatch = matchAttempt;
-                                    earliestMatchPattern = patternObj;
-                                    earliestMatchType = 'tiktok';
-                                    earliestMatchIsQuoteLink = false;
-                                }
-                            }
-
-                            // Find earliest inline Twitter match
-                            for (const patternObj of inlineTwitterPatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt && (earliestMatch === null || matchAttempt.index < earliestMatch.index)) {
-                                    earliestMatch = matchAttempt;
-                                    earliestMatchPattern = patternObj;
-                                    earliestMatchType = 'twitter';
-                                    earliestMatchIsQuoteLink = false;
-                                }
-                            }
-                            // Find earliest inline Twitch match
-                            for (const patternObj of inlineTwitchPatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt && (earliestMatch === null || matchAttempt.index < earliestMatch.index)) {
-                                    earliestMatch = matchAttempt;
-                                    earliestMatchPattern = patternObj;
-                                    earliestMatchType = 'twitch';
-                                    earliestMatchIsQuoteLink = false;
-                                }
-                            }
-                            // Find earliest inline Streamable match
-                            for (const patternObj of inlineStreamablePatterns) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt && (earliestMatch === null || matchAttempt.index < earliestMatch.index)) {
-                                    earliestMatch = matchAttempt;
-                                    earliestMatchPattern = patternObj;
-                                    earliestMatchType = 'streamable';
-                                    earliestMatchIsQuoteLink = false;
-                                }
-                            }
-
-                            // Find earliest >>ddd quote link match
-                            const quoteLinkMatch = currentTextSegment.match(inlineQuoteRegex); // inlineQuoteRegex is />>(\d+)/
-                            if (quoteLinkMatch && (earliestMatch === null || quoteLinkMatch.index < earliestMatch.index)) {
-                                earliestMatch = quoteLinkMatch;
-                                earliestMatchType = null; // Not a media embed
-                                earliestMatchIsQuoteLink = true;
-                            }
-
-                            if (earliestMatch) {
-                                processedAsEmbed = true; // Mark that some processing (embed or link) happened
-                                // Text before the match
-                                if (earliestMatch.index > 0) {
-                                    textElement.appendChild(document.createTextNode(currentTextSegment.substring(0, earliestMatch.index)));
-                                }
-
-                                const matchedText = earliestMatch[0];
-
-                                if (earliestMatchIsQuoteLink) {
-                                    const qId = earliestMatch[1];
-                                    const qLink = document.createElement('a');
-                                    // Try to find the actual rendered instance ID for better linking
-                                    const targetInstance = document.querySelector(`#otk-messages-container [data-original-message-id="${qId}"]`);
-                                    qLink.href = targetInstance ? `#${targetInstance.id}` : `#otk-instance-${qId}-unknown`;
-                                    qLink.textContent = matchedText;
-                                    qLink.style.color = 'var(--otk-newdesign-header-text-color, #555)'; // Example link color
-                                    qLink.onclick = (e) => {
-                                        e.preventDefault();
-                                        const targetEl = targetInstance || document.querySelector(`[data-message-id="${qId}"]`);
-                                        if (targetEl) targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                    };
-                                    textElement.appendChild(qLink);
-                                } else { // It's a media embed
-                                    const id = earliestMatch[earliestMatchPattern.idGroup];
-                                    let timestampStr = null;
-                                    let embedElement = null;
-                                    let canonicalEmbedId = null;
-
-                                    if (earliestMatchType === 'youtube') {
-                                        const timeMatchInUrl = matchedText.match(youtubeTimestampRegex);
-                                        if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
-                                        if (id) {
-                                            canonicalEmbedId = `youtube_${id}`;
-                                            embedElement = createYouTubeEmbedElement(id, timestampStr);
-                                        }
-                                    } else if (earliestMatchType === 'twitch') {
-                                        if (earliestMatchPattern.type === 'vod') {
-                                            const timeMatchInUrl = matchedText.match(twitchTimestampRegex);
-                                            if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
-                                        }
-                                        if (id) {
-                                            canonicalEmbedId = `twitch_${earliestMatchPattern.type}_${id}`;
-                                            embedElement = createTwitchEmbedElement(earliestMatchPattern.type, id, timestampStr);
-                                        }
-                                    } else if (earliestMatchType === 'streamable') {
-                                        if (id) {
-                                            canonicalEmbedId = `streamable_${id}`;
-                                            embedElement = createStreamableEmbedElement(id);
-                                        }
-                                    } else if (earliestMatchType === 'tiktok') {
-                                        if (id) {
-                                            canonicalEmbedId = `tiktok_${id}`;
-                                            embedElement = createTikTokEmbedElement(id);
-                                        }
-                                    } else if (earliestMatchType === 'kick') {
-                                        if (id) {
-                                            canonicalEmbedId = `kick_${id}`;
-                                            embedElement = createKickEmbedElement(id);
-                                        }
-                                    } else if (earliestMatchType === 'twitter') {
-                                        if (id) {
-                                            canonicalEmbedId = `twitter_${id}`;
-                                            embedElement = createTweetEmbedElement(id);
-                                        }
-                                    }
-
-                                    if (embedElement) {
-                                        // Statistics for embeds are only updated if they are in a top-level message.
-                                        if (isTopLevelMessage && canonicalEmbedId) {
-                                            viewerTopLevelEmbedIds.add(canonicalEmbedId);
-                                            if (!seenEmbeds.includes(canonicalEmbedId)) {
-                                                seenEmbeds.push(canonicalEmbedId);
-                                                localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
-                                                let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
-                                                localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                                updateDisplayedStatistics();
-                                            }
-                                        }
-                                        textElement.appendChild(embedElement);
-                                    }
-                                }
-                                currentTextSegment = currentTextSegment.substring(earliestMatch.index + matchedText.length);
-                            } else { // No more embeds or >>ddd links in the rest of the segment
-                                if (currentTextSegment.length > 0) {
-                                    textElement.appendChild(document.createTextNode(currentTextSegment));
-                                }
-                                currentTextSegment = ""; // Done with this line/segment
-                            }
-                        }
-                    }
-                    // End of robust inline processing
-
-                    if (lineIndex < lines.length - 1 && (trimmedLine.length > 0 || processedAsEmbed) && !soleUrlEmbedMade) {
-                        textElement.appendChild(document.createElement('br'));
-                    }
-                });
-            } else {
-                textElement.textContent = message.text || '';
-            }
-
-            if (shouldDisableUnderline && textElement.firstChild && textElement.firstChild.nodeName === 'BR') {
-                textElement.removeChild(textElement.firstChild);
-            }
-
-            textWrapperDiv.appendChild(textElement);
-            postDiv.appendChild(textWrapperDiv);
-            messageDiv.appendChild(postDiv); // Append the postDiv after any block quotes
-
-            // Attachment handling (can be similar to original, appended to messageDiv)
-            if (message.attachment && message.attachment.tim) {
-                const actualBoardForLink = boardForLink || message.board || 'b';
-                const attachmentDiv = document.createElement('div');
-                attachmentDiv.style.marginTop = '10px';
-
-                if (shouldDisplayFilenames) {
-                    const filenameLink = document.createElement('a');
-                    filenameLink.textContent = `${message.attachment.filename} (${message.attachment.ext.substring(1)})`;
-                    filenameLink.href = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
-                    filenameLink.target = "_blank";
-                    filenameLink.style.cssText = "color: #60a5fa; display: block; margin-bottom: 5px; text-decoration: underline;";
-                    attachmentDiv.appendChild(filenameLink);
-                }
-
-                _populateAttachmentDivWithMedia(
-                    attachmentDiv,
-                    message,
-                    actualBoardForLink,
-                    mediaLoadPromises,
-                    uniqueImageViewerHashes,
-                    isTopLevelMessage,
-                    'new_design',
-                    renderedFullSizeImageHashes,
-                    viewerTopLevelAttachedVideoHashes,
-                    otkMediaDB
-                );
-
-                if (attachmentDiv.hasChildNodes()) {
-                    textWrapperDiv.appendChild(attachmentDiv);
-                }
-            }
-
-            // Click listener for anchoring
-            const persistentInstanceId = `otk-msg-${parentMessageId || 'toplevel'}-${message.id}`;
-            messageDiv.id = persistentInstanceId;
-            messageDiv.setAttribute('data-original-message-id', message.id);
-
-            messageDiv.addEventListener('click', (event) => {
-                console.log("messageDiv clicked", persistentInstanceId);
-                const target = event.target;
-                let preventAnchor = false;
-
-                // Standard interactive elements that should not trigger anchoring
-                if (target.matches('a, img, video, iframe, input, button, select, textarea') ||
-                    target.closest('a, img, video, iframe, input, button, select, textarea') ||
-                    target.isContentEditable) {
-                    preventAnchor = true;
-                }
-
-                // Specific wrapper classes for embeds that should not trigger anchoring
-                if (!preventAnchor) {
-                    const specificWrappers = [
-                        '.thumbnail-link',
-                        '.otk-youtube-embed-wrapper',
-                        '.otk-twitch-embed-wrapper',
-                        '.otk-streamable-embed-wrapper'
-                    ];
-                    if (specificWrappers.some(cls => target.matches(cls) || target.closest(cls))) {
-                        preventAnchor = true;
-                    }
-                }
-
-                if (preventAnchor) {
-                    console.log("Anchor prevented for", persistentInstanceId);
-                    return; // Do not anchor
-                }
-
-                if (!isTopLevelMessage) {
-                    event.stopPropagation();
-                }
-
-                const isThisMessageAlreadyAnchored = messageDiv.classList.contains(ANCHORED_MESSAGE_CLASS);
-                console.log("isThisMessageAlreadyAnchored", isThisMessageAlreadyAnchored);
-
-                // Un-highlight all currently anchored messages
-                document.querySelectorAll(`.${ANCHORED_MESSAGE_CLASS}`).forEach(el => {
-                    el.classList.remove(ANCHORED_MESSAGE_CLASS);
-                });
-
-                if (isThisMessageAlreadyAnchored) {
-                    // If the clicked message was the anchor, un-anchor it
-                    localStorage.removeItem(ANCHORED_MESSAGE_ID_KEY);
-                    consoleLog(`Un-anchored message instance: ${persistentInstanceId}`);
-                } else {
-                    // Otherwise, anchor this new message
-                    messageDiv.classList.add(ANCHORED_MESSAGE_CLASS);
-                    localStorage.setItem(ANCHORED_MESSAGE_ID_KEY, persistentInstanceId);
-                    consoleLog(`Anchored new message instance: ${persistentInstanceId}`);
-                }
-            });
-
-            // Initial highlight check
-            const initiallyStoredAnchoredId = localStorage.getItem(ANCHORED_MESSAGE_ID_KEY);
-            console.log("initiallyStoredAnchoredId", initiallyStoredAnchoredId, "persistentInstanceId", persistentInstanceId);
-            if (persistentInstanceId === initiallyStoredAnchoredId) {
-                messageDiv.classList.add(ANCHORED_MESSAGE_CLASS);
-            }
-
-            return messageDiv;
-
-        } else { // layoutStyle === 'default' or unknown (original logic)
-            const messageDiv = document.createElement('div');
-            messageDiv.setAttribute('data-message-id', message.id);
 
             let backgroundColor;
             let marginLeft = '0';
@@ -2587,7 +2727,7 @@ function _populateAttachmentDivWithMedia(
             } else { // Quoted message (Depth 1+)
                 marginLeft = '0px'; // No specific indent margin for quote itself
                 marginTop = '10px';    // Specific top margin for quoted messages
-                marginBottom = '10px';  // Specific bottom margin for quoted messages
+                marginBottom = '0px';  // Specific bottom margin for quoted messages
                 if (currentDepth === 1) {
                     backgroundColorVar = 'var(--otk-msg-depth1-bg-color)';
                 } else { // Covers currentDepth === 2 and potential deeper fallbacks
@@ -2653,6 +2793,10 @@ function _populateAttachmentDivWithMedia(
                 width: 100%;
             `;
 
+            if (isFiltered) {
+                messageHeader.style.textDecoration = 'line-through';
+            }
+
             if (shouldDisableUnderline) {
                 messageHeader.style.borderBottom = 'none';
                 messageHeader.style.paddingBottom = '0px';
@@ -2685,28 +2829,145 @@ function _populateAttachmentDivWithMedia(
                     leftHeaderContent.appendChild(colorSquare);
                 }
 
-                const idTextSpan = document.createElement('span');
-                idTextSpan.textContent = `#${message.id} | ${timestampParts.time}`; // Combined ID and Time
-                leftHeaderContent.appendChild(idTextSpan);
+                const idSpan = document.createElement('span');
+                idSpan.textContent = `#${message.id}`;
+                idSpan.style.cursor = 'pointer';
+                idSpan.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const threadUrl = `https://boards.4chan.org/b/thread/${message.originalThreadId}`;
+                    const popup = window.open(threadUrl, '_blank', 'width=460,height=425,resizable,scrollbars');
+                    if (popup) {
+                        popup.addEventListener('load', () => {
+                            const script = popup.document.createElement('script');
+                            script.textContent = `
+                                const messageId = "${message.id}";
+                                const selector = \`#pi\${messageId} > span.postNum.desktop > a:nth-child(2)\`;
+                                const link = document.querySelector(selector);
+                                if (link) {
+                                    link.click();
+                                }
+                            `;
+                            popup.document.body.appendChild(script);
+                        }, true);
+                    }
+                });
 
-                // const timeSpan = document.createElement('span'); // Removed
-                // timeSpan.textContent = timestampParts.time;
-                // timeSpan.style.textAlign = 'center';
-                // timeSpan.style.flexGrow = '1';
+                const timeText = document.createTextNode(`\u00A0| ${timestampParts.time}`);
+                leftHeaderContent.appendChild(idSpan);
+                leftHeaderContent.appendChild(timeText);
+
+                const blockIcon = document.createElement('span');
+                blockIcon.innerHTML = '&#128711;'; // Block icon
+                blockIcon.style.cssText = 'margin-left: 10px; cursor: pointer;';
+
+                if (isFiltered) {
+                    blockIcon.style.color = 'red';
+                    blockIcon.title = 'This message is blocked by your filters.';
+                } else {
+                    blockIcon.style.visibility = 'hidden';
+                    blockIcon.title = 'Create filter for this message';
+                leftHeaderContent.addEventListener('mouseenter', () => {
+                        blockIcon.style.visibility = 'visible';
+                    });
+                leftHeaderContent.addEventListener('mouseleave', () => {
+                        blockIcon.style.visibility = 'hidden';
+                    });
+                }
+                leftHeaderContent.appendChild(blockIcon);
+
+                blockIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    let rule = '';
+                    if (message.text) {
+                        const cleanedText = message.text.replace(/>>\d+(\s\(You\))?/g, '').trim();
+                        if (cleanedText) {
+                            rule += `"${cleanedText}"`;
+                        }
+                    }
+                    if (message.attachment && message.attachment.filehash_db_key) {
+                        rule += ` md5:${message.attachment.filehash_db_key}`;
+                    }
+                    const filterWindow = document.getElementById('otk-filter-window');
+                    if (filterWindow) {
+                        filterWindow.style.display = 'flex';
+                        renderNewFilterView(rule.trim());
+                    }
+                });
 
                 const dateSpan = document.createElement('span');
                 dateSpan.textContent = timestampParts.date;
-                // dateSpan.style.paddingRight = '5px'; // Padding might not be needed or can be adjusted
 
-                messageHeader.appendChild(leftHeaderContent); // Add the new container
-                // messageHeader.appendChild(timeSpan); // Removed
+                messageHeader.appendChild(leftHeaderContent);
                 messageHeader.appendChild(dateSpan);
             } else { // Simplified header for quoted messages
                 messageHeader.style.justifyContent = 'flex-start'; // Align ID to the start
+
+                const headerContentWrapper = document.createElement('span');
+                headerContentWrapper.style.display = 'flex';
+                headerContentWrapper.style.alignItems = 'center';
+
                 const idSpan = document.createElement('span');
-                idSpan.textContent = `>>${message.id}`; // Changed prefix for quoted messages
-                // Time and Date spans are intentionally omitted for quoted messages
-                messageHeader.appendChild(idSpan);
+                idSpan.textContent = ` >>${message.id}`; // Changed prefix for quoted messages
+                idSpan.style.cursor = 'pointer';
+                idSpan.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const threadUrl = `https://boards.4chan.org/b/thread/${message.originalThreadId}`;
+                    const popup = window.open(threadUrl, '_blank', 'width=460,height=425,resizable,scrollbars,popup=true');
+                    if (popup) {
+                        popup.addEventListener('load', () => {
+                            const script = popup.document.createElement('script');
+                            script.textContent = `
+                                const messageId = "${message.id}";
+                                const selector = \`#pi\${messageId} > span.postNum.desktop > a:nth-child(2)\`;
+                                const link = document.querySelector(selector);
+                                if (link) {
+                                    link.click();
+                                }
+                            `;
+                            popup.document.body.appendChild(script);
+                        }, true);
+                    }
+                });
+                headerContentWrapper.appendChild(idSpan);
+
+                const blockIcon = document.createElement('span');
+                blockIcon.innerHTML = '&#128711;'; // Block icon
+                blockIcon.style.cssText = 'margin-left: 10px; cursor: pointer;';
+
+                if (isFiltered) {
+                    blockIcon.style.color = 'red';
+                    blockIcon.title = 'This message is blocked by your filters.';
+                } else {
+                    blockIcon.style.visibility = 'hidden';
+                    blockIcon.title = 'Create filter for this message';
+                    headerContentWrapper.addEventListener('mouseenter', () => {
+                        blockIcon.style.visibility = 'visible';
+                    });
+                    headerContentWrapper.addEventListener('mouseleave', () => {
+                        blockIcon.style.visibility = 'hidden';
+                    });
+                }
+                headerContentWrapper.appendChild(blockIcon);
+                messageHeader.appendChild(headerContentWrapper);
+
+                blockIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    let rule = '';
+                    if (message.text) {
+                        const cleanedText = message.text.replace(/>>\d+(\s\(You\))?/g, '').trim();
+                        if (cleanedText) {
+                            rule += `"${cleanedText}"`;
+                        }
+                    }
+                    if (message.attachment && message.attachment.filehash_db_key) {
+                        rule += ` md5:${message.attachment.filehash_db_key}`;
+                    }
+                    const filterWindow = document.getElementById('otk-filter-window');
+                    if (filterWindow) {
+                        filterWindow.style.display = 'flex';
+                        renderNewFilterView(rule.trim());
+                    }
+                });
             }
             messageDiv.appendChild(messageHeader);
 
@@ -2730,18 +2991,21 @@ function _populateAttachmentDivWithMedia(
 
             if (message.text && typeof message.text === 'string') {
                 const lines = message.text.split('\n');
-                const quoteRegex = /^>>(\d+)/;
+                const quoteRegex = /^>>(\d+)/; // For block-level quotes
+                const inlineQuoteRegex = />>(\d+)/; // For inline quotes
 
                 lines.forEach((line, lineIndex) => {
                     const trimmedLine = line.trim();
+                    const isBlockQuote = trimmedLine.match(quoteRegex) && trimmedLine.match(quoteRegex)[0] === trimmedLine;
+
+                    if (isBlockQuote && currentDepth >= MAX_QUOTE_DEPTH) {
+                        return; // Skip rendering this line entirely if it's a blockquote at max depth
+                    }
+
                     let processedAsEmbed = false;
-
-                    // All pattern definitions have been moved to the top of createMessageElementDOM.
-                    // The duplicate Streamable pattern block will also be removed by this change
-                    // as we are replacing the entire section where they were previously defined.
-
                     let soleUrlEmbedMade = false;
 
+                    // --- 1. Handle lines that are solely a media URL ---
                     // Check for Sole YouTube URL
                     if (!soleUrlEmbedMade) {
                         for (const patternObj of youtubePatterns) {
@@ -2754,25 +3018,24 @@ function _populateAttachmentDivWithMedia(
                                 if (videoId) {
                                     const canonicalEmbedId = `youtube_${videoId}`;
                                     if (isTopLevelMessage) {
-                                        // Add to viewer-specific top-level set
                                         viewerTopLevelEmbedIds.add(canonicalEmbedId);
-
-                                        // Existing global stat update logic (SEEN_EMBED_URL_IDS_KEY, LOCAL_VIDEO_COUNT_KEY)
                                         if (!seenEmbeds.includes(canonicalEmbedId)) {
                                             seenEmbeds.push(canonicalEmbedId);
                                             localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
                                             let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
                                             localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics(); // This updates global, not viewer-specific directly
+                                            updateDisplayedStatistics(false);
                                         }
                                     }
                                     textElement.appendChild(createYouTubeEmbedElement(videoId, timestampStr));
-                                    soleUrlEmbedMade = true; processedAsEmbed = true; break;
+                                    soleUrlEmbedMade = true;
+                                    processedAsEmbed = true;
+                                    break;
                                 }
                             }
                         }
                     }
-
+                    // (Similar blocks for Twitch, TikTok, Streamable as in the original code)
                     // Check for Sole Twitch URL
                     if (!soleUrlEmbedMade) {
                         for (const patternObj of twitchPatterns) {
@@ -2787,26 +3050,24 @@ function _populateAttachmentDivWithMedia(
                                 if (id) {
                                     const canonicalEmbedId = `twitch_${patternObj.type}_${id}`;
                                     if (isTopLevelMessage) {
-                                        // Add to viewer-specific top-level set
                                         viewerTopLevelEmbedIds.add(canonicalEmbedId);
-
-                                        // Existing global stat update logic
                                         if (!seenEmbeds.includes(canonicalEmbedId)) {
                                             seenEmbeds.push(canonicalEmbedId);
                                             localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
                                             let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
                                             localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics();
+                                            updateDisplayedStatistics(false);
                                         }
                                     }
                                     textElement.appendChild(createTwitchEmbedElement(patternObj.type, id, timestampStr));
-                                    soleUrlEmbedMade = true; processedAsEmbed = true; break;
+                                    soleUrlEmbedMade = true;
+                                    processedAsEmbed = true;
+                                    break;
                                 }
                             }
                         }
                     }
-
-                    // Check for Sole Streamable URL
+                    // Check for Sole TikTok URL
                     if (!soleUrlEmbedMade) {
                         for (const patternObj of tiktokPatterns) {
                             const match = trimmedLine.match(patternObj.regex);
@@ -2821,25 +3082,10 @@ function _populateAttachmentDivWithMedia(
                                             localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
                                             let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
                                             localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics();
+                                            updateDisplayedStatistics(false);
                                         }
                                     }
                                     textElement.appendChild(createTikTokEmbedElement(videoId));
-                                    soleUrlEmbedMade = true; processedAsEmbed = true; break;
-                                }
-                            }
-                        }
-                    }
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of twitterPatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const tweetId = match[patternObj.idGroup];
-                                if (tweetId) {
-                                    const tweetEmbed = createTweetEmbedElement(tweetId);
-                                    if (tweetEmbed) {
-                                        textElement.appendChild(tweetEmbed);
-                                    }
                                     soleUrlEmbedMade = true;
                                     processedAsEmbed = true;
                                     break;
@@ -2847,41 +3093,162 @@ function _populateAttachmentDivWithMedia(
                             }
                         }
                     }
+                    // Check for Sole Streamable URL
                     if (!soleUrlEmbedMade) {
                         for (const patternObj of streamablePatterns) {
                             const match = trimmedLine.match(patternObj.regex);
                             if (match) {
                                 const videoId = match[patternObj.idGroup];
-                                // Streamable doesn't have standard URL timestamps to parse here
                                 if (videoId) {
                                     const canonicalEmbedId = `streamable_${videoId}`;
                                     if (isTopLevelMessage) {
-                                        // Add to viewer-specific top-level set
                                         viewerTopLevelEmbedIds.add(canonicalEmbedId);
-
-                                        // Existing global stat update logic
                                         if (!seenEmbeds.includes(canonicalEmbedId)) {
                                             seenEmbeds.push(canonicalEmbedId);
                                             localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
                                             let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
                                             localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics();
+                                            updateDisplayedStatistics(false);
                                         }
                                     }
                                     textElement.appendChild(createStreamableEmbedElement(videoId));
-                                    soleUrlEmbedMade = true; processedAsEmbed = true; break;
+                                    soleUrlEmbedMade = true;
+                                    processedAsEmbed = true;
+                                    break;
                                 }
                             }
                         }
                     }
 
-                    if (!soleUrlEmbedMade) {
-                        let lineWasSkipped = appendTextOrQuoteSegment(textElement, line, quoteRegex, currentDepth, MAX_QUOTE_DEPTH, messagesByThreadId, uniqueImageViewerHashes, boardForLink, mediaLoadPromises, message.id);
 
-                        if (lineIndex < lines.length - 1 && !lineWasSkipped) {
-                            textElement.appendChild(document.createElement('br'));
+                    // --- 2. Handle mixed content lines iteratively ---
+                    if (!soleUrlEmbedMade) {
+                        let currentTextSegment = line;
+
+                        while (currentTextSegment.length > 0) {
+                            let earliestMatch = null;
+                            let earliestMatchPattern = null;
+                            let earliestMatchType = null;
+                            let earliestMatchIsQuoteLink = false;
+
+                            // Find earliest media embed match
+                            for (const patternObj of [...inlineYoutubePatterns, ...inlineKickPatterns, ...inlineTiktokPatterns, ...inlineTwitchPatterns, ...inlineStreamablePatterns]) {
+                                const matchAttempt = currentTextSegment.match(patternObj.regex);
+                                if (matchAttempt && (earliestMatch === null || matchAttempt.index < earliestMatch.index)) {
+                                    earliestMatch = matchAttempt;
+                                    earliestMatchPattern = patternObj;
+                                    // Determine type based on pattern object properties if needed, simplified here
+                                    if (inlineYoutubePatterns.includes(patternObj)) earliestMatchType = 'youtube';
+                                    else if (inlineKickPatterns.includes(patternObj)) earliestMatchType = 'kick';
+                                    else if (inlineTiktokPatterns.includes(patternObj)) earliestMatchType = 'tiktok';
+                                    else if (inlineTwitchPatterns.includes(patternObj)) earliestMatchType = 'twitch';
+                                    else if (inlineStreamablePatterns.includes(patternObj)) earliestMatchType = 'streamable';
+                                    earliestMatchIsQuoteLink = false;
+                                }
+                            }
+
+                            // Find earliest >>ddd quote link match
+                            const quoteLinkMatch = currentTextSegment.match(inlineQuoteRegex);
+                            if (quoteLinkMatch && (earliestMatch === null || quoteLinkMatch.index < earliestMatch.index)) {
+                                earliestMatch = quoteLinkMatch;
+                                earliestMatchType = null;
+                                earliestMatchIsQuoteLink = true;
+                            }
+
+                            if (earliestMatch) {
+                                processedAsEmbed = true;
+                                // Append text before the match
+                                if (earliestMatch.index > 0) {
+                                    textElement.appendChild(document.createTextNode(currentTextSegment.substring(0, earliestMatch.index)));
+                                }
+
+                                const matchedText = earliestMatch[0];
+
+                                if (earliestMatchIsQuoteLink) {
+                                    // Handle quote rendering directly, respecting MAX_QUOTE_DEPTH
+                                    if (currentDepth >= MAX_QUOTE_DEPTH) {
+                                        textElement.appendChild(document.createTextNode(matchedText));
+                                    } else {
+                                        const quotedMessageId = earliestMatch[1];
+                                        let quotedMessageObject = null;
+                                        for (const threadIdKey in messagesByThreadId) {
+                                            if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
+                                                const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === Number(quotedMessageId));
+                                                if (foundMsg) {
+                                                    quotedMessageObject = foundMsg;
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        if (quotedMessageObject) {
+                                            const quotedElement = createMessageElementDOM(quotedMessageObject, mediaLoadPromises, uniqueImageViewerHashes, quotedMessageObject.board || boardForLink, false, currentDepth + 1, null, message.id, newAncestors);
+                                            if (quotedElement) {
+                                                textElement.appendChild(quotedElement);
+                                            }
+                                        } else {
+                                            const notFoundSpan = document.createElement('span');
+                                            notFoundSpan.textContent = `>>${quotedMessageId} (Not Found)`;
+                                            notFoundSpan.style.color = '#88ccee';
+                                            notFoundSpan.style.textDecoration = 'underline';
+                                            textElement.appendChild(notFoundSpan);
+                                        }
+                                    }
+                                } else { // It's a media embed
+                                    const id = earliestMatch[earliestMatchPattern.idGroup];
+                                    let timestampStr = null;
+                                    let embedElement = null;
+                                    let canonicalEmbedId = null;
+
+                                    if (earliestMatchType === 'youtube') {
+                                        const timeMatchInUrl = matchedText.match(youtubeTimestampRegex);
+                                        if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
+                                        canonicalEmbedId = `youtube_${id}`;
+                                        embedElement = createYouTubeEmbedElement(id, timestampStr);
+                                    } else if (earliestMatchType === 'twitch') {
+                                        if (earliestMatchPattern.type === 'vod') {
+                                            const timeMatchInUrl = matchedText.match(twitchTimestampRegex);
+                                            if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
+                                        }
+                                        canonicalEmbedId = `twitch_${earliestMatchPattern.type}_${id}`;
+                                        embedElement = createTwitchEmbedElement(earliestMatchPattern.type, id, timestampStr);
+                                    } else if (earliestMatchType === 'streamable') {
+                                        canonicalEmbedId = `streamable_${id}`;
+                                        embedElement = createStreamableEmbedElement(id);
+                                    } else if (earliestMatchType === 'tiktok') {
+                                        canonicalEmbedId = `tiktok_${id}`;
+                                        embedElement = createTikTokEmbedElement(id);
+                                    } else if (earliestMatchType === 'kick') {
+                                        canonicalEmbedId = `kick_${id}`;
+                                        embedElement = createKickEmbedElement(id);
+                                    }
+
+                                    if (embedElement) {
+                                        if (isTopLevelMessage && canonicalEmbedId) {
+                                            viewerTopLevelEmbedIds.add(canonicalEmbedId);
+                                            if (!seenEmbeds.includes(canonicalEmbedId)) {
+                                                seenEmbeds.push(canonicalEmbedId);
+                                                localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
+                                                let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
+                                                localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
+                                                updateDisplayedStatistics(false);
+                                            }
+                                        }
+                                        textElement.appendChild(embedElement);
+                                    }
+                                }
+                                currentTextSegment = currentTextSegment.substring(earliestMatch.index + matchedText.length);
+                            } else {
+                                // No more matches, append the rest of the text
+                                if (currentTextSegment.length > 0) {
+                                    textElement.appendChild(document.createTextNode(currentTextSegment));
+                                }
+                                currentTextSegment = ""; // Exit loop
+                            }
                         }
-                    } else if (lineIndex < lines.length - 1) {
+                    }
+
+                    if (lineIndex < lines.length - 1 && (trimmedLine.length > 0 || processedAsEmbed)) {
                         textElement.appendChild(document.createElement('br'));
                     }
                 });
@@ -2892,8 +3259,6 @@ function _populateAttachmentDivWithMedia(
             if (shouldDisableUnderline && textElement.firstChild && textElement.firstChild.nodeName === 'BR') {
                 textElement.removeChild(textElement.firstChild);
             }
-
-            messageDiv.appendChild(textElement);
 
             // Click listener for anchoring
             const persistentInstanceId = `otk-msg-${parentMessageId || 'toplevel'}-${message.id}`;
@@ -2953,14 +3318,15 @@ function _populateAttachmentDivWithMedia(
 
             // Initial highlight check when the element is first created
             const initiallyStoredAnchoredId = localStorage.getItem(ANCHORED_MESSAGE_ID_KEY);
-            console.log("initiallyStoredAnchoredId", initiallyStoredAnchoredId, "persistentInstanceId", persistentInstanceId);
+            consoleLog("initiallyStoredAnchoredId", initiallyStoredAnchoredId, "persistentInstanceId", persistentInstanceId);
             if (persistentInstanceId === initiallyStoredAnchoredId) {
                 messageDiv.classList.add(ANCHORED_MESSAGE_CLASS);
             }
-            // The erroneous duplicated block that was here has been removed.
+
+            let attachmentDiv = null;
             if (message.attachment && message.attachment.tim) {
                 const actualBoardForLink = boardForLink || message.board || 'b';
-                const attachmentDiv = document.createElement('div');
+                attachmentDiv = document.createElement('div');
                 attachmentDiv.style.marginTop = '10px';
 
                 if (shouldDisplayFilenames) {
@@ -2973,19 +3339,18 @@ function _populateAttachmentDivWithMedia(
                 }
 
                 _populateAttachmentDivWithMedia(
-                    attachmentDiv,
-                    message,
-                    actualBoardForLink,
-                    mediaLoadPromises,
-                    uniqueImageViewerHashes,
-                    isTopLevelMessage,
-                    'default',
-                    renderedFullSizeImageHashes,
-                    viewerTopLevelAttachedVideoHashes,
-                    otkMediaDB
+                    attachmentDiv, message, actualBoardForLink, mediaLoadPromises,
+                    uniqueImageViewerHashes, isTopLevelMessage, 'default',
+                    renderedFullSizeImageHashes, viewerTopLevelAttachedVideoHashes, otkMediaDB
                 );
+            }
 
-                if (attachmentDiv.hasChildNodes()) {
+            if (isFiltered) {
+                const collapsibleContainer = wrapInCollapsibleContainer([textElement, attachmentDiv]);
+                messageDiv.appendChild(collapsibleContainer);
+            } else {
+                messageDiv.appendChild(textElement);
+                if (attachmentDiv) {
                     messageDiv.appendChild(attachmentDiv);
                 }
             }
@@ -2993,81 +3358,6 @@ function _populateAttachmentDivWithMedia(
         } // End of else (default layout)
     }
 
-    async function appendNewMessagesToViewer(newMessages) {
-        consoleLog(`[appendNewMessagesToViewer] Called with ${newMessages.length} new messages.`);
-        const messagesContainer = document.getElementById('otk-messages-container');
-        if (!messagesContainer) {
-            consoleError("[appendNewMessagesToViewer] messagesContainer not found. Aborting append.");
-            hideLoadingScreen();
-            return;
-        }
-
-        if (newMessages.length === 0) {
-            consoleLog("[appendNewMessagesToViewer] No new messages to append.");
-            hideLoadingScreen();
-            return;
-        }
-
-        const newContentDiv = document.createElement('div');
-
-        const separatorDiv = document.createElement('div');
-        separatorDiv.style.cssText = `
-            border-top: 2px dashed var(--otk-new-messages-divider-color);
-            margin: 20px 0;
-            padding-top: 10px;
-            padding-bottom: 10px;
-            padding-left: 15px;
-            text-align: left;
-            color: var(--otk-new-messages-font-color);
-            font-size: 12px;
-            font-style: italic;
-            width: 100%;
-            box-sizing: border-box;
-        `;
-        const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        separatorDiv.textContent = `--- ${currentTime} : ${newMessages.length} New Messages Loaded ---`;
-        newContentDiv.appendChild(separatorDiv);
-
-        const mediaLoadPromises = [];
-        const messageLimitEnabled = localStorage.getItem('otkMessageLimitEnabled') === 'true';
-        const messageLimitValue = parseInt(localStorage.getItem('otkMessageLimitValue') || '500', 10);
-
-        for (const message of newMessages) {
-            const boardForLink = message.board || 'b';
-            const threadColor = getThreadColor(message.originalThreadId);
-            const messageElement = createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, true, 0, threadColor, null);
-            newContentDiv.appendChild(messageElement);
-            renderedMessageIdsInViewer.add(message.id);
-        }
-
-        messagesContainer.appendChild(newContentDiv);
-
-        if (messageLimitEnabled) {
-            const messageElements = messagesContainer.querySelectorAll('.otk-message-container-main, .otk-message-container-quote-depth-1, .otk-message-container-quote-depth-2');
-            if (messageElements.length > messageLimitValue) {
-                const numToRemove = messageElements.length - messageLimitValue;
-                for (let i = 0; i < numToRemove; i++) {
-                    const messageToRemove = messageElements[i];
-                    renderedMessageIdsInViewer.delete(parseInt(messageToRemove.dataset.messageId, 10));
-                    messageToRemove.remove();
-                }
-            }
-        }
-
-        Promise.all(mediaLoadPromises).then(async () => {
-            hideLoadingScreen();
-
-            // Don't adjust scroll position
-            consoleLog("[appendNewMessagesToViewer] Scroll position intentionally not adjusted after append.");
-
-            viewerActiveImageCount = uniqueImageViewerHashes.size;
-            viewerActiveVideoCount = viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size;
-            updateDisplayedStatistics();
-        }).catch(err => {
-            consoleError("[appendNewMessagesToViewer] Error in media promises:", err);
-            hideLoadingScreen();
-        });
-    }
 
 
     function createThumbnailElement(attachment, board) {
@@ -3112,7 +3402,7 @@ function _populateAttachmentDivWithMedia(
                     let com = (thread.com || '').toLowerCase();
                     const combinedText = title + " " + com;
 
-                    if (keywords.some(keyword => combinedText.includes(keyword))) {
+                    if (keywords.some(keyword => combinedText.includes(keyword)) && !blockedThreads.has(Number(thread.no))) {
                         foundThreads.push({
                             id: Number(thread.no),
                             title: thread.sub || `Thread ${thread.no}` // Store original case title
@@ -3204,7 +3494,7 @@ function _populateAttachmentDivWithMedia(
             let fetchedImagesInThread = 0;
             let fetchedVideosInThread = 0;
             let newlyStoredImagesInThread = 0;
-            const newlyStoredVideosInThread = 0; // Stays 0 for now as videos are not stored in IDB
+            let newlyStoredVideosInThread = 0;
 
             for (const post of posts) {
                 fetchedMessagesInThread++;
@@ -3328,7 +3618,7 @@ function _populateAttachmentDivWithMedia(
                                                     let currentImageCount = parseInt(localStorage.getItem(LOCAL_IMAGE_COUNT_KEY) || '0');
                                                     localStorage.setItem(LOCAL_IMAGE_COUNT_KEY, (currentImageCount + 1).toString());
                                                 } else if (['.webm', '.mp4'].includes(extLower)) {
-                                                    // fetchedVideosInThread handled later
+                                                    newlyStoredVideosInThread++;
                                                     let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
                                                     localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
                                                 }
@@ -3478,7 +3768,7 @@ function _populateAttachmentDivWithMedia(
             fetchedVideosInThread = trueFetchedVideos;
 
 
-            consoleLog(`[fetchThreadMessages] Processed thread ${threadId}: ${fetchedMessagesInThread} msgs, ${fetchedImagesInThread} imgs, ${fetchedVideosInThread} vids. Stored: ${newlyStoredImagesInThread} imgs.`);
+            consoleLog(`[fetchThreadMessages] Processed thread ${threadId}: ${fetchedMessagesInThread} msgs, ${fetchedImagesInThread} imgs, ${fetchedVideosInThread} vids. Stored: ${newlyStoredImagesInThread} imgs, ${newlyStoredVideosInThread} vids.`);
             return {
                 messages: processedMessages,
                 counts: {
@@ -3486,7 +3776,7 @@ function _populateAttachmentDivWithMedia(
                     fetchedImages: fetchedImagesInThread,
                     fetchedVideos: fetchedVideosInThread,
                     newlyStoredImages: newlyStoredImagesInThread,
-                    newlyStoredVideos: newlyStoredVideosInThread // Will be 0
+                    newlyStoredVideos: newlyStoredVideosInThread
                 }
             };
         } catch (error) {
@@ -3495,14 +3785,14 @@ function _populateAttachmentDivWithMedia(
         }
     }
 
-    async function backgroundRefreshThreadsAndMessages(options = {}) { // Added options parameter
+async function backgroundRefreshThreadsAndMessages(options = {}) { // Added options parameter
         const { skipViewerUpdate = false, isBackground = false } = options; // Destructure with default
 
         if (isManualRefreshInProgress) {
             consoleLog('[BG] Manual refresh in progress, skipping background refresh.');
             return;
         }
-        consoleLog('[BG] Performing background refresh...');
+        consoleLog('[BG] Performing background refresh...', { isBackground, options });
         try {
             consoleLog('[BG] Calling scanCatalog...');
             const foundThreads = await scanCatalog();
@@ -3597,7 +3887,7 @@ function _populateAttachmentDivWithMedia(
 
             consoleLog(`[BG] Final active threads after message processing: ${activeThreads.length}`, activeThreads);
             consoleLog('[BG] Saving data...');
-            console.log("[BG] messagesByThreadId before save: ", messagesByThreadId);
+            consoleLog("[BG] messagesByThreadId before save: ", messagesByThreadId);
             localStorage.setItem(THREADS_KEY, JSON.stringify(activeThreads));
             for (const threadId of activeThreads) {
                 if (messagesByThreadId[threadId]) {
@@ -3610,18 +3900,41 @@ function _populateAttachmentDivWithMedia(
             window.dispatchEvent(new CustomEvent('otkMessagesUpdated'));
             renderThreadList();
 
-            updateDisplayedStatistics();
+            // Calculate new messages and media from this refresh
+            let newMessagesThisRefresh = newMessages.length;
+            let newImagesThisRefresh = 0;
+            let newVideosThisRefresh = 0;
+            newMessages.forEach(msg => {
+                if (msg.attachment) {
+                    const ext = msg.attachment.ext.toLowerCase();
+                    if (['.jpg', '.jpeg', '.png', '.gif'].includes(ext)) newImagesThisRefresh++;
+                    else if (['.webm', '.mp4'].includes(ext)) newVideosThisRefresh++;
+                }
+            });
 
-            if (isBackground && newMessages.length > 0) {
-                // When a background refresh happens, we should not add new content to the viewer.
-                // The main purpose is to update the underlying data and the "(+n)" indicators.
-                // The logic to prevent viewer updates for background refreshes is now primarily handled by the `isBackground` flag's context.
-                // This block can be simplified or removed if no specific background-only action is needed.
-                // For clarity, let's log that we are intentionally not updating the viewer.
-                consoleLog(`[BG] ${newMessages.length} new messages found. Viewer content will not be updated during this background refresh.`);
+            // Accumulate new counts
+            let accumulatedNewMessages = parseInt(localStorage.getItem('otkNewMessagesCount') || '0') + newMessagesThisRefresh;
+            let accumulatedNewImages = parseInt(localStorage.getItem('otkNewImagesCount') || '0') + newImagesThisRefresh;
+            let accumulatedNewVideos = parseInt(localStorage.getItem('otkNewVideosCount') || '0') + newVideosThisRefresh;
+
+            localStorage.setItem('otkNewMessagesCount', accumulatedNewMessages);
+            localStorage.setItem('otkNewImagesCount', accumulatedNewImages);
+            localStorage.setItem('otkNewVideosCount', accumulatedNewVideos);
+
+            // **FIX: Declare viewerIsOpen before it is used.**
+            const viewerIsOpen = otkViewer && otkViewer.style.display === 'block';
+
+            updateDisplayedStatistics(isBackground);
+
+            if (viewerIsOpen && !skipViewerUpdate) {
+                if (newMessages.length > 0) {
+                    const cachedIds = new Set(cachedNewMessages.map(m => m.id));
+                    const messagesToCache = newMessages.filter(m => !cachedIds.has(m.id));
+                    cachedNewMessages.push(...messagesToCache);
+                    consoleLog(`[BG] Viewer is open, caching ${messagesToCache.length} new messages for manual refresh.`);
+                }
             }
 
-            const viewerIsOpen = otkViewer && otkViewer.style.display === 'block';
             if (!viewerIsOpen) {
                 consoleLog('[BG Refresh] Viewer is closed. Resynchronizing display snapshot with ground truth.');
                 const allMessages = getAllMessagesSorted();
@@ -3689,10 +4002,18 @@ function _populateAttachmentDivWithMedia(
     }
 
     async function refreshThreadsAndMessages(options = {}) { // Manual Refresh / Called by Clear
-        const { skipViewerUpdate = false } = options; // Destructure with default
+        const { skipViewerUpdate = false, isChildCall = false } = options; // Destructure with default
 
-        consoleLog('[Manual] Refreshing threads and messages...');
-        isManualRefreshInProgress = true;
+        if (!isChildCall) {
+            if (isManualRefreshInProgress) {
+                consoleLog('[Manual] Refresh already in progress. Ignoring top-level call.');
+                return;
+            }
+            isManualRefreshInProgress = true;
+            resetStatAnimations();
+        }
+
+        consoleLog('[Manual] Refreshing threads and messages...', { options });
         showLoadingScreen("Initializing refresh..."); // Initial message
         try {
             await new Promise(resolve => setTimeout(resolve, 50)); // Ensure loading screen renders
@@ -3738,11 +4059,12 @@ function _populateAttachmentDivWithMedia(
             let totalNewImagesThisRefresh = 0; // Fetched images
             let totalNewVideosThisRefresh = 0; // Fetched videos
             let totalImagesStoredThisRefresh = 0;
-            // totalVideosStoredThisRefresh remains 0
+            let totalVideosStoredThisRefresh = 0;
 
             let threadsProcessedCount = 0;
             const totalThreadsToProcess = threadsToFetch.length;
 
+        let newMessagesToAppend = [];
             // Use a sequential loop for fetching to update loading screen more granularly per thread
             for (const threadId of threadsToFetch) {
                 threadsProcessedCount++;
@@ -3772,6 +4094,7 @@ function _populateAttachmentDivWithMedia(
                             newMessagesData.forEach(m => {
                                 if (!existingIds.has(m.id)) {
                                     updatedMessages.push(m);
+                                newMessagesToAppend.push(m);
                                     actualNewMessagesInThread++;
                                 }
                             });
@@ -3785,9 +4108,9 @@ function _populateAttachmentDivWithMedia(
                         totalNewImagesThisRefresh += counts.fetchedImages;
                         totalNewVideosThisRefresh += counts.fetchedVideos;
                         totalImagesStoredThisRefresh += counts.newlyStoredImages;
-                        // totalVideosStoredThisRefresh += counts.newlyStoredVideos; (will be 0)
+                        totalVideosStoredThisRefresh += counts.newlyStoredVideos;
 
-                        consoleLog(`[Manual] Processed thread ${threadId}. Fetched: ${counts.fetchedMessages} msgs, ${counts.fetchedImages} imgs, ${counts.fetchedVideos} vids. Added: ${actualNewMessagesInThread} new msgs. Stored: ${counts.newlyStoredImages} imgs.`);
+                        consoleLog(`[Manual] Processed thread ${threadId}. Fetched: ${counts.fetchedMessages} msgs, ${counts.fetchedImages} imgs, ${counts.fetchedVideos} vids. Added: ${actualNewMessagesInThread} new msgs. Stored: ${counts.newlyStoredImages} imgs, ${counts.newlyStoredVideos} vids.`);
                     }
                 } catch (error) {
                     consoleError(`[Manual] Error processing thread ${threadId} in loop:`, error);
@@ -3841,7 +4164,10 @@ function _populateAttachmentDivWithMedia(
             localStorage.setItem(LAST_SEEN_MESSAGES_KEY, newTotalMessages);
             localStorage.setItem(LAST_SEEN_IMAGES_KEY, newTotalImages);
             localStorage.setItem(LAST_SEEN_VIDEOS_KEY, newTotalVideos);
-            consoleLog(`[Manual Refresh] Updated last seen counts to: ${newTotalMessages} msgs, ${newTotalImages} imgs, ${newTotalVideos} vids.`);
+            localStorage.setItem('otkNewMessagesCount', '0');
+            localStorage.setItem('otkNewImagesCount', '0');
+            localStorage.setItem('otkNewVideosCount', '0');
+            consoleLog(`[Manual Refresh] Updated last seen counts and reset accumulated new counts.`);
 
         let viewerIsOpen = otkViewer && otkViewer.style.display === 'block';
 
@@ -3911,37 +4237,26 @@ function _populateAttachmentDivWithMedia(
              consoleLog(`[Manual Refresh] Resync complete. Snapshot counts: ${renderedMessageIdsInViewer.size} msgs, ${uniqueImageViewerHashes.size} imgs, ${viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size} videos.`);
         }
 
-            updateDisplayedStatistics();
+            updateDisplayedStatistics(false);
 
-            // New logic for incremental append or full render
-            const messagesContainer = document.getElementById('otk-messages-container'); // Still needed to check if viewer is open and has container
-
-            // Scroll position logic is removed from here for append.
-            // toggleViewer handles scroll restoration for open/close.
-
-            // Consolidate all messages fetched in this cycle to check for new ones
-            let allFetchedMessagesThisCycle = [];
-            for (const threadId of activeThreads) {
-                if (messagesByThreadId[threadId]) {
-                    allFetchedMessagesThisCycle = allFetchedMessagesThisCycle.concat(messagesByThreadId[threadId]);
+        if (!skipViewerUpdate && viewerIsOpen) {
+            let allNewMessages = [...cachedNewMessages, ...newMessagesToAppend];
+            cachedNewMessages = [];
+            consoleLog('[Manual Refresh] Cleared background message cache.');
+            const allNewIds = new Set();
+            const uniqueNewMessages = allNewMessages.filter(m => {
+                if (allNewIds.has(m.id)) {
+                    return false;
                 }
-            }
-            allFetchedMessagesThisCycle.sort((a, b) => a.time - b.time); // Ensure sorted if order matters for append logic
-
-            const newMessagesToAppend = allFetchedMessagesThisCycle.filter(m => !renderedMessageIdsInViewer.has(m.id));
-
-            consoleLog(`[Manual Refresh] About to check viewer state. Is open: ${viewerIsOpen}. New messages to append: ${newMessagesToAppend.length}. Skip viewer update: ${skipViewerUpdate}.`);
-
-            if (!skipViewerUpdate) { // Only perform viewer updates if not skipped
-                if (viewerIsOpen && newMessagesToAppend.length > 0) {
-                    consoleLog(`[Manual Refresh] Viewer is open, appending ${newMessagesToAppend.length} new messages.`);
-                    await appendNewMessagesToViewer(newMessagesToAppend);
-                } else {
-                    consoleLog(`[Manual Refresh] Viewer not updated. Is open: ${viewerIsOpen}, New messages: ${newMessagesToAppend.length}`);
-                }
-            } else {
-                consoleLog('[Refresh] Viewer update skipped as requested by options.');
-            }
+                allNewIds.add(m.id);
+                return true;
+            });
+            const finalMessagesToAppend = uniqueNewMessages.filter(m => !renderedMessageIdsInViewer.has(m.id));
+            consoleLog(`[Manual Refresh] Viewer is open, appending ${finalMessagesToAppend.length} new messages.`);
+            await appendNewMessagesToViewer(finalMessagesToAppend);
+        } else {
+            consoleLog(`[Manual Refresh] Viewer not updated. Skip viewer update: ${skipViewerUpdate}, Viewer is open: ${viewerIsOpen}`);
+        }
             // If viewer is not open, no specific viewer update action here, it will populate on next open.
 
             updateLoadingProgress(100, "Refresh complete!");
@@ -3952,12 +4267,15 @@ function _populateAttachmentDivWithMedia(
             updateLoadingProgress(100, "Error during refresh. Check console.");
             setTimeout(hideLoadingScreen, 1500); // Keep error message visible a bit longer
         } finally {
-            isManualRefreshInProgress = false;
+            if (!isChildCall) {
+                isManualRefreshInProgress = false;
+            }
         }
     }
 
     async function clearAndRefresh() {
         consoleLog('[Clear] Clear and Refresh initiated...');
+        resetStatAnimations();
         const viewerWasOpen = otkViewer && otkViewer.style.display === 'block';
 
         // Clear viewer content and related state immediately if viewer was open
@@ -3979,6 +4297,7 @@ function _populateAttachmentDivWithMedia(
             activeThreads = [];
             messagesByThreadId = {};
             threadColors = {};
+            blockedThreads = new Set();
             localStorage.removeItem(THREADS_KEY);
             // No longer need to remove MESSAGES_KEY, as it's not used.
             localStorage.removeItem(COLORS_KEY);
@@ -3990,20 +4309,37 @@ function _populateAttachmentDivWithMedia(
             localStorage.removeItem(LAST_SEEN_IMAGES_KEY);
             localStorage.removeItem(LAST_SEEN_VIDEOS_KEY);
             localStorage.removeItem(THEME_SETTINGS_KEY);
+            localStorage.removeItem(BLOCKED_THREADS_KEY);
             consoleLog('[Clear] LocalStorage (threads, messages, seen embeds, media counts, ACTIVE theme) cleared/reset. CUSTOM THEMES PRESERVED.');
 
             if (otkMediaDB) {
-                consoleLog('[Clear] Clearing IndexedDB mediaStore...');
+                consoleLog('[Clear] Clearing IndexedDB mediaStore (preserving filtered media)...');
+                const filterRules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
+                const parsedRules = filterRules.map(parseFilterRule);
+                const preservedHashes = new Set();
+                parsedRules.forEach(rule => {
+                    rule.md5.forEach(hash => preservedHashes.add(hash));
+                });
+                consoleLog(`[Clear] Preserving ${preservedHashes.size} media files from filter rules.`);
+
                 const mediaTransaction = otkMediaDB.transaction(['mediaStore'], 'readwrite');
                 const mediaStore = mediaTransaction.objectStore('mediaStore');
-                const mediaClearRequest = mediaStore.clear();
+                const cursorRequest = mediaStore.openCursor();
+
                 await new Promise((resolve, reject) => {
-                    mediaClearRequest.onsuccess = () => {
-                        consoleLog('[Clear] IndexedDB mediaStore cleared successfully.');
-                        resolve();
+                    cursorRequest.onsuccess = (event) => {
+                        const cursor = event.target.result;
+                        if (cursor) {
+                            if (!preservedHashes.has(cursor.value.filehash)) {
+                                cursor.delete();
+                            }
+                            cursor.continue();
+                        } else {
+                            resolve(); // Cursor finished
+                        }
                     };
-                    mediaClearRequest.onerror = (event) => {
-                        consoleError('[Clear] Error clearing IndexedDB mediaStore:', event.target.error);
+                    cursorRequest.onerror = (event) => {
+                        consoleError('[Clear] Error while clearing mediaStore with cursor:', event.target.error);
                         reject(event.target.error);
                     };
                 });
@@ -4026,7 +4362,7 @@ function _populateAttachmentDivWithMedia(
             }
 
             consoleLog('[Clear] Calling refreshThreadsAndMessages to repopulate data (viewer updates will be skipped by refresh function)...');
-            await refreshThreadsAndMessages({ skipViewerUpdate: true });
+            await refreshThreadsAndMessages({ skipViewerUpdate: true, isChildCall: true });
 
             // Explicitly re-render the viewer if it was open, using the fresh data.
             if (viewerWasOpen) {
@@ -4062,6 +4398,7 @@ function _populateAttachmentDivWithMedia(
             top: 86px;
             left: 0;
             width: 100vw;
+            height: calc(100vh - 86px);
             bottom: 0;
             /* background-color: #181818; */ /* New background color - replaced by variable below */
             opacity: 1; /* Ensure full opacity */
@@ -4114,20 +4451,59 @@ function _populateAttachmentDivWithMedia(
             consoleLog('Viewer shown. State saved to localStorage. Applying layout and rendering all messages.');
 
             // Apply correct layout class before rendering
-            const currentLayoutToggle = localStorage.getItem('otkMessageLayoutStyle') || 'default';
-            if (currentLayoutToggle === 'new_design') {
-                otkViewer.classList.add('otk-message-layout-newdesign');
-                otkViewer.classList.remove('otk-message-layout-default');
-            } else {
-                otkViewer.classList.add('otk-message-layout-default');
-                otkViewer.classList.remove('otk-message-layout-newdesign');
-            }
+            otkViewer.classList.add('otk-message-layout-default');
+            otkViewer.classList.remove('otk-message-layout-newdesign');
             // renderMessagesInViewer will calculate and set viewerActive counts and then call updateDisplayedStatistics
             renderMessagesInViewer({isToggleOpen: true}); // Pass flag
         }
     }
 
-    function updateDisplayedStatistics() {
+    function resetStatAnimations() {
+        // Stop all active animation timers
+        statAnimationTimers.forEach(timerId => clearInterval(timerId));
+        statAnimationTimers = []; // Clear the array
+
+        // Hide the (+n) elements
+        const newStatSpans = document.querySelectorAll('.new-stat');
+        newStatSpans.forEach(span => {
+            span.textContent = '';
+        });
+
+        consoleLog('All stat animations have been reset.');
+    }
+
+    function animateStat(element, startValue, targetValue) {
+        const diff = targetValue - startValue;
+        if (diff <= 0) {
+            if (targetValue > 0) {
+                element.textContent = `(+${targetValue})`;
+            } else {
+                element.textContent = '';
+            }
+            return;
+        }
+
+        if (tabHidden) {
+            element.textContent = `(+${targetValue})`;
+            return;
+        }
+
+        const duration = Math.min(10000, diff * 333); // Max 10 seconds, ~3 per second
+        const stepTime = duration / diff;
+
+        let current = startValue;
+        const timer = setInterval(() => {
+            current++;
+            element.textContent = `(+${current})`;
+            if (current >= targetValue) {
+                clearInterval(timer);
+                statAnimationTimers = statAnimationTimers.filter(t => t !== timer);
+            }
+        }, stepTime);
+        statAnimationTimers.push(timer);
+    }
+
+    function updateDisplayedStatistics(isBackgroundUpdate = false) {
         const threadsTrackedElem = document.getElementById('otk-threads-tracked-stat');
         const totalMessagesElem = document.getElementById('otk-total-messages-stat');
         const localImagesElem = document.getElementById('otk-local-images-stat');
@@ -4137,6 +4513,15 @@ function _populateAttachmentDivWithMedia(
             consoleWarn('One or more statistics elements not found in GUI.');
             return;
         }
+
+        const getOldStatValue = (id) => {
+            const elem = document.getElementById(`otk-stat-new-${id}`);
+            return elem ? parseInt(elem.textContent.replace(/[^\d]/g, '') || '0', 10) : 0;
+        };
+
+        const oldNewMessages = getOldStatValue('messages');
+        const oldNewImages = getOldStatValue('images');
+        const oldNewVideos = getOldStatValue('videos');
 
         let totalMessagesInStorage = 0;
         let totalImagesInStorage = 0;
@@ -4157,13 +4542,9 @@ function _populateAttachmentDivWithMedia(
             });
         }
 
-        const lastSeenMessages = parseInt(localStorage.getItem(LAST_SEEN_MESSAGES_KEY) || '0');
-        const lastSeenImages = parseInt(localStorage.getItem(LAST_SEEN_IMAGES_KEY) || '0');
-        const lastSeenVideos = parseInt(localStorage.getItem(LAST_SEEN_VIDEOS_KEY) || '0');
-
-        const newMessages = totalMessagesInStorage - lastSeenMessages;
-        const newImages = totalImagesInStorage - lastSeenImages;
-        const newVideos = totalVideosInStorage - lastSeenVideos;
+        const newMessages = parseInt(localStorage.getItem('otkNewMessagesCount') || '0');
+        const newImages = parseInt(localStorage.getItem('otkNewImagesCount') || '0');
+        const newVideos = parseInt(localStorage.getItem('otkNewVideosCount') || '0');
 
         const viewerIsOpen = otkViewer && otkViewer.style.display === 'block';
 
@@ -4173,43 +4554,57 @@ function _populateAttachmentDivWithMedia(
 
         const liveThreadsCount = activeThreads.length;
 
-        const createStatLine = (baseText, newCount) => {
-            const lineContainer = document.createElement('div');
-            lineContainer.style.display = 'flex';
-            lineContainer.style.justifyContent = 'flex-start';
-            lineContainer.style.width = '100%';
+        const updateStatLine = (container, baseText, newCount, startCount, id) => {
+            let lineContainer = document.getElementById(`otk-stat-${id}`);
+            if (!lineContainer) {
+                lineContainer = document.createElement('div');
+                lineContainer.id = `otk-stat-${id}`;
+                lineContainer.style.display = 'flex';
+                lineContainer.style.justifyContent = 'flex-start';
+                lineContainer.style.width = '100%';
 
-            const baseSpan = document.createElement('span');
-            baseSpan.textContent = baseText;
+                const baseSpan = document.createElement('span');
+                baseSpan.id = `otk-stat-base-${id}`;
+                lineContainer.appendChild(baseSpan);
 
-            const newCountSpan = document.createElement('span');
-            newCountSpan.className = 'new-stat';
-            newCountSpan.style.color = 'var(--otk-background-updates-stats-text-color)';
-            newCountSpan.style.marginLeft = '5px';
-
-            if (newCount > 0) {
-                newCountSpan.textContent = `(+${newCount} new)`;
-            } else {
-                newCountSpan.textContent = '';
+                const newCountSpan = document.createElement('span');
+                newCountSpan.id = `otk-stat-new-${id}`;
+                newCountSpan.className = 'new-stat';
+                newCountSpan.style.color = 'var(--otk-background-updates-stats-text-color)';
+                newCountSpan.style.marginLeft = '5px';
+                lineContainer.appendChild(newCountSpan);
+                container.appendChild(lineContainer);
             }
 
-            lineContainer.appendChild(baseSpan);
-            lineContainer.appendChild(newCountSpan);
-            return lineContainer;
+            const baseSpan = document.getElementById(`otk-stat-base-${id}`);
+            baseSpan.innerHTML = ''; // Clear previous content
+
+            const dashSpan = document.createElement('span');
+            dashSpan.textContent = '• ';
+            dashSpan.style.color = 'var(--otk-stats-dash-color)';
+
+            const textNode = document.createTextNode(baseText.substring(2)); // Get text after '• '
+
+            baseSpan.appendChild(dashSpan);
+            baseSpan.appendChild(textNode);
+
+            const newCountSpan = document.getElementById(`otk-stat-new-${id}`);
+            if (newCount > 0) {
+                if (isBackgroundUpdate) {
+                    animateStat(newCountSpan, startCount, newCount);
+                } else {
+                    newCountSpan.textContent = `(+${newCount})`;
+                }
+            } else {
+                newCountSpan.textContent = ''; // Explicitly clear if no new items
+            }
         };
 
         const paddingLength = 4;
-        threadsTrackedElem.innerHTML = '';
-        threadsTrackedElem.appendChild(createStatLine(`- ${padNumber(liveThreadsCount, paddingLength)} Live Thread${liveThreadsCount === 1 ? '' : 's'}`, 0));
-
-        totalMessagesElem.innerHTML = '';
-        totalMessagesElem.appendChild(createStatLine(`- ${padNumber(mainMessagesCount, paddingLength)} Total Message${mainMessagesCount === 1 ? '' : 's'}`, newMessages));
-
-        localImagesElem.innerHTML = '';
-        localImagesElem.appendChild(createStatLine(`- ${padNumber(mainImagesCount, paddingLength)} Image${mainImagesCount === 1 ? '' : 's'}`, newImages));
-
-        localVideosElem.innerHTML = '';
-        localVideosElem.appendChild(createStatLine(`- ${padNumber(mainVideosCount, paddingLength)} Video${mainVideosCount === 1 ? '' : 's'}`, newVideos));
+        updateStatLine(threadsTrackedElem, `- ${padNumber(liveThreadsCount, paddingLength)} Live Thread${liveThreadsCount === 1 ? '' : 's'}`, 0, 0, 'threads');
+        updateStatLine(totalMessagesElem, `- ${padNumber(mainMessagesCount, paddingLength)} Total Message${mainMessagesCount === 1 ? '' : 's'}`, newMessages, oldNewMessages, 'messages');
+        updateStatLine(localImagesElem, `- ${padNumber(mainImagesCount, paddingLength)} Image${mainImagesCount === 1 ? '' : 's'}`, newImages, oldNewImages, 'images');
+        updateStatLine(localVideosElem, `- ${padNumber(mainVideosCount, paddingLength)} Video${mainVideosCount === 1 ? '' : 's'}`, newVideos, oldNewVideos, 'videos');
     }
 
     function createTrackerButton(text, id = null) {
@@ -4218,7 +4613,7 @@ function _populateAttachmentDivWithMedia(
         button.textContent = text;
         button.classList.add('otk-tracker-button'); // Add a common class for potential shared base styles not from variables
         button.style.cssText = `
-            padding: 5px 10px;
+            padding: 12px 15px;
             cursor: pointer;
             background-color: var(--otk-button-bg-color);
             color: var(--otk-button-text-color);
@@ -4258,8 +4653,6 @@ function _populateAttachmentDivWithMedia(
                 // If mouse is still over, hover effect should apply.
                 // If mouseup happens outside, mouseout would have cleared hover.
                 // If mouseup happens inside, it should revert to hover state if still over.
-                // The mouseout listener already handles removing active and hover if mouse leaves.
-                // So, if still over, ensure hover is present.
                 if (button.matches(':hover')) { // Check if mouse is still over the button
                      button.classList.add('otk-button--hover');
                 }
@@ -4272,6 +4665,188 @@ function _populateAttachmentDivWithMedia(
     }
 
     // --- Button Implementations & Event Listeners ---
+    const clockElement = document.createElement('div');
+    clockElement.id = 'otk-clock';
+    clockElement.style.cssText = `
+        position: fixed;
+        top: 86px;
+        right: 10px;
+        background-color: var(--otk-clock-bg-color);
+        color: var(--otk-clock-text-color, var(--otk-gui-text-color));
+        padding: 5px;
+        border: 1px solid var(--otk-clock-border-color);
+        border-radius: 5px;
+        z-index: 100001;
+        display: none;
+        cursor: move;
+        display: flex; /* Use flexbox to align text and icon */
+        align-items: center; /* Center items vertically */
+    `;
+
+    document.body.appendChild(clockElement);
+
+    // Timezone Search Container
+    const timezoneSearchContainer = document.createElement('div');
+    timezoneSearchContainer.id = 'otk-timezone-search-container';
+    timezoneSearchContainer.style.cssText = `
+        position: fixed;
+        /* Position will be set dynamically based on clock position */
+        background-color: var(--otk-clock-search-bg-color, #333);
+        border: 1px solid #555;
+        border-radius: 4px;
+        z-index: 100002; /* Above clock */
+        display: none;
+        padding: 8px;
+        width: 250px;
+    `;
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.id = 'otk-timezone-search-input';
+    searchInput.placeholder = 'Search for a city/region...';
+    searchInput.style.cssText = 'width: 100%; box-sizing: border-box; margin-bottom: 5px;';
+    timezoneSearchContainer.appendChild(searchInput);
+
+    const searchResultsDiv = document.createElement('div');
+    searchResultsDiv.id = 'otk-timezone-search-results';
+    searchResultsDiv.style.cssText = 'max-height: 200px; overflow-y: auto;';
+    timezoneSearchContainer.appendChild(searchResultsDiv);
+
+    document.body.appendChild(timezoneSearchContainer);
+
+    // Make clock draggable
+    let isClockDragging = false;
+    let clockOffsetX, clockOffsetY;
+
+    // Load saved clock position
+    const CLOCK_POSITION_KEY = 'otkClockPosition';
+    try {
+        const savedClockPos = JSON.parse(localStorage.getItem(CLOCK_POSITION_KEY));
+        if (savedClockPos && savedClockPos.top && savedClockPos.left) {
+            clockElement.style.top = savedClockPos.top;
+            clockElement.style.left = savedClockPos.left;
+            clockElement.style.right = 'auto';
+        }
+    } catch (e) {
+        consoleError("Error parsing saved clock position from localStorage:", e);
+    }
+
+
+    clockElement.addEventListener('mousedown', (e) => {
+        isClockDragging = true;
+        clockOffsetX = e.clientX - clockElement.offsetLeft;
+        clockOffsetY = e.clientY - clockElement.offsetTop;
+        clockElement.style.userSelect = 'none';
+        document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (isClockDragging) {
+            let newLeft = e.clientX - clockOffsetX;
+            let newTop = e.clientY - clockOffsetY;
+
+            const buffer = 10;
+            const maxLeft = window.innerWidth - clockElement.offsetWidth - buffer;
+            const maxTop = window.innerHeight - clockElement.offsetHeight - buffer;
+
+            newLeft = Math.max(buffer, Math.min(newLeft, maxLeft));
+            newTop = Math.max(buffer, Math.min(newTop, maxTop));
+
+            clockElement.style.left = newLeft + 'px';
+            clockElement.style.top = newTop + 'px';
+            clockElement.style.right = 'auto';
+        }
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (isClockDragging) {
+            isClockDragging = false;
+            clockElement.style.userSelect = '';
+            document.body.style.userSelect = '';
+            // Save position to localStorage
+            localStorage.setItem(CLOCK_POSITION_KEY, JSON.stringify({top: clockElement.style.top, left: clockElement.style.left}));
+        }
+    });
+
+    // --- Draggable Countdown Timer ---
+    const countdownElement = document.createElement('div');
+    countdownElement.id = 'otk-countdown-timer-movable';
+    countdownElement.style.cssText = `
+        position: fixed;
+        top: 90px;
+        left: 50%;
+        transform: translateX(-50%);
+        background-color: var(--otk-countdown-bg-color, var(--otk-gui-bg-color));
+        padding: 5px;
+        border-radius: 5px;
+        z-index: 100001;
+        display: flex;
+        align-items: center;
+        cursor: move;
+        font-size: 14px;
+    `;
+    const countdownTimer = document.createElement('span');
+    countdownTimer.id = 'otk-countdown-timer';
+    countdownTimer.textContent = '00:00:00';
+    const countdownLabel = document.createElement('span');
+    countdownLabel.id = 'otk-countdown-label';
+    countdownLabel.textContent = 'Next Update:\u00A0';
+    countdownLabel.style.color = 'var(--otk-countdown-label-text-color)';
+    countdownTimer.style.color = 'var(--otk-countdown-timer-text-color)';
+    countdownElement.appendChild(countdownLabel);
+    countdownElement.appendChild(countdownTimer);
+    document.body.appendChild(countdownElement);
+
+    let isCountdownDragging = false;
+    let countdownOffsetX, countdownOffsetY;
+
+    const COUNTDOWN_POSITION_KEY = 'otkCountdownPosition';
+    try {
+        const savedCountdownPos = JSON.parse(localStorage.getItem(COUNTDOWN_POSITION_KEY));
+        if (savedCountdownPos && savedCountdownPos.top && savedCountdownPos.left) {
+            countdownElement.style.top = savedCountdownPos.top;
+            countdownElement.style.left = savedCountdownPos.left;
+            countdownElement.style.transform = 'none'; // Remove transform if we have a saved position
+        }
+    } catch (e) {
+        consoleError("Error parsing saved countdown position from localStorage:", e);
+    }
+
+    countdownElement.addEventListener('mousedown', (e) => {
+        isCountdownDragging = true;
+        countdownOffsetX = e.clientX - countdownElement.offsetLeft;
+        countdownOffsetY = e.clientY - countdownElement.offsetTop;
+        countdownElement.style.userSelect = 'none';
+        document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (isCountdownDragging) {
+            let newLeft = e.clientX - countdownOffsetX;
+            let newTop = e.clientY - countdownOffsetY;
+
+            countdownElement.style.left = newLeft + 'px';
+            countdownElement.style.top = newTop + 'px';
+            countdownElement.style.transform = 'none';
+        }
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (isCountdownDragging) {
+            isCountdownDragging = false;
+            countdownElement.style.userSelect = '';
+            document.body.style.userSelect = '';
+            localStorage.setItem(COUNTDOWN_POSITION_KEY, JSON.stringify({top: countdownElement.style.top, left: countdownElement.style.left}));
+        }
+    });
+
+    // Hide search if clicking outside
+    document.addEventListener('click', (e) => {
+        if (!clockElement.contains(e.target) && !timezoneSearchContainer.contains(e.target)) {
+            timezoneSearchContainer.style.display = 'none';
+        }
+    });
+
+
     const buttonContainer = document.getElementById('otk-button-container');
     if (buttonContainer) {
         const btnToggleViewer = createTrackerButton('Toggle Viewer', 'otk-toggle-viewer-btn');
@@ -4323,31 +4898,42 @@ function _populateAttachmentDivWithMedia(
             height: auto; /* Allow it to size based on content */
         `;
 
+        // Debug mode checkbox and label are removed from here.
+        // DEBUG_MODE is now only toggled via localStorage or by editing the script.
+
+        // Countdown timer is now a separate draggable element
+
         const btnClearRefresh = createTrackerButton('Restart Tracker', 'otk-restart-tracker-btn');
-        btnClearRefresh.style.alignSelf = 'center'; // Override parent's align-items:stretch to allow natural width & centering
-        btnClearRefresh.style.marginTop = '4px'; // Retain margin for spacing from checkbox if column is short
 
         const btnMemoryReport = createTrackerButton('Memory Report', 'otk-memory-report-btn');
         btnMemoryReport.style.display = localStorage.getItem('otkMemoryReportEnabled') === 'true' ? 'inline-block' : 'none';
         btnMemoryReport.addEventListener('click', generateMemoryUsageReport);
 
+        const btnFilter = createTrackerButton('Filter', 'otk-filter-btn');
+        btnFilter.addEventListener('click', () => {
+            const filterWindow = document.getElementById('otk-filter-window');
+            if (filterWindow) {
+                filterWindow.style.display = filterWindow.style.display === 'none' ? 'flex' : 'none';
+            }
+        });
+
 
         const thirdButtonColumn = document.createElement('div');
         thirdButtonColumn.style.cssText = `
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
+            display: flex;          /* It's a flex container for controlsWrapper */
+            flex-direction: column; /* Stack its children (controlsWrapper) */
+            justify-content: center;/* Center controlsWrapper vertically */
+            align-items: center;    /* Center controlsWrapper horizontally */
+            /* height: 100%; Removed, let it size by content */
+            /* min-width: 130px; Removed, let it size by content */
         `;
+        // controlsWrapper has align-self: center and width: fit-content, which is good.
+        // Ensure controlsWrapper takes appropriate width for its content (checkbox + label)
+        // and centers itself within the stretched column.
+        controlsWrapper.style.width = 'fit-content';
+        controlsWrapper.style.alignSelf = 'center';
 
-        const countdownTimer = document.createElement('div');
-        countdownTimer.id = 'otk-countdown-timer';
-        countdownTimer.style.cssText = `
-            font-size: 11px;
-            color: var(--otk-countdown-timer-text-color, #FFD700);
-            white-space: nowrap;
-        `;
-        thirdButtonColumn.appendChild(countdownTimer);
+        thirdButtonColumn.appendChild(controlsWrapper);
         // btnClearRefresh is handled below
         // buttonContainer.appendChild(thirdButtonColumn); // This is now part of topRowContainer
 
@@ -4357,6 +4943,7 @@ function _populateAttachmentDivWithMedia(
         bottomRowContainer.appendChild(btnToggleViewer);
         bottomRowContainer.appendChild(btnRefresh);
         bottomRowContainer.appendChild(btnClearRefresh);
+        bottomRowContainer.appendChild(btnFilter);
         bottomRowContainer.appendChild(btnMemoryReport);
 
         // Append row containers to the main buttonContainer
@@ -4382,13 +4969,29 @@ function _populateAttachmentDivWithMedia(
             }
         });
 
-
     } else {
         consoleError('Button container not found. GUI buttons cannot be added.');
     }
 
     // --- Background Refresh Control ---
     let scrollTimeout = null;
+    let countdownIntervalId = null;
+
+    function updateCountdown() {
+        const nextUpdateTimestamp = parseInt(localStorage.getItem('otkNextUpdateTimestamp') || '0', 10);
+        const countdownTimer = document.getElementById('otk-countdown-timer');
+        if (!countdownTimer) {
+            return;
+        }
+
+        const now = Date.now();
+        const timeLeft = Math.max(0, nextUpdateTimestamp - now);
+        const hours = Math.floor(timeLeft / (1000 * 60 * 60));
+        const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
+        const seconds = Math.floor((timeLeft % (1000 * 60)) / 1000);
+
+        countdownTimer.textContent = `${padNumber(hours, 2)}:${padNumber(minutes, 2)}:${padNumber(seconds, 2)}`;
+    }
 
     function startBackgroundRefresh(immediate = false) {
         if (localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) === 'true') {
@@ -4405,11 +5008,6 @@ function _populateAttachmentDivWithMedia(
 
             const nextUpdateTimestamp = Date.now() + refreshIntervalMs;
             localStorage.setItem('otkNextUpdateTimestamp', nextUpdateTimestamp);
-
-            const lastUpdateTimestamp = parseInt(localStorage.getItem('otkNextUpdateTimestamp') || '0', 10);
-            if (Date.now() > lastUpdateTimestamp) {
-                refreshIntervalMs = 0;
-            }
 
 
             backgroundRefreshIntervalId = setTimeout(() => {
@@ -4429,7 +5027,11 @@ function _populateAttachmentDivWithMedia(
             } else {
                 consoleLog(`Background refresh scheduled in ${minUpdateMinutes}-${maxUpdateMinutes} minutes. Next update at ~${new Date(Date.now() + refreshIntervalMs).toLocaleTimeString()}`);
             }
-        updateCountdownTimer();
+
+            if (countdownIntervalId) {
+                clearInterval(countdownIntervalId);
+            }
+            countdownIntervalId = setInterval(updateCountdown, 1000);
         }
     }
 
@@ -4441,44 +5043,128 @@ function _populateAttachmentDivWithMedia(
         } else {
             consoleLog('Background refresh was not running.');
         }
-    const countdownTimer = document.getElementById('otk-countdown-timer');
-    if (countdownTimer) {
-        countdownTimer.textContent = '';
-    }
-    if (countdownIntervalId) {
-        clearInterval(countdownIntervalId);
-        countdownIntervalId = null;
-    }
-}
-
-let countdownIntervalId = null;
-
-function updateCountdownTimer() {
-    const countdownTimer = document.getElementById('otk-countdown-timer');
-    if (!countdownTimer || localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) === 'true') {
-        if(countdownTimer) countdownTimer.textContent = '';
-        if(countdownIntervalId) clearInterval(countdownIntervalId);
-        return;
     }
 
-    if (countdownIntervalId) {
-        clearInterval(countdownIntervalId);
+    let activeClockSearchId = null;
+
+    function renderClocks() {
+        const clockContainer = document.getElementById('otk-clock');
+        if (!clockContainer) return;
+
+        clockContainer.innerHTML = ''; // Clear existing clocks
+        const clocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+
+        clocks.forEach((clock, index) => {
+            const clockInstance = document.createElement('div');
+            clockInstance.className = 'otk-clock-instance';
+            clockInstance.dataset.clockId = clock.id;
+            clockInstance.style.display = 'flex';
+            clockInstance.style.alignItems = 'center';
+            clockInstance.style.padding = '0 5px';
+            clockInstance.style.position = 'relative';
+
+            const clockTextSpan = document.createElement('span');
+            clockTextSpan.id = `otk-clock-text-${clock.id}`;
+            clockInstance.appendChild(clockTextSpan);
+
+            const iconsWrapper = document.createElement('span');
+            iconsWrapper.className = 'otk-clock-icons-wrapper';
+            iconsWrapper.style.marginLeft = '8px';
+            iconsWrapper.style.display = 'flex';
+            iconsWrapper.style.alignItems = 'center';
+
+
+            const searchIcon = document.createElement('span');
+            searchIcon.className = 'otk-clock-icon otk-clock-search-icon';
+            searchIcon.innerHTML = '&#128269;'; // Search icon
+            searchIcon.style.cssText = 'cursor: default; display: none;';
+            searchIcon.addEventListener('click', (e) => {
+                e.stopPropagation();
+                activeClockSearchId = clock.id;
+                const timezoneSearchContainer = document.getElementById('otk-timezone-search-container');
+                if (timezoneSearchContainer.style.display === 'block' && activeClockSearchId === clock.id) {
+                    timezoneSearchContainer.style.display = 'none';
+                } else {
+                    const clockRect = clockContainer.getBoundingClientRect();
+                    timezoneSearchContainer.style.top = `${clockRect.bottom + 5}px`;
+                    timezoneSearchContainer.style.left = `${clockRect.left}px`;
+                    timezoneSearchContainer.style.display = 'block';
+                }
+            });
+            iconsWrapper.appendChild(searchIcon);
+
+            const addIcon = document.createElement('span');
+            addIcon.className = 'otk-clock-icon otk-clock-add-icon';
+            addIcon.innerHTML = '&#10133;'; // Plus icon
+            addIcon.style.cssText = 'margin-left: 5px; cursor: default; display: none;';
+            addIcon.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const currentClocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+                const newClock = {
+                    id: Date.now(),
+                    timezone: 'America/New_York',
+                    displayPlace: 'New York'
+                };
+                currentClocks.splice(index + 1, 0, newClock);
+                localStorage.setItem('otkClocks', JSON.stringify(currentClocks));
+                renderClocks();
+            });
+            iconsWrapper.appendChild(addIcon);
+
+            if (index > 0) {
+                const removeIcon = document.createElement('span');
+                removeIcon.className = 'otk-clock-icon otk-clock-remove-icon';
+                removeIcon.innerHTML = '&#10060;'; // Cross icon
+                removeIcon.style.cssText = 'margin-left: 5px; cursor: default; display: none;';
+                removeIcon.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    let currentClocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+                    currentClocks = currentClocks.filter(c => c.id !== clock.id);
+                    localStorage.setItem('otkClocks', JSON.stringify(currentClocks));
+                    renderClocks();
+                });
+                iconsWrapper.appendChild(removeIcon);
+            }
+
+            clockInstance.appendChild(iconsWrapper);
+
+            clockInstance.addEventListener('mouseenter', () => {
+                clockInstance.querySelectorAll('.otk-clock-icon').forEach(icon => icon.style.display = 'inline-block');
+            });
+            clockInstance.addEventListener('mouseleave', () => {
+                clockInstance.querySelectorAll('.otk-clock-icon').forEach(icon => icon.style.display = 'none');
+            });
+
+            clockContainer.appendChild(clockInstance);
+
+            if (index < clocks.length - 1) {
+                const divider = document.createElement('span');
+                divider.textContent = '|';
+                divider.style.color = 'var(--otk-clock-divider-color, #ff8040)';
+                divider.style.padding = '0 5px';
+                clockContainer.appendChild(divider);
+            }
+        });
+        updateClockTimes();
     }
 
-    countdownIntervalId = setInterval(() => {
-        const nextUpdateTimestamp = parseInt(localStorage.getItem('otkNextUpdateTimestamp') || '0', 10);
-        const now = Date.now();
-        const remaining = Math.max(0, nextUpdateTimestamp - now);
-
-        if (remaining === 0) {
-            countdownTimer.textContent = 'Refreshing...';
-            return;
-        }
-
-        const minutes = Math.floor(remaining / 60000);
-        const seconds = Math.floor((remaining % 60000) / 1000);
-        countdownTimer.textContent = `Next update in: ${minutes}:${seconds.toString().padStart(2, '0')}`;
-    }, 1000);
+    function updateClockTimes() {
+        const clocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+        clocks.forEach(clock => {
+            const clockTextElement = document.getElementById(`otk-clock-text-${clock.id}`);
+            if (clockTextElement) {
+                const timeZoneName = clock.displayPlace || clock.timezone.split('/').pop().replace(/_/g, ' ');
+                const now = new Date();
+                const timeString = now.toLocaleTimeString('en-US', {
+                    timeZone: clock.timezone,
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                });
+                clockTextElement.textContent = `${timeString} ${timeZoneName}`;
+            }
+        });
     }
 
 function startAutoEmbedReloader() {
@@ -4500,149 +5186,94 @@ function startAutoEmbedReloader() {
     }, 5000); // Check every 5 seconds
 }
 
-function forceRenderAllTweets() {
-    if (!otkViewer || otkViewer.style.display === 'none') {
-        return;
-    }
-    const tweetEmbeds = otkViewer.querySelectorAll('.otk-tweet-embed-wrapper');
-    tweetEmbeds.forEach(embed => {
-        const iframe = embed.querySelector('iframe.twitter-tweet');
-        if (!iframe) {
-            consoleLog(`[ForceRender] Found tweet embed without iframe (${embed.dataset.tweetId}). Forcing re-render.`);
-            processTweetEmbed(embed);
-        }
-    });
-}
-
-function startTweetEmbedBackupSystem() {
-    setInterval(() => {
-        if (!otkViewer || otkViewer.style.display === 'none') {
-            return;
-        }
-
-        const tweetEmbeds = otkViewer.querySelectorAll('.otk-tweet-embed-wrapper');
-        tweetEmbeds.forEach(embed => {
-            if (embed.classList.contains('twttr-rendered')) {
-                return; // Already rendered, do nothing.
-            }
-
-            const lastAttempt = parseInt(embed.dataset.lastRenderAttempt, 10);
-            const now = Date.now();
-            if (lastAttempt && (now - lastAttempt < 10000)) { // 10 second cooldown
-                return; // Still cooling down.
-            }
-
-            const blockquote = embed.querySelector('blockquote.twitter-tweet');
-            const iframe = embed.querySelector('iframe.twitter-tweet');
-
-            if (!iframe && !blockquote) {
-                consoleLog(`[TweetBackup] Found empty tweet embed (${embed.dataset.tweetId}). Retrying render.`);
-                embed.dataset.lastRenderAttempt = now;
-                processTweetEmbed(embed);
-            } else if (blockquote && !iframe) {
-                consoleLog(`[TweetBackup] Found failed tweet embed (${embed.dataset.tweetId}). Retrying render.`);
-                embed.dataset.lastRenderAttempt = now;
-                if (window.twttr && window.twttr.widgets) {
-                    window.twttr.widgets.load(embed);
-                }
-            }
-        });
-    }, 3000); // Check every 3 seconds
-}
 
 
-function processTweetEmbed(embedContainer) {
-    const tweetId = embedContainer.dataset.tweetId;
-    if (!tweetId) {
-        return;
-    }
 
-    const embedMode = localStorage.getItem('otk-tweet-embed-mode') || 'default';
-
-    const renderAndLoadTweet = (html) => {
-        embedContainer.innerHTML = html;
-        const script = document.createElement("script");
-        script.src = "https://platform.twitter.com/widgets.js";
-        script.async = true;
-        embedContainer.appendChild(script);
-    };
-
-    const embedUrl = `https://publish.x.com/oembed?url=https://twitter.com/any/status/${tweetId}&theme=${embedMode}&omit_script=true`;
-    const maxRetries = 3;
-    let attempt = 0;
-
-    function fetchTweet() {
-        GM_xmlhttpRequest({
-            method: "GET",
-            url: embedUrl,
-            onload: function(response) {
-                try {
-                    if (response.status === 404) {
-                        embedContainer.textContent = "[Tweet not found]";
-                        return;
-                    }
-                    const data = JSON.parse(response.responseText);
-                    if (data.html) {
-                        renderAndLoadTweet(data.html);
-                    } else {
-                        embedContainer.textContent = "[Tweet not found]";
-                    }
-                } catch (e) {
-                    if (attempt < maxRetries) {
-                        attempt++;
-                        const delay = Math.pow(2, attempt) * 1000;
-                        consoleWarn(`Failed to parse tweet JSON, retrying in ${delay}ms...`);
-                        setTimeout(fetchTweet, delay);
-                    } else {
-                        consoleError("Error parsing tweet embed JSON after max retries", e);
-                        embedContainer.textContent = "[Tweet parse error]";
-                    }
-                }
-            },
-            onerror: function(err) {
-                if (attempt < maxRetries) {
-                    attempt++;
-                    const delay = Math.pow(2, attempt) * 1000;
-                    consoleWarn(`Failed to fetch tweet, retrying in ${delay}ms...`);
-                    setTimeout(fetchTweet, delay);
-                } else {
-                    consoleError("Error loading tweet embed after max retries:", err);
-                    embedContainer.textContent = "[Tweet fetch error]";
-                }
-            }
-        });
-    }
-
-    fetchTweet();
-}
 
 // --- IIFE Scope Helper for Intersection Observer ---
 function handleIntersection(entries, observerInstance) {
     entries.forEach(entry => {
         const wrapper = entry.target;
-        const iframe = wrapper.querySelector('iframe');
+        let iframe = wrapper.querySelector('iframe');
 
         if (entry.isIntersecting) {
             // Element is now visible
-            wrapper.style.display = ''; // Restore display
-            if (wrapper.classList.contains('otk-tweet-embed-wrapper') && !iframe) {
-                processTweetEmbed(wrapper);
-            } else if (iframe && iframe.dataset.src && (!iframe.src || iframe.src === 'about:blank') && !wrapper.classList.contains('otk-tweet-embed-wrapper')) {
-                console.log('[LazyLoad] Iframe is intersecting, loading src:', iframe.dataset.src);
+            if (!iframe) {
+                // If the iframe was removed, recreate it
+                const newIframe = document.createElement('iframe');
+                // Copy attributes from a template or stored config if necessary
+                // For now, assuming basic recreation is enough
+                newIframe.style.position = 'absolute';
+                newIframe.style.top = '0';
+                newIframe.style.left = '0';
+                newIframe.style.width = '100%';
+                newIframe.style.height = '100%';
+                newIframe.setAttribute('frameborder', '0');
+                newIframe.setAttribute('allowfullscreen', 'true');
+                if (wrapper.classList.contains('otk-twitch-embed-wrapper')) {
+                    newIframe.setAttribute('scrolling', 'no');
+                } else if (wrapper.classList.contains('otk-youtube-embed-wrapper')) {
+                    newIframe.setAttribute('allow', 'accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
+                }
+                newIframe.dataset.src = wrapper.dataset.embedUrl;
+                wrapper.innerHTML = '';
+    if (window.twttr?.widgets?.load) {
+        twttr.widgets.load(wrapper);
+    } // Clear placeholder
+                wrapper.appendChild(newIframe);
+                iframe = newIframe;
+            }
+
+            if (iframe && iframe.dataset.src && (!iframe.src || iframe.src === 'about:blank')) {
+                consoleLog('[LazyLoad] Iframe is intersecting, loading src:', iframe.dataset.src);
                 iframe.src = iframe.dataset.src;
             }
+            observerInstance.unobserve(wrapper);
         } else {
             // Element is no longer visible
-            if (iframe && iframe.src && iframe.src !== 'about:blank' && !wrapper.classList.contains('otk-tweet-embed-wrapper')) {
-                console.log('[LazyLoad] Iframe is no longer intersecting, unloading src:', iframe.src);
+            if (wrapper.classList.contains('otk-tweet-embed-wrapper')) {
+                return; // Do not unload tweet embeds
+            }
+
+            if (iframe && iframe.src && iframe.src !== 'about:blank') {
+                consoleLog('[LazyLoad] Iframe is no longer intersecting, removing iframe for:', iframe.src);
+
+                // For YouTube, try to pause the video before removing
                 if (iframe.contentWindow && iframe.src.includes("youtube.com/embed")) {
                     try {
                         iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', 'https://www.youtube.com');
                     } catch (e) {
                         consoleWarn('[LazyLoad] Error attempting to postMessage pause to YouTube:', e);
                     }
+                } else if (iframe.contentWindow && iframe.src.includes("twitch.tv")) {
+                    try {
+                        iframe.contentWindow.postMessage({"event": "video.pause"}, "*");
+                    } catch (e) {
+                        consoleWarn('[LazyLoad] Error attempting to postMessage pause to Twitch:', e);
+                    }
                 }
-                iframe.src = 'about:blank';
+
+                // Store the embed URL on the wrapper if it's not already there
+                if (!wrapper.dataset.embedUrl) {
+                    wrapper.dataset.embedUrl = iframe.dataset.src;
+                }
+
+                // Remove the iframe and add a placeholder
+                iframe.remove();
+                const placeholder = document.createElement('div');
+                placeholder.textContent = 'Embed hidden. Scroll to load.';
+                placeholder.style.cssText = `
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    width: 100%;
+                    height: 100%;
+                    background-color: #181818;
+                    color: white;
+                    font-size: 14px;
+                `;
+                wrapper.appendChild(placeholder);
+                observerInstance.observe(wrapper);
             }
         }
     });
@@ -4666,11 +5297,21 @@ function hideApplyDiscardButtons() {
     if (discardBtn) discardBtn.style.display = 'none';
 }
 
-function forceViewerRerenderAfterThemeChange() {
+async function forceViewerRerenderAfterThemeChange() {
     if (otkViewer && otkViewer.style.display === 'block') {
+        consoleLog("Forcing viewer re-render after theme/setting change.");
+
+        // Reload messages from DB to ensure we have the full set before applying limits
+        messagesByThreadId = await loadMessagesFromDB();
+
+        // No need to manually trim here, as renderMessagesInViewer will do it.
+        // The key is that we've refreshed messagesByThreadId from the source of truth.
+
+        // Clear viewer state
         renderedMessageIdsInViewer.clear();
         otkViewer.innerHTML = ''; // Clear the viewer content
 
+        // Apply layout class
         const currentLayoutToggle = localStorage.getItem('otkMessageLayoutStyle') || 'default';
         if (currentLayoutToggle === 'new_design') {
             otkViewer.classList.add('otk-message-layout-newdesign');
@@ -4680,8 +5321,9 @@ function forceViewerRerenderAfterThemeChange() {
             otkViewer.classList.remove('otk-message-layout-newdesign');
         }
 
-        renderMessagesInViewer({ isToggleOpen: true }); // Re-render all messages
-        consoleLog("Viewer force re-rendered after theme change.");
+        // Re-render, which will now use the freshly loaded and correctly trimmed messages
+        renderMessagesInViewer({ isToggleOpen: true });
+        consoleLog("Viewer force re-rendered with fresh data.");
     }
 }
 
@@ -4703,668 +5345,1306 @@ function saveThemeSetting(key, value, requiresRerender = false) {
         }
         localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(settings));
         consoleLog("Saved theme setting:", key, value);
+        if (key.startsWith('otkMsgDepth')) {
+            forceViewerRerenderAfterThemeChange();
+        }
     }
 }
 
 async function applyMainTheme() {
-    const mainThemeJSON = await GM.getValue(MAIN_THEME_KEY, null);
-
-    if (typeof mainThemeJSON === 'string') {
-        consoleLog("Applying main theme from GM storage.");
-        try {
-            const mainThemeSettings = JSON.parse(mainThemeJSON);
-
-            // Apply all settings from the main theme
-            for (const key in mainThemeSettings) {
-                if (mainThemeSettings.hasOwnProperty(key)) {
-                    localStorage.setItem(key, mainThemeSettings[key]);
-                }
-            }
-
-            // Persist the loaded theme as the active theme
-            localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(mainThemeSettings));
-            consoleLog("Main theme settings have been applied as the active theme.");
-
-        } catch (e) {
-            consoleError("Error parsing or applying main theme from GM storage:", e);
-        }
-    } else {
-        consoleWarn("No main theme found in GM storage or it's not a string.");
-    }
-}
-
-function applyThemeSettings(previewSettings = null) {
-    let settings = previewSettings;
-    if (!settings) {
-        try {
-            settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-        } catch (e) {
-            consoleError("Error parsing theme settings from localStorage:", e);
-            settings = {};
-        }
-    }
-    consoleLog("Applying theme settings:", settings);
-
-    // Helper to update a color input pair (hex text and color swatch)
-    const updateColorInputs = (idSuffix, colorValue) => {
-        const hexInput = document.getElementById(`otk-${idSuffix}-hex`);
-        const pickerInput = document.getElementById(`otk-${idSuffix}`); // Correct ID for color swatch
-        if (hexInput) hexInput.value = colorValue;
-        if (pickerInput) pickerInput.value = colorValue;
-    };
-
-    if (settings.guiBgColor) {
-        document.documentElement.style.setProperty('--otk-gui-bg-color', settings.guiBgColor);
-        updateColorInputs('gui-bg', settings.guiBgColor);
-    }
-
-    if (settings.titleTextColor) {
-        document.documentElement.style.setProperty('--otk-title-text-color', settings.titleTextColor);
-        updateColorInputs('title-text', settings.titleTextColor);
-    }
-
-    if (settings.optionsTextColor) {
-        document.documentElement.style.setProperty('--otk-options-text-color', settings.optionsTextColor);
-        updateColorInputs('options-text', settings.optionsTextColor);
-    }
-
-    if (settings.actualStatsTextColor) {
-        document.documentElement.style.setProperty('--otk-stats-text-color', settings.actualStatsTextColor);
-        updateColorInputs('actual-stats-text', settings.actualStatsTextColor);
-    }
-
-    if (settings.viewerBgColor) {
-        document.documentElement.style.setProperty('--otk-viewer-bg-color', settings.viewerBgColor);
-        updateColorInputs('viewer-bg', settings.viewerBgColor);
-    }
-
-    if (settings.guiThreadListTitleColor) {
-        document.documentElement.style.setProperty('--otk-gui-threadlist-title-color', settings.guiThreadListTitleColor);
-        updateColorInputs('threadlist-title', settings.guiThreadListTitleColor);
-    }
-
-    if (settings.guiThreadListTimeColor) {
-        document.documentElement.style.setProperty('--otk-gui-threadlist-time-color', settings.guiThreadListTimeColor);
-        updateColorInputs('threadlist-time', settings.guiThreadListTimeColor);
-    }
-
-    // Viewer Header Border Color
-    if (settings.viewerHeaderBorderColor) {
-        document.documentElement.style.setProperty('--otk-viewer-header-border-color', settings.viewerHeaderBorderColor);
-        updateColorInputs('viewer-header-border', settings.viewerHeaderBorderColor);
-    }
-
-    // Viewer Quote L1 Border Color
-    if (settings.viewerQuote1HeaderBorderColor) {
-        document.documentElement.style.setProperty('--otk-viewer-quote1-header-border-color', settings.viewerQuote1HeaderBorderColor);
-        updateColorInputs('viewer-quote1-border', settings.viewerQuote1HeaderBorderColor);
-    }
-
-    // Viewer Quote L2+ Border Color
-    if (settings.viewerQuote2plusHeaderBorderColor) {
-        document.documentElement.style.setProperty('--otk-viewer-quote2plus-header-border-color', settings.viewerQuote2plusHeaderBorderColor);
-        updateColorInputs('viewer-quote2plus-border', settings.viewerQuote2plusHeaderBorderColor);
-    }
-
-    // Message Background Colors, Message Body Text Colors, Message Header Text Colors
-    ['Bg', 'Text', 'HeaderTextColor'].forEach(type => {
-        ['0', '1', '2plus'].forEach(depth => {
-            const keyBase = `msgDepth${depth}${type === 'HeaderTextColor' ? 'HeaderTextColor' : type}`; // e.g. msgDepth0BgColor, msgDepth0TextColor, msgDepth0HeaderTextColor
-            const cssVarBase = `--otk-msg-depth${depth}-${type === 'Bg' ? 'bg' : (type === 'Text' ? 'text' : 'header-text')}-color`; // e.g. --otk-msg-depth0-bg-color
-            const idSuffixBase = `msg-depth${depth}-${type === 'Bg' ? 'bg' : (type === 'Text' ? 'text' : 'header-text')}`; // e.g. msg-depth0-bg
-
-            // Correcting key and idSuffix for "HeaderTextColor" to match createThemeOptionRow structure
-            let correctedKey = keyBase;
-            let correctedIdSuffix = idSuffixBase;
-            if (type === 'HeaderTextColor') {
-                 correctedKey = `msgDepth${depth}HeaderTextColor`; // This was already correct
-                 correctedIdSuffix = `msg-depth${depth}-header-text`; // This was already correct
-            } else {
-                correctedKey = `msgDepth${depth}${type}Color`; // e.g. msgDepth0BgColor
-                correctedIdSuffix = `msg-depth${depth}-${type.toLowerCase()}`; // e.g. msg-depth0-bg
-            }
-
-
-            if (settings[correctedKey]) {
-                document.documentElement.style.setProperty(cssVarBase, settings[correctedKey]);
-                updateColorInputs(correctedIdSuffix, settings[correctedKey]);
-            }
-        });
-    });
-
-
-    // New Depth-Specific Content Font Sizes
-    ['Depth 0', 'Depth 1', 'Depth 2+'].forEach((label, index) => {
-        const depthKeyPart = index === 2 ? '2plus' : index.toString();
-        const storageKey = `msgDepth${depthKeyPart}ContentFontSize`;
-        const cssVar = `--otk-msg-depth${depthKeyPart}-content-font-size`;
-        const inputId = `otk-msg-depth${depthKeyPart}-content-fontsize`;
-
-        if (settings[storageKey]) {
-            document.documentElement.style.setProperty(cssVar, settings[storageKey]);
-            const inputElement = document.getElementById(inputId);
-            if (inputElement) {
-                inputElement.value = settings[storageKey].replace('px', '');
-            }
-        }
-    });
-
-    // Message Layout Dropdown
-    if (settings.otkMessageLayoutStyle) {
-        const layoutDropdown = document.getElementById('otk-message-layout-dropdown');
-        if (layoutDropdown) {
-            layoutDropdown.value = settings.otkMessageLayoutStyle;
-        }
-        if (otkViewer) {
-            if (settings.otkMessageLayoutStyle === 'new_design') {
-                otkViewer.classList.add('otk-message-layout-newdesign');
-                otkViewer.classList.remove('otk-message-layout-default');
-            } else {
-                otkViewer.classList.add('otk-message-layout-default');
-                otkViewer.classList.remove('otk-message-layout-newdesign');
-            }
-        }
-    }
-
-    if (settings.guiBottomBorderColor) {
-        document.documentElement.style.setProperty('--otk-gui-bottom-border-color', settings.guiBottomBorderColor);
-        updateColorInputs('gui-bottom-border', settings.guiBottomBorderColor);
-    }
-
-    // Cog Icon Color
-    if (settings.cogIconColor) {
-        document.documentElement.style.setProperty('--otk-cog-icon-color', settings.cogIconColor);
-        updateColorInputs('cog-icon', settings.cogIconColor);
-    }
-
-    // Disable Background Font Color
-    if (settings.disableBgFontColor) {
-        document.documentElement.style.setProperty('--otk-disable-bg-font-color', settings.disableBgFontColor);
-        updateColorInputs('disable-bg-font', settings.disableBgFontColor);
-    }
-
-    // New Messages Divider Color
-    if (settings.newMessagesDividerColor) {
-        document.documentElement.style.setProperty('--otk-new-messages-divider-color', settings.newMessagesDividerColor);
-        updateColorInputs('new-msg-divider', settings.newMessagesDividerColor);
-    }
-
-    // New Messages Font Color
-    if (settings.newMessagesFontColor) {
-        document.documentElement.style.setProperty('--otk-new-messages-font-color', settings.newMessagesFontColor);
-        updateColorInputs('new-msg-font', settings.newMessagesFontColor);
-    }
-
-    // Anchor Highlight Colors
-    if (settings.anchorHighlightBgColor) {
-        document.documentElement.style.setProperty('--otk-anchor-highlight-bg-color', settings.anchorHighlightBgColor);
-        updateColorInputs('anchor-bg', settings.anchorHighlightBgColor);
-    }
-    if (settings.anchorHighlightBorderColor) {
-        document.documentElement.style.setProperty('--otk-anchor-highlight-border-color', settings.anchorHighlightBorderColor);
-        updateColorInputs('anchor-border', settings.anchorHighlightBorderColor);
-    }
-
-    // GUI Button Colors
-    const buttonColorConfigs = [
-        { key: 'guiButtonBgColor', cssVar: '--otk-button-bg-color', idSuffix: 'gui-button-bg' },
-        { key: 'guiButtonTextColor', cssVar: '--otk-button-text-color', idSuffix: 'gui-button-text' },
-        { key: 'guiButtonBorderColor', cssVar: '--otk-button-border-color', idSuffix: 'gui-button-border' },
-        { key: 'guiButtonHoverBgColor', cssVar: '--otk-button-hover-bg-color', idSuffix: 'gui-button-hover-bg' },
-        { key: 'guiButtonActiveBgColor', cssVar: '--otk-button-active-bg-color', idSuffix: 'gui-button-active-bg' }
-    ];
-    buttonColorConfigs.forEach(config => {
-        if (settings[config.key]) {
-            document.documentElement.style.setProperty(config.cssVar, settings[config.key]);
-            updateColorInputs(config.idSuffix, settings[config.key]);
-        }
-    });
-
-    // Loading Screen Colors
-    if (settings.loadingOverlayBaseHexColor) {
-        document.documentElement.style.setProperty('--otk-loading-overlay-base-hex-color', settings.loadingOverlayBaseHexColor);
-        updateColorInputs('loading-overlay-base-hex', settings.loadingOverlayBaseHexColor);
-    }
-    if (settings.loadingOverlayOpacity) {
-        document.documentElement.style.setProperty('--otk-loading-overlay-opacity', settings.loadingOverlayOpacity);
-        const inputEl = document.getElementById('otk-loading-overlay-opacity');
-        if (inputEl) inputEl.value = settings.loadingOverlayOpacity;
-    }
-    if (settings.loadingTextColor) {
-        document.documentElement.style.setProperty('--otk-loading-text-color', settings.loadingTextColor);
-        updateColorInputs('loading-text', settings.loadingTextColor);
-    }
-    if (settings.loadingProgressBarBgColor) {
-        document.documentElement.style.setProperty('--otk-loading-progress-bar-bg-color', settings.loadingProgressBarBgColor);
-        updateColorInputs('loading-progress-bg', settings.loadingProgressBarBgColor);
-    }
-    if (settings.loadingProgressBarFillColor) {
-        document.documentElement.style.setProperty('--otk-loading-progress-bar-fill-color', settings.loadingProgressBarFillColor);
-        updateColorInputs('loading-progress-fill', settings.loadingProgressBarFillColor);
-    }
-    if (settings.loadingProgressBarTextColor) {
-        document.documentElement.style.setProperty('--otk-loading-progress-bar-text-color', settings.loadingProgressBarTextColor);
-        updateColorInputs('loading-progress-text', settings.loadingProgressBarTextColor);
-    }
-
-    // Update checkboxes for new boolean settings
-    const newBooleanSettings = [
-        { key: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth0-disable-header-underline' },
-        { key: 'otkMsgDepth0DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth0-display-media-filename' },
-        { key: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth1-disable-header-underline' },
-        { key: 'otkMsgDepth1DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth1-display-media-filename' },
-        { key: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth2plus-disable-header-underline' },
-        { key: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth2plus-display-media-filename' }
-    ];
-
-    newBooleanSettings.forEach(opt => {
-        const checkbox = document.getElementById(`otk-${opt.idSuffix}-checkbox`);
-        if (checkbox) {
-            if (settings.hasOwnProperty(opt.key)) {
-                checkbox.checked = settings[opt.key];
-            } else {
-                checkbox.checked = opt.defaultValue;
-            }
-        }
-    });
-
-    // Directly update loading screen styles
-    const loadingOverlayElement = document.getElementById('otk-loading-overlay');
-    if (loadingOverlayElement) {
-        const baseHex = settings.loadingOverlayBaseHexColor || getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-overlay-base-hex-color').trim() || '#000000';
-        const rgbParts = hexToRgbParts(baseHex);
-        const opacity = settings.loadingOverlayOpacity || getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-overlay-opacity').trim() || '0.8';
-        loadingOverlayElement.style.backgroundColor = `rgba(${rgbParts}, ${opacity})`;
-        loadingOverlayElement.style.color = `var(--otk-loading-text-color, ${getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-text-color').trim() || '#ffffff'})`;
-        const progressBarContainer = document.getElementById('otk-progress-bar-container');
-        if (progressBarContainer) {
-            progressBarContainer.style.backgroundColor = `var(--otk-loading-progress-bar-bg-color, ${getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-progress-bar-bg-color').trim() || '#333333'})`;
-        }
-        const progressBar = document.getElementById('otk-progress-bar');
-        if (progressBar) {
-            progressBar.style.backgroundColor = `var(--otk-loading-progress-bar-fill-color, ${getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-progress-bar-fill-color').trim() || '#4CAF50'})`;
-            progressBar.style.color = `var(--otk-loading-progress-bar-text-color, ${getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-progress-bar-text-color').trim() || '#ffffff'})`;
-        }
-    }
-
-    forceViewerRerenderAfterThemeChange();
-}
-
-
-function setupOptionsWindow() {
-    consoleLog("Setting up Options Window...");
-
-    // Check if window already exists
-    if (document.getElementById('otk-options-window')) {
-        consoleLog("Options window already exists.");
+    // If theme settings already exist in localStorage, don't overwrite them with the main theme on page load.
+    // This preserves user's session changes. Main theme is for initial load or after a reset.
+    if (localStorage.getItem(THEME_SETTINGS_KEY)) {
+        consoleLog('[Theme] Active theme settings found in localStorage. Skipping main theme load.');
         return;
     }
 
-    const optionsWindow = document.createElement('div');
-    optionsWindow.id = 'otk-options-window';
-    optionsWindow.style.cssText = `
-        position: fixed;
-        top: 100px;
-        left: 100px;
-        width: 545px; /* Further Increased width for scrollbar clearance (540px + 5px) */
-        min-height: 150px; /* Minimum height when collapsed */
-        max-height: 550px; /* Maximum height when expanded (title + theme heading + theme options container max-height + paddings) */
-        background-color: #2c2c2c; /* Slightly lighter than GUI for distinction */
-        border: 1px solid #444;
-        border-radius: 5px;
-        z-index: 10000; /* Below loading screen, above viewer/GUI */
-        display: none; /* Hidden by default */
-        flex-direction: column;
-        box-shadow: 0 5px 15px rgba(0,0,0,0.5);
-        color: var(--otk-options-text-color); /* Use specific variable for options window text */
-    `;
-
-    const titleBar = document.createElement('div');
-    titleBar.id = 'otk-options-title-bar';
-    titleBar.style.cssText = `
-        padding: 8px 12px;
-        background-color: #383838;
-        color: #f0f0f0;
-        font-weight: bold;
-        cursor: move; /* For dragging */
-        border-bottom: 1px solid #444;
-        border-top-left-radius: 5px;
-        border-top-right-radius: 5px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    `;
-    titleBar.textContent = 'Options'; // Changed title
-
-    const titleBarButtons = document.createElement('div');
-    titleBarButtons.style.display = 'flex';
-    titleBarButtons.style.alignItems = 'center';
-
-    const applyButton = createTrackerButton('Apply', 'otk-apply-settings-btn');
-    applyButton.style.display = 'none'; // Hidden by default
-    applyButton.style.marginRight = '10px';
-    titleBarButtons.appendChild(applyButton);
-
-    const discardButton = createTrackerButton('Discard', 'otk-discard-settings-btn');
-    discardButton.style.display = 'none'; // Hidden by default
-    discardButton.style.marginRight = '10px';
-    discardButton.style.backgroundColor = '#803333';
-    discardButton.onmouseover = () => discardButton.style.backgroundColor = '#a04444';
-    discardButton.onmouseout = () => discardButton.style.backgroundColor = '#803333';
-    titleBarButtons.appendChild(discardButton);
-
-    const closeButton = document.createElement('span');
-    closeButton.id = 'otk-options-close-btn';
-    closeButton.innerHTML = '&#x2715;'; // 'X' character
-    closeButton.style.cssText = `
-        cursor: pointer;
-        font-size: 16px;
-        padding: 0 5px;
-    `;
-    closeButton.title = "Close Settings";
-    titleBarButtons.appendChild(closeButton);
-
-    titleBar.appendChild(titleBarButtons);
-    optionsWindow.appendChild(titleBar);
-
-    applyButton.addEventListener('click', () => {
-        let settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-        settings = { ...settings, ...pendingThemeChanges };
-        localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(settings));
-        pendingThemeChanges = {};
-        hideApplyDiscardButtons();
-        applyThemeSettings();
-        forceViewerRerenderAfterThemeChange();
-    });
-
-    discardButton.addEventListener('click', () => {
-        pendingThemeChanges = {};
-        hideApplyDiscardButtons();
-        applyThemeSettings(); // Re-apply original settings to reset inputs
-    });
-
-    const contentArea = document.createElement('div');
-    contentArea.id = 'otk-options-content';
-    contentArea.style.cssText = `
-        padding: 15px 10px 15px 20px; /* Top, Right (10px), Bottom, Left (20px) */
-        flex-grow: 1; /* Allows content to fill space */
-        overflow-y: auto; /* If content gets too long */
-        box-sizing: border-box; /* Ensure padding is included in width/height */
-        /* display: flex; Will be handled by section container */
-        /* flex-direction: column; */
-        /* gap: 10px; */
-    `;
-    optionsWindow.appendChild(contentArea);
-
-    // --- Main Sections Container (for tabs or collapsible sections later) ---
-    // This container might not be strictly necessary anymore if we are just stacking sections.
-    // For now, let's keep it but add general settings directly to contentArea or sectionsContainer.
-    // Let's add general settings directly to contentArea, above the theme section.
-
-    const generalSettingsSection = document.createElement('div');
-    generalSettingsSection.id = 'otk-general-settings-section';
-    generalSettingsSection.style.cssText = `
-        display: flex;
-        flex-direction: column;
-        gap: 10px; /* Space between general option groups */
-        margin-bottom: 15px; /* Space before the theme section */
-        padding-right: 5px; /* Added right padding */
-        box-sizing: border-box; /* Ensure padding is included if not already part of a width calc */
-    `;
-    contentArea.appendChild(generalSettingsSection); // Add general settings section first
-
-    // Add a heading for the General Settings section using the helper
-    generalSettingsSection.appendChild(createSectionHeading('General Settings'));
-
-    // --- Tracked Keyword(s) Option ---
-    const trackedKeywordsGroup = document.createElement('div');
-    // Apply Flexbox styling similar to createThemeOptionRow
-    trackedKeywordsGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
-
-    const trackedKeywordsLabel = document.createElement('label');
-    trackedKeywordsLabel.textContent = "Tracked Keyword(s):";
-    trackedKeywordsLabel.htmlFor = 'otk-tracked-keywords-input';
-    // Apply Flexbox label styling
-    trackedKeywordsLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
-
-    const trackedKeywordsControlsWrapper = document.createElement('div');
-    trackedKeywordsControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
-
-    const trackedKeywordsInput = document.createElement('input');
-    trackedKeywordsInput.type = 'text';
-    trackedKeywordsInput.id = 'otk-tracked-keywords-input';
-    trackedKeywordsInput.placeholder = "e.g., otk, item2, phrase three";
-    // Explicitly set width to 100% of its parent wrapper and right-align text.
-    trackedKeywordsInput.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
-    trackedKeywordsInput.value = localStorage.getItem(OTK_TRACKED_KEYWORDS_KEY) || "otk"; // Load saved value or default
-
-    trackedKeywordsInput.addEventListener('change', () => { // Save on change (after blur or Enter)
-        const valueToSave = trackedKeywordsInput.value.trim();
-        if (valueToSave) {
-            localStorage.setItem(OTK_TRACKED_KEYWORDS_KEY, valueToSave);
-            consoleLog(`Tracked keywords saved: ${valueToSave}`);
-        } else { // If input is cleared, revert to default and save that
-            localStorage.setItem(OTK_TRACKED_KEYWORDS_KEY, "otk");
-            trackedKeywordsInput.value = "otk"; // Reflect default in input
-            consoleLog(`Tracked keywords reset to default: "otk"`);
-        }
-    });
-
-    trackedKeywordsControlsWrapper.appendChild(trackedKeywordsInput);
-    trackedKeywordsGroup.appendChild(trackedKeywordsLabel);
-    trackedKeywordsGroup.appendChild(trackedKeywordsControlsWrapper);
-    generalSettingsSection.appendChild(trackedKeywordsGroup);
-
-    // --- Background Update Frequency Option ---
-    const minUpdateGroup = createThemeOptionRow({
-        labelText: "Minimum time between updates (minutes):",
-        storageKey: 'otkMinUpdateSeconds',
-        cssVariable: '--otk-min-update-seconds',
-        defaultValue: '2',
-        inputType: 'number',
-        unit: null,
-        min: 2,
-        max: 60,
-        idSuffix: 'min-update-seconds'
-    });
-    generalSettingsSection.appendChild(minUpdateGroup);
-
-    const maxUpdateGroup = createThemeOptionRow({
-        labelText: "Maximum time between updates (minutes):",
-        storageKey: 'otkMaxUpdateSeconds',
-        cssVariable: '--otk-max-update-seconds',
-        defaultValue: '5',
-        inputType: 'number',
-        unit: null,
-        min: 4,
-        max: 60,
-        idSuffix: 'max-update-seconds'
-    });
-    generalSettingsSection.appendChild(maxUpdateGroup);
-
-    const suspendAfterGroup = createThemeOptionRow({
-        labelText: "Suspend updates after (minutes):",
-        storageKey: 'otkSuspendAfterInactiveMinutes',
-        cssVariable: '--otk-suspend-after-inactive-minutes',
-        defaultValue: '1',
-        inputType: 'number',
-        unit: null,
-        min: 1,
-        max: 60,
-        idSuffix: 'suspend-after-inactive-minutes'
-    });
-    generalSettingsSection.appendChild(suspendAfterGroup);
-
-    // --- Debugging Toggle Option ---
-    const debugToggleGroup = document.createElement('div');
-    // Apply Flexbox styling
-    debugToggleGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
-
-    const debugToggleLabel = document.createElement('label');
-    debugToggleLabel.textContent = "Enable Console Debugging:";
-    debugToggleLabel.htmlFor = 'otk-debug-mode-checkbox';
-    // Apply Flexbox label styling
-    debugToggleLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
-
-    const debugToggleControlsWrapper = document.createElement('div');
-    debugToggleControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
-
-    const debugToggleCheckbox = document.createElement('input');
-    debugToggleCheckbox.type = 'checkbox';
-    debugToggleCheckbox.id = 'otk-debug-mode-checkbox';
-    // Specific styling for checkbox
-    debugToggleCheckbox.style.cssText = "height: 16px; width: 16px;";
-    debugToggleCheckbox.checked = DEBUG_MODE;
-
-    debugToggleCheckbox.addEventListener('change', () => {
-        DEBUG_MODE = debugToggleCheckbox.checked;
-        localStorage.setItem(DEBUG_MODE_KEY, DEBUG_MODE.toString());
-        consoleLog(`Debug mode ${DEBUG_MODE ? 'enabled' : 'disabled'}.`);
-        if (DEBUG_MODE) {
-             console.log('[OTK Tracker]', `Debug mode explicitly enabled via UI.`);
-        }
-    });
-
-    debugToggleControlsWrapper.appendChild(debugToggleCheckbox);
-    debugToggleGroup.appendChild(debugToggleLabel);
-    debugToggleGroup.appendChild(debugToggleControlsWrapper);
-    generalSettingsSection.appendChild(debugToggleGroup);
-
-    // --- Memory Usage Report ---
-    const memoryReportGroup = document.createElement('div');
-    memoryReportGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
-
-    const memoryReportLabel = document.createElement('label');
-    memoryReportLabel.textContent = "Enable Memory Usage Report:";
-    memoryReportLabel.htmlFor = 'otk-memory-report-checkbox';
-    memoryReportLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
-
-    const memoryReportControlsWrapper = document.createElement('div');
-    memoryReportControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
-
-    const bgUpdateCheckboxContainer = document.createElement('div');
-    bgUpdateCheckboxContainer.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
-
-    const bgUpdateLabel = document.createElement('label');
-    bgUpdateLabel.textContent = "Disable Background Updates:";
-    bgUpdateLabel.htmlFor = 'otk-disable-bg-update-checkbox';
-    bgUpdateLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
-
-    const bgUpdateControlsWrapper = document.createElement('div');
-    bgUpdateControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
-
-    const bgUpdateCheckbox = document.createElement('input');
-    bgUpdateCheckbox.type = 'checkbox';
-    bgUpdateCheckbox.id = 'otk-disable-bg-update-checkbox';
-    bgUpdateCheckbox.style.cssText = "height: 16px; width: 16px;";
-    bgUpdateCheckbox.checked = localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) === 'true';
-
-    bgUpdateCheckbox.addEventListener('change', () => {
-        const isEnabled = bgUpdateCheckbox.checked;
-        localStorage.setItem(BACKGROUND_UPDATES_DISABLED_KEY, isEnabled);
-        if (isEnabled) {
-            stopBackgroundRefresh();
+    try {
+        const mainThemeSettings = await GM.getValue(MAIN_THEME_KEY);
+        if (mainThemeSettings) {
+            const parsedSettings = JSON.parse(mainThemeSettings);
+            localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(parsedSettings));
+            consoleLog('[Theme] Loaded main theme from GM storage into localStorage.');
         } else {
-            startBackgroundRefresh(true);
+            consoleLog('[Theme] No main theme found in GM storage. Using localStorage default.');
         }
-    });
+    } catch (error) {
+        consoleError('[Theme] Error loading main theme from GM storage:', error);
+    }
+}
 
-    bgUpdateControlsWrapper.appendChild(bgUpdateCheckbox);
-    bgUpdateCheckboxContainer.appendChild(bgUpdateLabel);
-    bgUpdateCheckboxContainer.appendChild(bgUpdateControlsWrapper);
-    generalSettingsSection.appendChild(bgUpdateCheckboxContainer);
+function applyThemeSettings(options = {}) {
+    const { forceRerender = true } = options; // Default to true to not break existing calls
 
-    const memoryReportCheckbox = document.createElement('input');
-    memoryReportCheckbox.type = 'checkbox';
-    memoryReportCheckbox.id = 'otk-memory-report-checkbox';
-    memoryReportCheckbox.style.cssText = "height: 16px; width: 16px;";
-    memoryReportCheckbox.checked = localStorage.getItem('otkMemoryReportEnabled') === 'true';
+    let settings = {};
+    try {
+        settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+    } catch (e) {
+        consoleError("Error parsing theme settings from localStorage:", e);
+    }
+    consoleLog("Applying theme settings:", settings);
+    consoleLog("[Clock BG Debug] Applying theme. clockBgColor is:", settings.clockBgColor);
 
-    memoryReportCheckbox.addEventListener('change', () => {
-        const isEnabled = memoryReportCheckbox.checked;
-        localStorage.setItem('otkMemoryReportEnabled', isEnabled);
-        const memoryReportButton = document.getElementById('otk-memory-report-btn');
-        if (memoryReportButton) {
-            memoryReportButton.style.display = isEnabled ? 'inline-block' : 'none';
+    // Helper to update a color input pair (hex text and color swatch)
+        const updateColorInputs = (idSuffix, colorValue) => {
+            const hexInput = document.getElementById(`otk-${idSuffix}-hex`);
+            const pickerInput = document.getElementById(`otk-${idSuffix}`); // Correct ID for color swatch
+            if (hexInput) hexInput.value = colorValue;
+            if (pickerInput) pickerInput.value = colorValue;
+        };
+
+        if (settings.guiBgColor) {
+            document.documentElement.style.setProperty('--otk-gui-bg-color', settings.guiBgColor);
+            updateColorInputs('gui-bg', settings.guiBgColor);
         }
-    });
 
-    memoryReportControlsWrapper.appendChild(memoryReportCheckbox);
-    memoryReportGroup.appendChild(memoryReportLabel);
-    memoryReportGroup.appendChild(memoryReportControlsWrapper);
-    generalSettingsSection.appendChild(memoryReportGroup);
+        if (settings.titleTextColor) {
+            document.documentElement.style.setProperty('--otk-title-text-color', settings.titleTextColor);
+            updateColorInputs('title-text', settings.titleTextColor);
+        }
+
+        if (settings.optionsTextColor) {
+            document.documentElement.style.setProperty('--otk-options-text-color', settings.optionsTextColor);
+            updateColorInputs('options-text', settings.optionsTextColor);
+        }
+
+        if (settings.actualStatsTextColor) {
+            document.documentElement.style.setProperty('--otk-stats-text-color', settings.actualStatsTextColor);
+            updateColorInputs('actual-stats-text', settings.actualStatsTextColor);
+        }
+
+        if (settings.viewerBgColor) {
+            document.documentElement.style.setProperty('--otk-viewer-bg-color', settings.viewerBgColor);
+            updateColorInputs('viewer-bg', settings.viewerBgColor);
+        }
+
+        if (settings.guiThreadListTitleColor) {
+            document.documentElement.style.setProperty('--otk-gui-threadlist-title-color', settings.guiThreadListTitleColor);
+            updateColorInputs('threadlist-title', settings.guiThreadListTitleColor);
+        }
+
+        if (settings.guiThreadListTimeColor) {
+            document.documentElement.style.setProperty('--otk-gui-threadlist-time-color', settings.guiThreadListTimeColor);
+            updateColorInputs('threadlist-time', settings.guiThreadListTimeColor);
+        }
+
+        // Viewer Header Border Color
+        if (settings.viewerHeaderBorderColor) {
+            document.documentElement.style.setProperty('--otk-viewer-header-border-color', settings.viewerHeaderBorderColor);
+            updateColorInputs('viewer-header-border', settings.viewerHeaderBorderColor);
+        }
+
+        // Viewer Quote L1 Border Color
+        if (settings.viewerQuote1HeaderBorderColor) {
+            document.documentElement.style.setProperty('--otk-viewer-quote1-header-border-color', settings.viewerQuote1HeaderBorderColor);
+            updateColorInputs('viewer-quote1-border', settings.viewerQuote1HeaderBorderColor);
+        }
+
+        // Viewer Quote L2+ Border Color
+        if (settings.viewerQuote2plusHeaderBorderColor) {
+            document.documentElement.style.setProperty('--otk-viewer-quote2plus-header-border-color', settings.viewerQuote2plusHeaderBorderColor);
+            updateColorInputs('viewer-quote2plus-border', settings.viewerQuote2plusHeaderBorderColor);
+        }
+
+        // Message Background Colors, Message Body Text Colors, Message Header Text Colors
+        ['Bg', 'Text', 'HeaderTextColor'].forEach(type => {
+            ['0', '1', '2plus'].forEach(depth => {
+                const keyBase = `msgDepth${depth}${type === 'HeaderTextColor' ? 'HeaderTextColor' : type}`; // e.g. msgDepth0BgColor, msgDepth0TextColor, msgDepth0HeaderTextColor
+                const cssVarBase = `--otk-msg-depth${depth}-${type === 'Bg' ? 'bg' : (type === 'Text' ? 'text' : 'header-text')}-color`; // e.g. --otk-msg-depth0-bg-color
+                const idSuffixBase = `msg-depth${depth}-${type === 'Bg' ? 'bg' : (type === 'Text' ? 'text' : 'header-text')}`; // e.g. msg-depth0-bg
+
+                // Correcting key and idSuffix for "HeaderTextColor" to match createThemeOptionRow structure
+                let correctedKey = keyBase;
+                let correctedIdSuffix = idSuffixBase;
+                if (type === 'HeaderTextColor') {
+                     correctedKey = `msgDepth${depth}HeaderTextColor`; // This was already correct
+                     correctedIdSuffix = `msg-depth${depth}-header-text`; // This was already correct
+                } else {
+                    correctedKey = `msgDepth${depth}${type}Color`; // e.g. msgDepth0BgColor
+                    correctedIdSuffix = `msg-depth${depth}-${type.toLowerCase()}`; // e.g. msg-depth0-bg
+                }
 
 
-    // --- Theme/Appearance Section ---
-    // This section will now be added after the general settings.
-    // The 'sectionsContainer' might be redundant if themeSection is the only thing in it.
-    // Let's append themeSection directly to contentArea as well, after generalSettingsSection.
-    const sectionsContainer = document.createElement('div'); // Keep for potential future use if more sections are added here
-    contentArea.appendChild(sectionsContainer);
+                if (settings[correctedKey]) {
+                    document.documentElement.style.setProperty(cssVarBase, settings[correctedKey]);
+                    updateColorInputs(correctedIdSuffix, settings[correctedKey]);
+                }
+            });
+        });
 
 
-    const themeSection = document.createElement('div');
-    themeSection.id = 'otk-options-theme-section';
-    themeSection.style.cssText = `
-        display: flex;
-        flex-direction: column;
-        gap: 10px; /* Space between color option groups */
-        /* max-height: 330px; */ /* Max height for the theme options area - Let content dictate or use min-height */
-        /* overflow-y: auto; */ /* Enable vertical scrollbar - Let themeOptionsContainer handle scroll */
-        /* padding-right: 10px; */ /* Space for scrollbar - Removed */
-        /* padding-left: 5px; */ /* Minor padding for content - Removed */
-    `;
-    // Add a heading for the section (optional)
-    const themeSectionHeading = document.createElement('h4');
-    themeSectionHeading.textContent = '► Theme'; // Changed text and added indicator
-    themeSectionHeading.style.cssText = `
-        margin-top: 0;
-        margin-bottom: 10px;
-        border-bottom: 1px solid #555;
-        padding-bottom: 5px;
-        cursor: pointer;
-        user-select: none;
-    `;
-    themeSection.appendChild(themeSectionHeading);
+        // New Depth-Specific Content Font Sizes
+        ['Depth 0', 'Depth 1', 'Depth 2+'].forEach((label, index) => {
+            const depthKeyPart = index === 2 ? '2plus' : index.toString();
+            const storageKey = `msgDepth${depthKeyPart}ContentFontSize`;
+            const cssVar = `--otk-msg-depth${depthKeyPart}-content-font-size`;
+            const inputId = `otk-msg-depth${depthKeyPart}-content-fontsize`;
 
-    // Create a container for the actual theme options, to be toggled
-    const themeOptionsContainer = document.createElement('div');
-    themeOptionsContainer.id = 'otk-theme-options-container';
-    themeOptionsContainer.style.display = 'none'; // Hidden by default
-    // Apply scrolling properties to this container instead of themeSection directly
-    themeOptionsContainer.style.cssText += `
-        display: none; /* Reiterate, will be toggled */
-        flex-direction: column;
-        /* gap: 10px; Will be handled by margins/padding of new structure or individual rows */
-        max-height: 300px; /* Adjusted from themeSection's previous max-height */
-        overflow-y: auto;
-        padding-right: 20px; /* Further Increased right padding for scrollbar clearance (15px + 5px) */
-        box-sizing: border-box; /* Ensure padding is included */
-        /* padding-left: 5px; */ /* Minor padding for content - Remains Removed, covered by contentArea */
-    `;
-    themeSection.appendChild(themeOptionsContainer);
+            if (settings[storageKey]) {
+                document.documentElement.style.setProperty(cssVar, settings[storageKey]);
+                const inputElement = document.getElementById(inputId);
+                if (inputElement) {
+                    inputElement.value = settings[storageKey].replace('px', '');
+                }
+            }
+        });
 
-    sectionsContainer.appendChild(themeSection); // Add theme section to main content
 
-    document.body.appendChild(optionsWindow);
+        if (settings.guiBottomBorderColor) {
+            document.documentElement.style.setProperty('--otk-gui-bottom-border-color', settings.guiBottomBorderColor);
+            updateColorInputs('gui-bottom-border', settings.guiBottomBorderColor);
+        }
 
-    // Event listener for toggling theme options visibility
-    themeSectionHeading.addEventListener('click', () => {
-        const isHidden = themeOptionsContainer.style.display === 'none';
-        if (isHidden) {
-            themeOptionsContainer.style.display = 'flex'; // Use 'flex' as it's a flex container
-            themeSectionHeading.textContent = '▼ Theme';
+        // Cog Icon Color
+        if (settings.cogIconColor) {
+            document.documentElement.style.setProperty('--otk-cog-icon-color', settings.cogIconColor);
+            updateColorInputs('cog-icon', settings.cogIconColor);
+        }
+
+        // Disable Background Font Color
+        if (settings.disableBgFontColor) {
+            document.documentElement.style.setProperty('--otk-disable-bg-font-color', settings.disableBgFontColor);
+            updateColorInputs('disable-bg-font', settings.disableBgFontColor);
+        }
+
+        if (settings.countdownLabelTextColor) {
+            document.documentElement.style.setProperty('--otk-countdown-label-text-color', settings.countdownLabelTextColor);
+            updateColorInputs('countdown-label-text', settings.countdownLabelTextColor);
+        }
+
+        if (settings.countdownTimerTextColor) {
+            document.documentElement.style.setProperty('--otk-countdown-timer-text-color', settings.countdownTimerTextColor);
+            updateColorInputs('countdown-timer-text', settings.countdownTimerTextColor);
+        }
+
+        // New Messages Divider Color
+        if (settings.newMessagesDividerColor) {
+            document.documentElement.style.setProperty('--otk-new-messages-divider-color', settings.newMessagesDividerColor);
+            updateColorInputs('new-msg-divider', settings.newMessagesDividerColor);
+        }
+
+        // New Messages Font Color
+        if (settings.newMessagesFontColor) {
+            document.documentElement.style.setProperty('--otk-new-messages-font-color', settings.newMessagesFontColor);
+            updateColorInputs('new-msg-font', settings.newMessagesFontColor);
+        }
+
+        // Anchor Highlight Colors
+        if (settings.anchorHighlightBgColor) {
+            document.documentElement.style.setProperty('--otk-anchor-highlight-bg-color', settings.anchorHighlightBgColor);
+            updateColorInputs('anchor-bg', settings.anchorHighlightBgColor);
+        }
+        if (settings.anchorHighlightBorderColor) {
+            document.documentElement.style.setProperty('--otk-anchor-highlight-border-color', settings.anchorHighlightBorderColor);
+            updateColorInputs('anchor-border', settings.anchorHighlightBorderColor);
+        }
+
+        // Icon Colors
+        if (settings.resizeIconColor) {
+            document.documentElement.style.setProperty('--otk-resize-icon-color', settings.resizeIconColor);
+            updateColorInputs('resize-icon', settings.resizeIconColor);
+        }
+        if (settings.resizeIconBgColor) {
+            document.documentElement.style.setProperty('--otk-resize-icon-bg-color', settings.resizeIconBgColor);
+            updateColorInputs('resize-icon-bg', settings.resizeIconBgColor);
+        }
+        if (settings.blurIconColor) {
+            document.documentElement.style.setProperty('--otk-blur-icon-color', settings.blurIconColor);
+            updateColorInputs('blur-icon', settings.blurIconColor);
+        }
+        if (settings.blurIconBgColor) {
+            document.documentElement.style.setProperty('--otk-blur-icon-bg-color', settings.blurIconBgColor);
+            updateColorInputs('blur-icon-bg', settings.blurIconBgColor);
+        }
+
+    // Clock Colors
+        if (settings.hasOwnProperty('clockBgColor') && settings.clockBgColor) {
+            document.documentElement.style.setProperty('--otk-clock-bg-color', settings.clockBgColor);
+            updateColorInputs('clock-bg', settings.clockBgColor);
         } else {
-            themeOptionsContainer.style.display = 'none';
-            themeSectionHeading.textContent = '► Theme';
+            // If the setting is empty or doesn't exist, remove the inline style property.
+            // This makes the element revert to the color defined in the <style> block's :root.
+            document.documentElement.style.removeProperty('--otk-clock-bg-color');
+            // Update the input to show the computed default color.
+            const defaultColor = getComputedStyle(document.documentElement).getPropertyValue('--otk-clock-bg-color').trim();
+            updateColorInputs('clock-bg', defaultColor);
         }
-    });
+        if (settings.clockSearchBgColor) {
+            document.documentElement.style.setProperty('--otk-clock-search-bg-color', settings.clockSearchBgColor);
+            updateColorInputs('clock-search-bg', settings.clockSearchBgColor);
+        }
+        if (settings.clockSearchTextColor) {
+            document.documentElement.style.setProperty('--otk-clock-search-text-color', settings.clockSearchTextColor);
+            updateColorInputs('clock-search-text', settings.clockSearchTextColor);
+        }
 
-    // Helper function to create a checkbox option row
-    function createCheckboxOptionRow(options) {
-        // options = { labelText, storageKey, defaultValue, idSuffix }
-        const group = document.createElement('div');
-        group.style.cssText = `
+        // GUI Button Colors
+        const buttonColorConfigs = [
+            { key: 'guiButtonBgColor', cssVar: '--otk-button-bg-color', idSuffix: 'gui-button-bg' },
+            { key: 'guiButtonTextColor', cssVar: '--otk-button-text-color', idSuffix: 'gui-button-text' },
+            { key: 'guiButtonBorderColor', cssVar: '--otk-button-border-color', idSuffix: 'gui-button-border' },
+            { key: 'guiButtonHoverBgColor', cssVar: '--otk-button-hover-bg-color', idSuffix: 'gui-button-hover-bg' },
+            { key: 'guiButtonActiveBgColor', cssVar: '--otk-button-active-bg-color', idSuffix: 'gui-button-active-bg' }
+        ];
+        buttonColorConfigs.forEach(config => {
+            if (settings[config.key]) {
+                document.documentElement.style.setProperty(config.cssVar, settings[config.key]);
+                updateColorInputs(config.idSuffix, settings[config.key]);
+            }
+        });
+
+        // Loading Screen Colors
+        if (settings.loadingOverlayBaseHexColor) {
+            document.documentElement.style.setProperty('--otk-loading-overlay-base-hex-color', settings.loadingOverlayBaseHexColor);
+            updateColorInputs('loading-overlay-base-hex', settings.loadingOverlayBaseHexColor);
+        }
+        if (settings.loadingOverlayOpacity) {
+            document.documentElement.style.setProperty('--otk-loading-overlay-opacity', settings.loadingOverlayOpacity);
+            const inputEl = document.getElementById('otk-loading-overlay-opacity');
+            if (inputEl) inputEl.value = settings.loadingOverlayOpacity;
+        }
+        if (settings.loadingTextColor) {
+            document.documentElement.style.setProperty('--otk-loading-text-color', settings.loadingTextColor);
+            updateColorInputs('loading-text', settings.loadingTextColor);
+        }
+        if (settings.loadingProgressBarBgColor) {
+            document.documentElement.style.setProperty('--otk-loading-progress-bar-bg-color', settings.loadingProgressBarBgColor);
+            updateColorInputs('loading-progress-bg', settings.loadingProgressBarBgColor);
+        }
+        if (settings.loadingProgressBarFillColor) {
+            document.documentElement.style.setProperty('--otk-loading-progress-bar-fill-color', settings.loadingProgressBarFillColor);
+            updateColorInputs('loading-progress-fill', settings.loadingProgressBarFillColor);
+        }
+        if (settings.loadingProgressBarTextColor) {
+            document.documentElement.style.setProperty('--otk-loading-progress-bar-text-color', settings.loadingProgressBarTextColor);
+            updateColorInputs('loading-progress-text', settings.loadingProgressBarTextColor);
+        }
+
+        // Update checkboxes for new boolean settings
+        const newBooleanSettings = [
+            { key: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth0-disable-header-underline' },
+            { key: 'otkMsgDepth0DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth0-display-media-filename' },
+            { key: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth1-disable-header-underline' },
+            { key: 'otkMsgDepth1DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth1-display-media-filename' },
+            { key: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth2plus-disable-header-underline' },
+            { key: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth2plus-display-media-filename' }
+        ];
+
+        newBooleanSettings.forEach(opt => {
+            const checkbox = document.getElementById(`otk-${opt.idSuffix}-checkbox`);
+            if (checkbox) {
+                if (settings.hasOwnProperty(opt.key)) {
+                    checkbox.checked = settings[opt.key];
+                } else {
+                    checkbox.checked = opt.defaultValue;
+                }
+            }
+        });
+
+        // Directly update loading screen styles
+        const loadingOverlayElement = document.getElementById('otk-loading-overlay');
+        if (loadingOverlayElement) {
+            const baseHex = settings.loadingOverlayBaseHexColor || getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-overlay-base-hex-color').trim() || '#000000';
+            const rgbParts = hexToRgbParts(baseHex);
+            const opacity = settings.loadingOverlayOpacity || getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-overlay-opacity').trim() || '0.8';
+            loadingOverlayElement.style.backgroundColor = `rgba(${rgbParts}, ${opacity})`;
+            loadingOverlayElement.style.color = `var(--otk-loading-text-color, ${getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-text-color').trim() || '#ffffff'})`;
+            const progressBarContainer = document.getElementById('otk-progress-bar-container');
+            if (progressBarContainer) {
+                progressBarContainer.style.backgroundColor = `var(--otk-loading-progress-bar-bg-color, ${getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-progress-bar-bg-color').trim() || '#333333'})`;
+            }
+            const progressBar = document.getElementById('otk-progress-bar');
+            if (progressBar) {
+                progressBar.style.backgroundColor = `var(--otk-loading-progress-bar-fill-color, ${getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-progress-bar-fill-color').trim() || '#4CAF50'})`;
+                progressBar.style.color = `var(--otk-loading-progress-bar-text-color, ${getComputedStyle(document.documentElement).getPropertyValue('--otk-loading-progress-bar-text-color').trim() || '#ffffff'})`;
+            }
+        }
+
+        // GUI Background Image
+        const guiWrapper = document.getElementById('otk-tracker-gui-wrapper');
+        if (guiWrapper) {
+            if (settings.guiBackgroundImageUrl) {
+                guiWrapper.style.backgroundImage = `url('${settings.guiBackgroundImageUrl}')`;
+                guiWrapper.style.backgroundSize = settings.guiBgSize || 'cover';
+                guiWrapper.style.backgroundRepeat = settings.guiBgRepeat || 'no-repeat';
+                guiWrapper.style.backgroundPosition = settings.guiBgPosition || 'center';
+            } else {
+                guiWrapper.style.backgroundImage = '';
+            }
+        }
+
+        if (forceRerender) {
+            forceViewerRerenderAfterThemeChange();
+        }
+    }
+
+
+    function setupOptionsWindow() {
+        consoleLog("Setting up Options Window...");
+
+        // Check if window already exists
+        if (document.getElementById('otk-options-window')) {
+            consoleLog("Options window already exists.");
+            return;
+        }
+
+        const optionsWindow = document.createElement('div');
+        optionsWindow.id = 'otk-options-window';
+        optionsWindow.style.cssText = `
+            position: fixed;
+            top: 100px;
+            left: 100px;
+            width: 545px; /* Further Increased width for scrollbar clearance (540px + 5px) */
+            min-height: 150px; /* Minimum height when collapsed */
+            max-height: 550px; /* Maximum height when expanded (title + theme heading + theme options container max-height + paddings) */
+            background-color: #2c2c2c; /* Slightly lighter than GUI for distinction */
+            border: 1px solid #444;
+            border-radius: 5px;
+            z-index: 10000; /* Below loading screen, above viewer/GUI */
+            display: none; /* Hidden by default */
+            flex-direction: column;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+            color: var(--otk-options-text-color); /* Use specific variable for options window text */
+        `;
+
+        const titleBar = document.createElement('div');
+        titleBar.id = 'otk-options-title-bar';
+        titleBar.style.cssText = `
+            padding: 8px 12px;
+            background-color: #383838;
+            color: #f0f0f0;
+            font-weight: bold;
+            cursor: move; /* For dragging */
+            border-bottom: 1px solid #444;
+            border-top-left-radius: 5px;
+            border-top-right-radius: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        `;
+        titleBar.textContent = 'Options'; // Changed title
+
+        const titleBarButtons = document.createElement('div');
+        titleBarButtons.style.display = 'flex';
+        titleBarButtons.style.alignItems = 'center';
+
+        const applyButton = createTrackerButton('Apply', 'otk-apply-settings-btn');
+        applyButton.style.display = 'none'; // Hidden by default
+        applyButton.style.marginRight = '10px';
+        titleBarButtons.appendChild(applyButton);
+
+        const discardButton = createTrackerButton('Discard', 'otk-discard-settings-btn');
+        discardButton.style.display = 'none'; // Hidden by default
+        discardButton.style.marginRight = '10px';
+        discardButton.style.backgroundColor = '#803333';
+        discardButton.onmouseover = () => discardButton.style.backgroundColor = '#a04444';
+        discardButton.onmouseout = () => discardButton.style.backgroundColor = '#803333';
+        titleBarButtons.appendChild(discardButton);
+
+        const closeButton = document.createElement('span');
+        closeButton.id = 'otk-options-close-btn';
+        closeButton.innerHTML = '&#x2715;'; // 'X' character
+        closeButton.style.cssText = `
+            cursor: pointer;
+            font-size: 16px;
+            padding: 0 5px;
+        `;
+        closeButton.title = "Close Settings";
+        titleBarButtons.appendChild(closeButton);
+
+        titleBar.appendChild(titleBarButtons);
+        optionsWindow.appendChild(titleBar);
+
+        applyButton.addEventListener('click', () => {
+            let settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+            settings = { ...settings, ...pendingThemeChanges };
+            localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(settings));
+            pendingThemeChanges = {};
+            hideApplyDiscardButtons();
+            applyThemeSettings();
+            forceViewerRerenderAfterThemeChange();
+        });
+
+        discardButton.addEventListener('click', () => {
+            pendingThemeChanges = {};
+            hideApplyDiscardButtons();
+            applyThemeSettings(); // Re-apply original settings to reset inputs
+        });
+
+        const contentArea = document.createElement('div');
+        contentArea.id = 'otk-options-content';
+        contentArea.style.cssText = `
+            padding: 15px 10px 15px 20px; /* Top, Right (10px), Bottom, Left (20px) */
+            flex-grow: 1; /* Allows content to fill space */
+            overflow-y: auto; /* If content gets too long */
+            box-sizing: border-box; /* Ensure padding is included in width/height */
+            /* display: flex; Will be handled by section container */
+            /* flex-direction: column; */
+            /* gap: 10px; */
+        `;
+        optionsWindow.appendChild(contentArea);
+
+        // --- Main Sections Container (for tabs or collapsible sections later) ---
+        // This container might not be strictly necessary anymore if we are just stacking sections.
+        // For now, let's keep it but add general settings directly to contentArea or sectionsContainer.
+        // Let's add general settings directly to contentArea, above the theme section.
+
+        const generalSettingsSection = document.createElement('div');
+        generalSettingsSection.id = 'otk-general-settings-section';
+        generalSettingsSection.style.cssText = `
+            display: flex;
+            flex-direction: column;
+            gap: 10px; /* Space between general option groups */
+            margin-bottom: 15px; /* Space before the theme section */
+            padding-right: 5px; /* Added right padding */
+            box-sizing: border-box; /* Ensure padding is included if not already part of a width calc */
+        `;
+        contentArea.appendChild(generalSettingsSection); // Add general settings section first
+
+        // Add a heading for the General Settings section using the helper
+        generalSettingsSection.appendChild(createSectionHeading('General Settings'));
+
+        // --- Tracked Keyword(s) Option ---
+        const trackedKeywordsGroup = document.createElement('div');
+        // Apply Flexbox styling similar to createThemeOptionRow
+        trackedKeywordsGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const trackedKeywordsLabel = document.createElement('label');
+        trackedKeywordsLabel.textContent = "Tracked Keyword(s):";
+        trackedKeywordsLabel.htmlFor = 'otk-tracked-keywords-input';
+        // Apply Flexbox label styling
+        trackedKeywordsLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const trackedKeywordsControlsWrapper = document.createElement('div');
+        trackedKeywordsControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
+
+        const trackedKeywordsInput = document.createElement('input');
+        trackedKeywordsInput.type = 'text';
+        trackedKeywordsInput.id = 'otk-tracked-keywords-input';
+        trackedKeywordsInput.placeholder = "e.g., otk, item2, phrase three";
+        // Explicitly set width to 100% of its parent wrapper and right-align text.
+        trackedKeywordsInput.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
+        trackedKeywordsInput.value = localStorage.getItem(OTK_TRACKED_KEYWORDS_KEY) || "otk"; // Load saved value or default
+
+        trackedKeywordsInput.addEventListener('change', () => { // Save on change (after blur or Enter)
+            const valueToSave = trackedKeywordsInput.value.trim();
+            if (valueToSave) {
+                localStorage.setItem(OTK_TRACKED_KEYWORDS_KEY, valueToSave);
+                consoleLog(`Tracked keywords saved: ${valueToSave}`);
+            } else { // If input is cleared, revert to default and save that
+                localStorage.setItem(OTK_TRACKED_KEYWORDS_KEY, "otk");
+                trackedKeywordsInput.value = "otk"; // Reflect default in input
+                consoleLog(`Tracked keywords reset to default: "otk"`);
+            }
+        });
+
+        trackedKeywordsControlsWrapper.appendChild(trackedKeywordsInput);
+        trackedKeywordsGroup.appendChild(trackedKeywordsLabel);
+        trackedKeywordsGroup.appendChild(trackedKeywordsControlsWrapper);
+        generalSettingsSection.appendChild(trackedKeywordsGroup);
+
+        // --- Background Update Frequency Option ---
+        const minUpdateGroup = createThemeOptionRow({
+            labelText: "Minimum time between updates (minutes):",
+            storageKey: 'otkMinUpdateSeconds',
+            cssVariable: '--otk-min-update-seconds',
+            defaultValue: '2',
+            inputType: 'number',
+            unit: null,
+            min: 2,
+            max: 60,
+            idSuffix: 'min-update-seconds'
+        });
+        generalSettingsSection.appendChild(minUpdateGroup);
+
+        const maxUpdateGroup = createThemeOptionRow({
+            labelText: "Maximum time between updates (minutes):",
+            storageKey: 'otkMaxUpdateSeconds',
+            cssVariable: '--otk-max-update-seconds',
+            defaultValue: '5',
+            inputType: 'number',
+            unit: null,
+            min: 4,
+            max: 60,
+            idSuffix: 'max-update-seconds'
+        });
+        generalSettingsSection.appendChild(maxUpdateGroup);
+
+        // --- Suspend After Inactive Option ---
+        const suspendGroup = document.createElement('div');
+        suspendGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const suspendLabel = document.createElement('label');
+        suspendLabel.textContent = "Suspend after inactivity:";
+        suspendLabel.htmlFor = 'otk-suspend-after-inactive-select';
+        suspendLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const suspendControlsWrapper = document.createElement('div');
+        suspendControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
+
+        const suspendSelect = document.createElement('select');
+        suspendSelect.id = 'otk-suspend-after-inactive-select';
+        suspendSelect.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px;";
+
+        const suspendOptions = ["Disabled", "1", "5", "10", "15", "30", "60"];
+        suspendOptions.forEach(opt => {
+            const optionElement = document.createElement('option');
+            optionElement.value = opt;
+            optionElement.textContent = opt;
+            suspendSelect.appendChild(optionElement);
+        });
+
+        suspendSelect.value = localStorage.getItem('otkSuspendAfterInactiveMinutes') || '1';
+
+        suspendSelect.addEventListener('change', () => {
+            localStorage.setItem('otkSuspendAfterInactiveMinutes', suspendSelect.value);
+            consoleLog(`Suspend after inactive time saved: ${suspendSelect.value}`);
+        });
+
+        suspendControlsWrapper.appendChild(suspendSelect);
+        suspendGroup.appendChild(suspendLabel);
+        suspendGroup.appendChild(suspendControlsWrapper);
+        generalSettingsSection.appendChild(suspendGroup);
+
+        // --- Media Load Mode Option ---
+        const mediaLoadModeGroup = document.createElement('div');
+        mediaLoadModeGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const mediaLoadModeLabel = document.createElement('label');
+        mediaLoadModeLabel.textContent = "Attached Media Load Mode:";
+        mediaLoadModeLabel.htmlFor = 'otk-media-load-mode-select';
+        mediaLoadModeLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const mediaLoadModeControlsWrapper = document.createElement('div');
+        mediaLoadModeControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
+
+        const mediaLoadModeSelect = document.createElement('select');
+        mediaLoadModeSelect.id = 'otk-media-load-mode-select';
+        mediaLoadModeSelect.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px;";
+
+        const mediaLoadOptions = [
+            { label: 'Source First (Default)', value: 'source_first' },
+            { label: 'Cache Only', value: 'cache_only' }
+        ];
+
+        mediaLoadOptions.forEach(opt => {
+            const optionElement = document.createElement('option');
+            optionElement.value = opt.value;
+            optionElement.textContent = opt.label;
+            mediaLoadModeSelect.appendChild(optionElement);
+        });
+
+        mediaLoadModeSelect.value = localStorage.getItem('otkMediaLoadMode') || 'source_first';
+
+        mediaLoadModeSelect.addEventListener('change', () => {
+            localStorage.setItem('otkMediaLoadMode', mediaLoadModeSelect.value);
+            consoleLog(`Media load mode saved: ${mediaLoadModeSelect.value}`);
+            alert('Media loading preference saved. This will take effect for newly rendered messages.');
+        });
+
+        mediaLoadModeControlsWrapper.appendChild(mediaLoadModeSelect);
+        mediaLoadModeGroup.appendChild(mediaLoadModeLabel);
+        mediaLoadModeGroup.appendChild(mediaLoadModeControlsWrapper);
+        generalSettingsSection.appendChild(mediaLoadModeGroup);
+
+
+        // --- Debugging Toggle Option ---
+        const debugToggleGroup = document.createElement('div');
+        // Apply Flexbox styling
+        debugToggleGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const debugToggleLabel = document.createElement('label');
+        debugToggleLabel.textContent = "Enable Console Debugging:";
+        debugToggleLabel.htmlFor = 'otk-debug-mode-checkbox';
+        // Apply Flexbox label styling
+        debugToggleLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const debugToggleControlsWrapper = document.createElement('div');
+        debugToggleControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
+
+        const debugToggleCheckbox = document.createElement('input');
+        debugToggleCheckbox.type = 'checkbox';
+        debugToggleCheckbox.id = 'otk-debug-mode-checkbox';
+        // Specific styling for checkbox
+        debugToggleCheckbox.style.cssText = "height: 16px; width: 16px;";
+        debugToggleCheckbox.checked = DEBUG_MODE;
+
+        debugToggleCheckbox.addEventListener('change', () => {
+            DEBUG_MODE = debugToggleCheckbox.checked;
+            localStorage.setItem(DEBUG_MODE_KEY, DEBUG_MODE.toString());
+            consoleLog(`Debug mode ${DEBUG_MODE ? 'enabled' : 'disabled'}.`);
+            if (DEBUG_MODE) {
+                 consoleLog('[OTK Tracker]', `Debug mode explicitly enabled via UI.`);
+            }
+        });
+
+        debugToggleControlsWrapper.appendChild(debugToggleCheckbox);
+        debugToggleGroup.appendChild(debugToggleLabel);
+        debugToggleGroup.appendChild(debugToggleControlsWrapper);
+        generalSettingsSection.appendChild(debugToggleGroup);
+
+        // --- Memory Usage Report ---
+        const memoryReportGroup = document.createElement('div');
+        memoryReportGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const memoryReportLabel = document.createElement('label');
+        memoryReportLabel.textContent = "Enable Memory Usage Report:";
+        memoryReportLabel.htmlFor = 'otk-memory-report-checkbox';
+        memoryReportLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const memoryReportControlsWrapper = document.createElement('div');
+        memoryReportControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
+
+        const memoryReportCheckbox = document.createElement('input');
+        memoryReportCheckbox.type = 'checkbox';
+        memoryReportCheckbox.id = 'otk-memory-report-checkbox';
+        memoryReportCheckbox.style.cssText = "height: 16px; width: 16px;";
+        memoryReportCheckbox.checked = localStorage.getItem('otkMemoryReportEnabled') === 'true';
+
+        memoryReportCheckbox.addEventListener('change', () => {
+            const isEnabled = memoryReportCheckbox.checked;
+            localStorage.setItem('otkMemoryReportEnabled', isEnabled);
+            const memoryReportButton = document.getElementById('otk-memory-report-btn');
+            if (memoryReportButton) {
+                memoryReportButton.style.display = isEnabled ? 'inline-block' : 'none';
+            }
+        });
+
+        memoryReportControlsWrapper.appendChild(memoryReportCheckbox);
+        memoryReportGroup.appendChild(memoryReportLabel);
+        memoryReportGroup.appendChild(memoryReportControlsWrapper);
+        generalSettingsSection.appendChild(memoryReportGroup);
+
+        // --- Disable Background Updates Option ---
+        const bgUpdateGroup = document.createElement('div');
+        bgUpdateGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const bgUpdateLabel = document.createElement('label');
+        bgUpdateLabel.textContent = "Disable Background Updates:";
+        bgUpdateLabel.htmlFor = 'otk-disable-bg-update-checkbox';
+        bgUpdateLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const bgUpdateControlsWrapper = document.createElement('div');
+        bgUpdateControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
+
+        const bgUpdateCheckbox = document.createElement('input');
+        bgUpdateCheckbox.type = 'checkbox';
+        bgUpdateCheckbox.id = 'otk-disable-bg-update-checkbox';
+        bgUpdateCheckbox.style.cssText = "height: 16px; width: 16px;";
+        bgUpdateCheckbox.checked = localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) === 'true';
+
+        bgUpdateCheckbox.addEventListener('change', () => {
+            if (bgUpdateCheckbox.checked) {
+                stopBackgroundRefresh();
+                if (countdownIntervalId) {
+                    clearInterval(countdownIntervalId);
+                    countdownIntervalId = null;
+                }
+                const countdownTimer = document.getElementById('otk-countdown-timer');
+                if (countdownTimer) {
+                    countdownTimer.textContent = 'n/a';
+                }
+                localStorage.setItem(BACKGROUND_UPDATES_DISABLED_KEY, 'true');
+                consoleLog('Background updates disabled via checkbox.');
+            } else {
+                localStorage.setItem(BACKGROUND_UPDATES_DISABLED_KEY, 'false');
+                startBackgroundRefresh(true); // Start immediately
+                consoleLog('Background updates enabled via checkbox.');
+            }
+        });
+
+        bgUpdateControlsWrapper.appendChild(bgUpdateCheckbox);
+        bgUpdateGroup.appendChild(bgUpdateLabel);
+        bgUpdateGroup.appendChild(bgUpdateControlsWrapper);
+        generalSettingsSection.appendChild(bgUpdateGroup);
+
+        // --- Clock Toggle Option ---
+        const clockToggleGroup = document.createElement('div');
+        clockToggleGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const clockToggleLabel = document.createElement('label');
+        clockToggleLabel.textContent = "Enable Clock:";
+        clockToggleLabel.htmlFor = 'otk-clock-toggle-checkbox';
+        clockToggleLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const clockToggleControlsWrapper = document.createElement('div');
+        clockToggleControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
+
+        const clockToggleCheckbox = document.createElement('input');
+        clockToggleCheckbox.type = 'checkbox';
+        clockToggleCheckbox.id = 'otk-clock-toggle-checkbox';
+        clockToggleCheckbox.style.cssText = "height: 16px; width: 16px;";
+        clockToggleCheckbox.checked = localStorage.getItem('otkClockEnabled') === 'true';
+
+        clockToggleCheckbox.addEventListener('change', () => {
+            const isEnabled = clockToggleCheckbox.checked;
+            localStorage.setItem('otkClockEnabled', isEnabled);
+            const clockElement = document.getElementById('otk-clock');
+            if (clockElement) {
+                clockElement.style.display = isEnabled ? 'block' : 'none';
+            }
+        });
+
+        clockToggleControlsWrapper.appendChild(clockToggleCheckbox);
+        clockToggleGroup.appendChild(clockToggleLabel);
+        clockToggleGroup.appendChild(clockToggleControlsWrapper);
+        generalSettingsSection.appendChild(clockToggleGroup);
+
+        // --- Message Limiting Feature ---
+        const messageLimitGroup = document.createElement('div');
+        messageLimitGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const messageLimitLabel = document.createElement('label');
+        messageLimitLabel.textContent = "Limit Number of Messages:";
+        messageLimitLabel.htmlFor = 'otk-message-limit-checkbox';
+        messageLimitLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const messageLimitControlsWrapper = document.createElement('div');
+        messageLimitControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
+
+        const messageLimitCheckbox = document.createElement('input');
+        messageLimitCheckbox.type = 'checkbox';
+        messageLimitCheckbox.id = 'otk-message-limit-checkbox';
+        messageLimitCheckbox.style.cssText = "height: 16px; width: 16px;";
+        const initialThemeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+        messageLimitCheckbox.checked = initialThemeSettings.otkMessageLimitEnabled !== false;
+
+        const messageLimitInput = document.createElement('input');
+        messageLimitInput.type = 'number';
+        messageLimitInput.id = 'otk-message-limit-input';
+        messageLimitInput.min = '1';
+        messageLimitInput.style.cssText = "width: 70px; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
+        messageLimitInput.value = initialThemeSettings.otkMessageLimitValue || '500';
+        messageLimitInput.disabled = !messageLimitCheckbox.checked;
+
+        messageLimitCheckbox.addEventListener('change', () => {
+            const isEnabled = messageLimitCheckbox.checked;
+            saveThemeSetting('otkMessageLimitEnabled', isEnabled, true);
+            messageLimitInput.disabled = !isEnabled;
+        });
+
+        messageLimitInput.addEventListener('change', () => {
+            saveThemeSetting('otkMessageLimitValue', messageLimitInput.value, true);
+        });
+
+        messageLimitControlsWrapper.appendChild(messageLimitCheckbox);
+        messageLimitControlsWrapper.appendChild(messageLimitInput);
+        messageLimitGroup.appendChild(messageLimitLabel);
+        messageLimitGroup.appendChild(messageLimitControlsWrapper);
+        generalSettingsSection.appendChild(messageLimitGroup);
+
+
+        // --- Theme/Appearance Section ---
+        // This section will now be added after the general settings.
+        // The 'sectionsContainer' might be redundant if themeSection is the only thing in it.
+        // Let's append themeSection directly to contentArea as well, after generalSettingsSection.
+        const sectionsContainer = document.createElement('div'); // Keep for potential future use if more sections are added here
+        contentArea.appendChild(sectionsContainer);
+
+
+        const themeSection = document.createElement('div');
+        themeSection.id = 'otk-options-theme-section';
+        themeSection.style.cssText = `
+            display: flex;
+            flex-direction: column;
+            gap: 10px; /* Space between color option groups */
+            /* max-height: 330px; */ /* Max height for the theme options area - Let content dictate or use min-height */
+            /* overflow-y: auto; */ /* Enable vertical scrollbar - Let themeOptionsContainer handle scroll */
+            /* padding-right: 10px; */ /* Space for scrollbar - Removed */
+            /* padding-left: 5px; */ /* Minor padding for content - Removed */
+        `;
+        // Add a heading for the section (optional)
+        const themeSectionHeading = document.createElement('h4');
+        themeSectionHeading.textContent = '► Theme'; // Changed text and added indicator
+        themeSectionHeading.style.cssText = `
+            margin-top: 0;
+            margin-bottom: 10px;
+            border-bottom: 1px solid #555;
+            padding-bottom: 5px;
+            cursor: pointer;
+            user-select: none;
+        `;
+        themeSection.appendChild(themeSectionHeading);
+
+        // Create a container for the actual theme options, to be toggled
+        const themeOptionsContainer = document.createElement('div');
+        themeOptionsContainer.id = 'otk-theme-options-container';
+        themeOptionsContainer.style.display = 'none'; // Hidden by default
+        // Apply scrolling properties to this container instead of themeSection directly
+        themeOptionsContainer.style.cssText += `
+            display: none; /* Reiterate, will be toggled */
+            flex-direction: column;
+            /* gap: 10px; Will be handled by margins/padding of new structure or individual rows */
+            max-height: 300px; /* Adjusted from themeSection's previous max-height */
+            overflow-y: auto;
+            padding-right: 20px; /* Further Increased right padding for scrollbar clearance (15px + 5px) */
+            box-sizing: border-box; /* Ensure padding is included */
+            /* padding-left: 5px; */ /* Minor padding for content - Remains Removed, covered by contentArea */
+        `;
+        themeSection.appendChild(themeOptionsContainer);
+
+        sectionsContainer.appendChild(themeSection); // Add theme section to main content
+
+        document.body.appendChild(optionsWindow);
+
+        // Event listener for toggling theme options visibility
+        themeSectionHeading.addEventListener('click', () => {
+            const isHidden = themeOptionsContainer.style.display === 'none';
+            if (isHidden) {
+                themeOptionsContainer.style.display = 'flex'; // Use 'flex' as it's a flex container
+                themeSectionHeading.textContent = '▼ Theme';
+            } else {
+                themeOptionsContainer.style.display = 'none';
+                themeSectionHeading.textContent = '► Theme';
+            }
+        });
+
+        // Helper function to create a checkbox option row
+        function createCheckboxOptionRow(options) {
+            // options = { labelText, storageKey, defaultValue, idSuffix }
+            const group = document.createElement('div');
+            group.style.cssText = `
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                width: 100%;
+                margin-bottom: 5px;
+            `;
+
+            const label = document.createElement('label');
+            label.textContent = options.labelText;
+            label.htmlFor = `otk-${options.idSuffix}-checkbox`;
+            label.style.cssText = `
+                font-size: 12px;
+                text-align: left;
+                flex-basis: 230px;
+                flex-shrink: 0;
+            `;
+
+            const controlsWrapperDiv = document.createElement('div');
+            controlsWrapperDiv.style.cssText = `
+                display: flex;
+                flex-grow: 1;
+                align-items: center;
+                justify-content: flex-end; /* Align checkbox to the right */
+                min-width: 0;
+            `;
+
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.id = `otk-${options.idSuffix}-checkbox`; // Ensure ID is unique and clear
+            checkbox.style.cssText = `
+                height: 16px; /* Standard checkbox size */
+                width: 16px;  /* Standard checkbox size */
+                flex-shrink: 0; /* Prevent checkbox from shrinking */
+            `;
+
+            // Initialize checkbox state
+            const savedValue = localStorage.getItem(options.storageKey);
+            checkbox.checked = (savedValue !== null) ? (savedValue === 'true') : options.defaultValue;
+
+            checkbox.addEventListener('change', () => {
+                saveThemeSetting(options.storageKey, checkbox.checked, options.requiresRerender);
+            });
+
+            controlsWrapperDiv.appendChild(checkbox);
+            group.appendChild(label);
+            group.appendChild(controlsWrapperDiv);
+            return group;
+        }
+
+        // Helper function to create a theme option row
+        function createThemeOptionRow(options) {
+            // options = { labelText, storageKey, cssVariable, defaultValue, inputType ('color'|'number'), unit ('px'|null), min, max, idSuffix }
+            const group = document.createElement('div');
+            // Using Flexbox for more dynamic sizing
+            group.style.cssText = `
+                display: flex;
+                align-items: center; /* Vertically align label and controls-wrapper */
+                gap: 8px; /* Space between label and controls-wrapper */
+                width: 100%;
+                margin-bottom: 5px;
+            `;
+
+            const label = document.createElement('label');
+            label.textContent = options.labelText;
+            label.htmlFor = `otk-${options.idSuffix}`; // Points to the main input (picker or number input)
+            label.style.cssText = `
+                font-size: 12px;
+                text-align: left;
+                flex-basis: 230px; /* Accommodate longest label */
+                flex-shrink: 0; /* Prevent shrinking */
+            `;
+
+            // Create a wrapper for all controls (hex, main input, button)
+            const controlsWrapperDiv = document.createElement('div');
+            controlsWrapperDiv.style.cssText = `
+                display: flex;
+                flex-grow: 1; /* Take remaining space */
+                align-items: center; /* Vertically align controls */
+                gap: 8px; /* Space between controls */
+                min-width: 0; /* Allow shrinking if needed */
+            `;
+
+            let hexInput = null;
+            if (options.inputType === 'color') {
+                hexInput = document.createElement('input');
+                hexInput.type = 'text';
+                hexInput.id = `otk-${options.idSuffix}-hex`;
+                hexInput.style.cssText = `
+                    flex: 1 1 70px; /* flex-grow, flex-shrink, flex-basis */
+                    min-width: 50px;
+                    height: 25px;
+                    box-sizing: border-box;
+                    font-size: 12px;
+                    text-align: right;
+                `;
+            }
+
+            const mainInput = document.createElement('input');
+            mainInput.type = options.inputType;
+            mainInput.id = `otk-${options.idSuffix}`;
+            if (options.inputType === 'color') {
+                mainInput.style.cssText = `
+                    flex-grow: 0;
+                    flex-shrink: 0;
+                    width: 30px; /* Adjusted width */
+                    height: 25px;
+                    padding: 1px; /* Adjusted padding */
+                    box-sizing: border-box;
+                `;
+            } else if (options.inputType === 'number') {
+                mainInput.style.cssText = `
+                    flex: 1 1 60px; /* flex-grow, flex-shrink, flex-basis */
+                    min-width: 40px;
+                    height: 25px;
+                    box-sizing: border-box;
+                    font-size: 12px;
+                `;
+                // Add text-align: right for number inputs created by createThemeOptionRow
+                if (options.inputType === 'number') {
+                    mainInput.style.textAlign = 'right';
+                }
+                if (options.min !== undefined) mainInput.min = options.min;
+                if (options.max !== undefined) mainInput.max = options.max;
+            }
+
+            const defaultBtn = document.createElement('button');
+            defaultBtn.textContent = 'Default';
+            defaultBtn.style.cssText = `
+                flex-grow: 0;
+                flex-shrink: 0;
+                padding: 2px 6px; /* Adjusted padding */
+                height: 25px;
+                font-size: 11px;
+                box-sizing: border-box;
+                width: auto;
+            `;
+
+            group.appendChild(label);
+
+            // Append controls to their wrapper
+            if (hexInput) {
+                controlsWrapperDiv.appendChild(hexInput);
+            }
+            controlsWrapperDiv.appendChild(mainInput);
+            controlsWrapperDiv.appendChild(defaultBtn);
+
+            group.appendChild(controlsWrapperDiv); // Append the wrapper to the main group
+
+            // Determine initial value for inputs
+            let initialValue = getComputedStyle(document.documentElement).getPropertyValue(options.cssVariable)?.trim() || options.defaultValue;
+            if (options.unit && initialValue.endsWith(options.unit)) {
+                initialValue = initialValue.replace(options.unit, '');
+            }
+
+            if (options.inputType === 'color') {
+                if (hexInput) hexInput.value = initialValue;
+                mainInput.value = initialValue; // Color picker also needs full hex
+            } else if (options.inputType === 'number') {
+                mainInput.value = initialValue;
+            }
+
+            // Event handling
+            const updateSetting = (value, fromColorPicker = false) => { // Added fromColorPicker flag
+                let processedValue = value.trim();
+                if (options.inputType === 'color') {
+                    if (processedValue === '') {
+                        // Allow empty string to clear the color
+                    } else if (!/^#[0-9A-F]{6}$/i.test(processedValue) && !/^#[0-9A-F]{3}$/i.test(processedValue)) {
+                        consoleWarn(`Invalid hex color for ${options.labelText}:`, processedValue);
+                        // Restore previous valid values if possible, or default
+                        let currentSaved = options.defaultValue;
+                        try {
+                            currentSaved = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || options.defaultValue;
+                        } catch (e) {
+                            consoleError("Error parsing theme settings from localStorage:", e);
+                        }
+                        if (hexInput) hexInput.value = currentSaved;
+                        mainInput.value = currentSaved;
+                        return;
+                    }
+                    // If the update is coming from the color picker, hexInput.value is already correct via its own listener.
+                    // If the update is from hexInput, update mainInput (color picker).
+                    if (!fromColorPicker && hexInput) mainInput.value = processedValue;
+                    // If the update is from color picker, update hexInput.
+                    if (fromColorPicker && hexInput) hexInput.value = processedValue;
+
+                } else if (options.inputType === 'number') {
+                    const numValue = parseFloat(processedValue);
+                    if (isNaN(numValue) || (options.min !== undefined && numValue < options.min) || (options.max !== undefined && numValue > options.max)) {
+                        consoleWarn(`Invalid number value for ${options.labelText}:`, processedValue);
+                         let currentSaved = options.defaultValue;
+                         try {
+                            currentSaved = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || options.defaultValue;
+                         } catch (e) {
+                            consoleError("Error parsing theme settings from localStorage:", e);
+                         }
+                        mainInput.value = currentSaved.replace(options.unit || '', '');
+                        return;
+                    }
+                    mainInput.value = numValue; // Update input with validated number
+                    processedValue = numValue + (options.unit || '');
+                }
+
+                if (options.storageKey === 'viewerQuote1HeaderBorderColor' || options.storageKey === 'viewerQuote2plusHeaderBorderColor') {
+                    consoleLog(`[Debug UpdateSetting] Applying to ${options.cssVariable}: ${processedValue} (StorageKey: ${options.storageKey})`);
+                }
+
+                document.documentElement.style.setProperty(options.cssVariable, processedValue || 'transparent');
+                saveThemeSetting(options.storageKey, processedValue);
+                // If this is the cog icon color, update it directly as it's not part of applyThemeSettings' normal flow for self-update
+                if (options.storageKey === 'cogIconColor') {
+                     const cogIcon = document.getElementById('otk-settings-cog');
+                     if(cogIcon) cogIcon.style.color = processedValue;
+                }
+            };
+
+            if (hexInput) { // For color inputs
+                hexInput.addEventListener('input', (e) => { // Real-time update from hex input to color picker
+                    const hexValue = e.target.value.trim();
+                    // Basic validation for a complete hex code (3, 4, 6, or 8 digits after #)
+                    if (/^#([0-9A-F]{3}|[0-9A-F]{4}|[0-9A-F]{6}|[0-9A-F]{8})$/i.test(hexValue)) {
+                        mainInput.value = hexValue;
+                    }
+                    // The 'change' listener below will handle full validation and saving.
+                });
+                hexInput.addEventListener('change', (e) => updateSetting(e.target.value, false)); // Fire on change (blur/enter) for saving
+
+                mainInput.addEventListener('input', (e) => { // Color picker updates continuously
+                    const pickerValue = e.target.value;
+                    // Update hex field immediately as picker changes, assuming pickerValue is standard hex
+                    if (pickerValue.startsWith('#')) { // Basic check that it's likely a hex color string
+                        hexInput.value = pickerValue;
+                    } else {
+                        // This case should ideally not happen with standard browser behavior.
+                        // If pickerValue is not hex (e.g., 'rgb(r,g,b)'), we might need to convert it or log an error.
+                        // For now, we'll only update hexInput if it looks like hex.
+                        // The robust validation and saving happens on 'change'.
+                        consoleWarn(`Color picker returned non-hex value during input: ${pickerValue}. Hex field not updated in real-time.`);
+                    }
+
+                    // Call updateSetting to apply the change to CSS variables etc.
+                    // updateSetting itself will validate the hex code before applying it.
+                    updateSetting(pickerValue, true); // Pass flag true
+                });
+            } else { // For number inputs
+                mainInput.addEventListener('change', (e) => updateSetting(e.target.value));
+            }
+
+            defaultBtn.addEventListener('click', () => {
+                document.documentElement.style.removeProperty(options.cssVariable); // Reverts to CSS default
+                let cssDefaultValue = getComputedStyle(document.documentElement).getPropertyValue(options.cssVariable)?.trim() || options.defaultValue;
+
+                if (options.unit && cssDefaultValue.endsWith(options.unit)) {
+                    cssDefaultValue = cssDefaultValue.replace(options.unit, '');
+                }
+                if (options.inputType === 'color') {
+                    if (hexInput) hexInput.value = cssDefaultValue;
+                    mainInput.value = cssDefaultValue;
+                } else {
+                    mainInput.value = cssDefaultValue;
+                }
+                saveThemeSetting(options.storageKey, null, options.requiresRerender);
+                // If this is the cog icon color, update it directly
+                if (options.storageKey === 'cogIconColor') {
+                     const cogIcon = document.getElementById('otk-settings-cog');
+                     if(cogIcon) cogIcon.style.color = ''; // Clear inline style to use CSS var
+                }
+            });
+            // Initial application from saved settings (if any) is handled by applyThemeSettings call later.
+            // This function just sets up the row and its default state based on current CSS or fallback.
+            return group;
+        }
+
+        function createDivider() {
+            const hr = document.createElement('hr');
+            hr.style.cssText = "width: 100%; border: none; border-top: 1px solid #555; margin: 12px 0 8px 0;";
+            return hr;
+        }
+
+        function createSectionHeading(text) {
+            const h = document.createElement('h5');
+            h.textContent = text;
+            // Adjusted margins for more space, removed border-bottom
+            h.style.cssText = "margin-top: 10px; margin-bottom: 6px; color: #cccccc; font-size: 13px; padding-bottom: 4px; font-weight: bold; text-align: left;";
+            return h;
+        }
+
+        // Clear existing content from themeOptionsContainer before repopulating
+        themeOptionsContainer.innerHTML = '';
+
+        // --- GUI Section ---
+        const guiSectionHeading = createSectionHeading('GUI');
+        guiSectionHeading.style.marginTop = "0px"; // First heading doesn't need extra top margin
+        guiSectionHeading.style.marginBottom = "18px"; // Increased bottom margin for specific space after GUI heading
+        themeOptionsContainer.appendChild(guiSectionHeading);
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Title Text:", storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'title-text' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Thread Titles Text:", storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Thread Times Text:", storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Stats Text:", storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Stats Dash:", storageKey: 'statsDashColor', cssVariable: '--otk-stats-dash-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'stats-dash' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Text:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Cog Icon:", storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Countdown Background:", storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Countdown Label Text:", storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Countdown Timer Text:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Separator:", storageKey: 'separatorColor', cssVariable: '--otk-separator-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'separator' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Background:", storageKey: 'clockBgColor', cssVariable: '--otk-clock-bg-color', defaultValue: '', inputType: 'color', idSuffix: 'clock-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Text:", storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Border:", storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-border' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Divider:", storageKey: 'clockDividerColor', cssVariable: '--otk-clock-divider-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-divider' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Search Background:", storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Search Text:", storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }));
+
+        // Sub-section for GUI Buttons
+        const guiButtonsSubHeading = document.createElement('h6');
+        guiButtonsSubHeading.textContent = "GUI Buttons";
+        guiButtonsSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;"; // Increased margin-top and margin-bottom
+        themeOptionsContainer.appendChild(guiButtonsSubHeading);
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Border:", storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Hover Background:", storageKey: 'guiButtonHoverBgColor', cssVariable: '--otk-button-hover-bg-color', defaultValue: '#666666', inputType: 'color', idSuffix: 'gui-button-hover-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Active Background:", storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' }));
+
+        // themeOptionsContainer.appendChild(createDivider()); // Removed divider
+
+        // --- GUI Background Section ---
+        const guiBackgroundSubHeading = document.createElement('h6');
+        guiBackgroundSubHeading.textContent = "GUI Background";
+        guiBackgroundSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;";
+        themeOptionsContainer.appendChild(guiBackgroundSubHeading);
+
+        function createTextInputRow(options) {
+            const group = document.createElement('div');
+            group.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+            const label = document.createElement('label');
+            label.textContent = options.labelText;
+            label.htmlFor = `otk-${options.idSuffix}-input`;
+            label.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+            const controlsWrapperDiv = document.createElement('div');
+            controlsWrapperDiv.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.id = `otk-${options.idSuffix}-input`;
+            input.placeholder = options.placeholder || '';
+            input.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
+            input.value = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || '';
+            input.addEventListener('change', () => {
+                saveThemeSetting(options.storageKey, input.value, true);
+            });
+            controlsWrapperDiv.appendChild(input);
+            group.appendChild(label);
+            group.appendChild(controlsWrapperDiv);
+            return group;
+        }
+
+        themeOptionsContainer.appendChild(createTextInputRow({
+            labelText: 'Background Image URL:',
+            storageKey: 'guiBackgroundImageUrl',
+            idSuffix: 'gui-bg-image-url',
+            placeholder: 'Enter image URL'
+        }));
+
+        function createDropdownRow(options) {
+            const group = document.createElement('div');
+            group.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+            const label = document.createElement('label');
+            label.textContent = options.labelText;
+            label.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+            const controlsWrapperDiv = document.createElement('div');
+            controlsWrapperDiv.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
+            const select = document.createElement('select');
+            select.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px;";
+            options.options.forEach(opt => {
+                const optionElement = document.createElement('option');
+                optionElement.value = opt;
+                optionElement.textContent = opt;
+                select.appendChild(optionElement);
+            });
+            select.value = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || options.defaultValue;
+            select.addEventListener('change', () => {
+                saveThemeSetting(options.storageKey, select.value, true);
+            });
+            controlsWrapperDiv.appendChild(select);
+            group.appendChild(label);
+            group.appendChild(controlsWrapperDiv);
+            return group;
+        }
+
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Background Size:',
+            storageKey: 'guiBgSize',
+            options: ['auto', 'cover', 'contain'],
+            defaultValue: 'cover'
+        }));
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Background Repeat:',
+            storageKey: 'guiBgRepeat',
+            options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
+            defaultValue: 'no-repeat'
+        }));
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Background Position:',
+            storageKey: 'guiBgPosition',
+            options: ['center', 'top', 'bottom', 'left', 'right'],
+            defaultValue: 'center'
+        }));
+
+        // --- Viewer Section ---
+        const viewerSectionHeading = createSectionHeading('Viewer');
+        viewerSectionHeading.style.marginTop = "22px"; // Increased top margin for space before Viewer heading
+        viewerSectionHeading.style.marginBottom = "18px"; // Increased bottom margin for space after Viewer heading
+        themeOptionsContainer.appendChild(viewerSectionHeading);
+
+        // Add Message Layout Dropdown to Viewer section (moved to top)
+
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "GUI Bottom Border:", storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'gui-bottom-border' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Divider:", storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-divider' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Text:", storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-font' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "'Blocked Content' Font:", storageKey: 'blockedContentFontColor', cssVariable: '--otk-blocked-content-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'blocked-content-font' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Font Size (px):", storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: true }));
+
+        // Anchor Highlight Colors
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Anchor Highlight Background:", storageKey: 'anchorHighlightBgColor', cssVariable: '--otk-anchor-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'anchor-bg', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Anchor Highlight Border:", storageKey: 'anchorHighlightBorderColor', cssVariable: '--otk-anchor-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'anchor-border', requiresRerender: true }));
+
+        // Icon Colors
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Blur Icon Color:", storageKey: 'blurIconColor', cssVariable: '--otk-blur-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'blur-icon' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Blur Icon Background:", storageKey: 'blurIconBgColor', cssVariable: '--otk-blur-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'blur-icon-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Resize Icon Color:", storageKey: 'resizeIconColor', cssVariable: '--otk-resize-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'resize-icon' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Resize Icon Background:", storageKey: 'resizeIconBgColor', cssVariable: '--otk-resize-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'resize-icon-bg' }));
+
+        const imageBlurSectionHeading = createSectionHeading('Image Blurring');
+        imageBlurSectionHeading.style.marginTop = "22px";
+        imageBlurSectionHeading.style.marginBottom = "18px";
+        themeOptionsContainer.appendChild(imageBlurSectionHeading);
+
+        const blurGroup = document.createElement('div');
+        blurGroup.style.cssText = `
             display: flex;
             align-items: center;
             gap: 8px;
@@ -5372,1421 +6652,1501 @@ function setupOptionsWindow() {
             margin-bottom: 5px;
         `;
 
-        const label = document.createElement('label');
-        label.textContent = options.labelText;
-        label.htmlFor = `otk-${options.idSuffix}-checkbox`;
-        label.style.cssText = `
+        const blurLabel = document.createElement('label');
+        blurLabel.textContent = "Blur Amount (%):";
+        blurLabel.htmlFor = `otk-image-blur-amount`;
+        blurLabel.style.cssText = `
             font-size: 12px;
             text-align: left;
             flex-basis: 230px;
             flex-shrink: 0;
         `;
 
-        const controlsWrapperDiv = document.createElement('div');
-        controlsWrapperDiv.style.cssText = `
+        const blurControlsWrapper = document.createElement('div');
+        blurControlsWrapper.style.cssText = `
             display: flex;
             flex-grow: 1;
             align-items: center;
-            justify-content: flex-end; /* Align checkbox to the right */
+            gap: 8px;
             min-width: 0;
         `;
 
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.id = `otk-${options.idSuffix}-checkbox`; // Ensure ID is unique and clear
-        checkbox.style.cssText = `
-            height: 16px; /* Standard checkbox size */
-            width: 16px;  /* Standard checkbox size */
-            flex-shrink: 0; /* Prevent checkbox from shrinking */
+        const blurInput = document.createElement('input');
+        blurInput.type = 'number';
+        blurInput.id = 'otk-image-blur-amount';
+        blurInput.min = 0;
+        blurInput.max = 100;
+        blurInput.style.cssText = `
+            flex: 1 1 60px;
+            min-width: 40px;
+            height: 25px;
+            box-sizing: border-box;
+            font-size: 12px;
+            text-align: right;
         `;
+        blurInput.value = localStorage.getItem(IMAGE_BLUR_AMOUNT_KEY) || '60';
 
-        // Initialize checkbox state
-        const savedValue = localStorage.getItem(options.storageKey);
-        checkbox.checked = (savedValue !== null) ? (savedValue === 'true') : options.defaultValue;
-
-        checkbox.addEventListener('change', () => {
-            saveThemeSetting(options.storageKey, checkbox.checked, options.requiresRerender);
+        blurInput.addEventListener('change', (e) => {
+            let value = parseInt(e.target.value, 10);
+            if (isNaN(value) || value < 0 || value > 100) {
+                value = 60; // reset to default if invalid
+            }
+            e.target.value = value;
+            localStorage.setItem(IMAGE_BLUR_AMOUNT_KEY, value);
+            consoleLog(`Image blur amount saved: ${value}%`);
         });
 
-        controlsWrapperDiv.appendChild(checkbox);
-        group.appendChild(label);
-        group.appendChild(controlsWrapperDiv);
-        return group;
-    }
-
-    // Helper function to create a theme option row
-    function createThemeOptionRow(options) {
-        // options = { labelText, storageKey, cssVariable, defaultValue, inputType ('color'|'number'), unit ('px'|null), min, max, idSuffix }
-        const group = document.createElement('div');
-        // Using Flexbox for more dynamic sizing
-        group.style.cssText = `
-            display: flex;
-            align-items: center; /* Vertically align label and controls-wrapper */
-            gap: 8px; /* Space between label and controls-wrapper */
-            width: 100%;
-            margin-bottom: 5px;
-        `;
-
-        const label = document.createElement('label');
-        label.textContent = options.labelText;
-        label.htmlFor = `otk-${options.idSuffix}`; // Points to the main input (picker or number input)
-        label.style.cssText = `
-            font-size: 12px;
-            text-align: left;
-            flex-basis: 230px; /* Accommodate longest label */
-            flex-shrink: 0; /* Prevent shrinking */
-        `;
-
-        // Create a wrapper for all controls (hex, main input, button)
-        const controlsWrapperDiv = document.createElement('div');
-        controlsWrapperDiv.style.cssText = `
-            display: flex;
-            flex-grow: 1; /* Take remaining space */
-            align-items: center; /* Vertically align controls */
-            gap: 8px; /* Space between controls */
-            min-width: 0; /* Allow shrinking if needed */
-        `;
-
-        let hexInput = null;
-        if (options.inputType === 'color') {
-            hexInput = document.createElement('input');
-            hexInput.type = 'text';
-            hexInput.id = `otk-${options.idSuffix}-hex`;
-            hexInput.style.cssText = `
-                flex: 1 1 70px; /* flex-grow, flex-shrink, flex-basis */
-                min-width: 50px;
-                height: 25px;
-                box-sizing: border-box;
-                font-size: 12px;
-                text-align: right;
-            `;
-        }
-
-        const mainInput = document.createElement('input');
-        mainInput.type = options.inputType;
-        mainInput.id = `otk-${options.idSuffix}`;
-        if (options.inputType === 'color') {
-            mainInput.style.cssText = `
-                flex-grow: 0;
-                flex-shrink: 0;
-                width: 30px; /* Adjusted width */
-                height: 25px;
-                padding: 1px; /* Adjusted padding */
-                box-sizing: border-box;
-            `;
-        } else if (options.inputType === 'number') {
-            mainInput.style.cssText = `
-                flex: 1 1 60px; /* flex-grow, flex-shrink, flex-basis */
-                min-width: 40px;
-                height: 25px;
-                box-sizing: border-box;
-                font-size: 12px;
-            `;
-            // Add text-align: right for number inputs created by createThemeOptionRow
-            if (options.inputType === 'number') {
-                mainInput.style.textAlign = 'right';
-            }
-            if (options.min !== undefined) mainInput.min = options.min;
-            if (options.max !== undefined) mainInput.max = options.max;
-        }
-
-        const defaultBtn = document.createElement('button');
-        defaultBtn.textContent = 'Default';
-        defaultBtn.style.cssText = `
+        const blurDefaultBtn = document.createElement('button');
+        blurDefaultBtn.textContent = 'Default';
+        blurDefaultBtn.style.cssText = `
             flex-grow: 0;
             flex-shrink: 0;
-            padding: 2px 6px; /* Adjusted padding */
+            padding: 2px 6px;
             height: 25px;
             font-size: 11px;
             box-sizing: border-box;
             width: auto;
         `;
 
-        group.appendChild(label);
-
-        // Append controls to their wrapper
-        if (hexInput) {
-            controlsWrapperDiv.appendChild(hexInput);
-        }
-        controlsWrapperDiv.appendChild(mainInput);
-        controlsWrapperDiv.appendChild(defaultBtn);
-
-        group.appendChild(controlsWrapperDiv); // Append the wrapper to the main group
-
-        // Determine initial value for inputs
-        let initialValue = getComputedStyle(document.documentElement).getPropertyValue(options.cssVariable)?.trim() || options.defaultValue;
-        if (options.unit && initialValue.endsWith(options.unit)) {
-            initialValue = initialValue.replace(options.unit, '');
-        }
-
-        if (options.inputType === 'color') {
-            if (hexInput) hexInput.value = initialValue;
-            mainInput.value = initialValue; // Color picker also needs full hex
-        } else if (options.inputType === 'number') {
-            mainInput.value = initialValue;
-        }
-
-        // Event handling
-        const updateSetting = (value, fromColorPicker = false) => { // Added fromColorPicker flag
-            let processedValue = value.trim();
-            if (options.inputType === 'color') {
-                if (!/^#[0-9A-F]{6}$/i.test(processedValue) && !/^#[0-9A-F]{3}$/i.test(processedValue)) {
-                    consoleWarn(`Invalid hex color for ${options.labelText}:`, processedValue);
-                    // Restore previous valid values if possible, or default
-                    let currentSaved = options.defaultValue;
-                    try {
-                        currentSaved = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || options.defaultValue;
-                    } catch (e) {
-                        consoleError("Error parsing theme settings from localStorage:", e);
-                    }
-                    if (hexInput) hexInput.value = currentSaved;
-                    mainInput.value = currentSaved;
-                    return;
-                }
-                // If the update is coming from the color picker, hexInput.value is already correct via its own listener.
-                // If the update is from hexInput, update mainInput (color picker).
-                if (!fromColorPicker && hexInput) mainInput.value = processedValue;
-                // If the update is from color picker, update hexInput.
-                if (fromColorPicker && hexInput) hexInput.value = processedValue;
-
-            } else if (options.inputType === 'number') {
-                const numValue = parseInt(processedValue, 10);
-                if (isNaN(numValue) || (options.min !== undefined && numValue < options.min) || (options.max !== undefined && numValue > options.max)) {
-                    consoleWarn(`Invalid number value for ${options.labelText}:`, processedValue);
-                     let currentSaved = options.defaultValue;
-                     try {
-                        currentSaved = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || options.defaultValue;
-                     } catch (e) {
-                        consoleError("Error parsing theme settings from localStorage:", e);
-                     }
-                    mainInput.value = currentSaved.replace(options.unit || '', '');
-                    return;
-                }
-                mainInput.value = numValue; // Update input with validated number
-                processedValue = numValue + (options.unit || '');
-            }
-
-            if (options.storageKey === 'viewerQuote1HeaderBorderColor' || options.storageKey === 'viewerQuote2plusHeaderBorderColor') {
-                consoleLog(`[Debug UpdateSetting] Applying to ${options.cssVariable}: ${processedValue} (StorageKey: ${options.storageKey})`);
-            }
-
-            document.documentElement.style.setProperty(options.cssVariable, processedValue);
-            saveThemeSetting(options.storageKey, processedValue);
-            // If this is the cog icon color, update it directly as it's not part of applyThemeSettings' normal flow for self-update
-            if (options.storageKey === 'cogIconColor') {
-                 const cogIcon = document.getElementById('otk-settings-cog');
-                 if(cogIcon) cogIcon.style.color = processedValue;
-            }
-        };
-
-        if (hexInput) { // For color inputs
-            hexInput.addEventListener('input', (e) => { // Real-time update from hex input to color picker
-                const hexValue = e.target.value.trim();
-                // Basic validation for a complete hex code (3, 4, 6, or 8 digits after #)
-                if (/^#([0-9A-F]{3}|[0-9A-F]{4}|[0-9A-F]{6}|[0-9A-F]{8})$/i.test(hexValue)) {
-                    mainInput.value = hexValue;
-                }
-                // The 'change' listener below will handle full validation and saving.
-            });
-            hexInput.addEventListener('change', (e) => updateSetting(e.target.value, false)); // Fire on change (blur/enter) for saving
-
-            mainInput.addEventListener('input', (e) => { // Color picker updates continuously
-                const pickerValue = e.target.value;
-                // Update hex field immediately as picker changes, assuming pickerValue is standard hex
-                if (pickerValue.startsWith('#')) { // Basic check that it's likely a hex color string
-                    hexInput.value = pickerValue;
-                } else {
-                    // This case should ideally not happen with standard browser behavior.
-                    // If pickerValue is not hex (e.g., 'rgb(r,g,b)'), we might need to convert it or log an error.
-                    // For now, we'll only update hexInput if it looks like hex.
-                    // The robust validation and saving happens on 'change'.
-                    consoleWarn(`Color picker returned non-hex value during input: ${pickerValue}. Hex field not updated in real-time.`);
-                }
-
-                // Call updateSetting to apply the change to CSS variables etc.
-                // updateSetting itself will validate the hex code before applying it.
-                updateSetting(pickerValue, true); // Pass flag true
-            });
-        } else { // For number inputs
-            mainInput.addEventListener('change', (e) => updateSetting(e.target.value));
-        }
-
-        defaultBtn.addEventListener('click', () => {
-            document.documentElement.style.removeProperty(options.cssVariable); // Reverts to CSS default
-            let cssDefaultValue = getComputedStyle(document.documentElement).getPropertyValue(options.cssVariable)?.trim() || options.defaultValue;
-
-            if (options.unit && cssDefaultValue.endsWith(options.unit)) {
-                cssDefaultValue = cssDefaultValue.replace(options.unit, '');
-            }
-            if (options.inputType === 'color') {
-                if (hexInput) hexInput.value = cssDefaultValue;
-                mainInput.value = cssDefaultValue;
-            } else {
-                mainInput.value = cssDefaultValue;
-            }
-            saveThemeSetting(options.storageKey, null, options.requiresRerender);
-            // If this is the cog icon color, update it directly
-            if (options.storageKey === 'cogIconColor') {
-                 const cogIcon = document.getElementById('otk-settings-cog');
-                 if(cogIcon) cogIcon.style.color = ''; // Clear inline style to use CSS var
-            }
-        });
-        // Initial application from saved settings (if any) is handled by applyThemeSettings call later.
-        // This function just sets up the row and its default state based on current CSS or fallback.
-        return group;
-    }
-
-    function createDivider() {
-        const hr = document.createElement('hr');
-        hr.style.cssText = "width: 100%; border: none; border-top: 1px solid #555; margin: 12px 0 8px 0;";
-        return hr;
-    }
-
-    function createSectionHeading(text) {
-        const h = document.createElement('h5');
-        h.textContent = text;
-        // Adjusted margins for more space, removed border-bottom
-        h.style.cssText = "margin-top: 10px; margin-bottom: 6px; color: #cccccc; font-size: 13px; padding-bottom: 4px; font-weight: bold; text-align: left;";
-        return h;
-    }
-
-    // Clear existing content from themeOptionsContainer before repopulating
-    themeOptionsContainer.innerHTML = '';
-
-    // --- GUI Section ---
-    const guiSectionHeading = createSectionHeading('GUI');
-    guiSectionHeading.style.marginTop = "0px"; // First heading doesn't need extra top margin
-    guiSectionHeading.style.marginBottom = "18px"; // Increased bottom margin for specific space after GUI heading
-    themeOptionsContainer.appendChild(guiSectionHeading);
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Title Text:", storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'title-text' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Thread Titles Text:", storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Thread Times Text:", storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Stats Text:", storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Text:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Cog Icon:", storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Disable Background Update Text:", storageKey: 'disableBgFontColor', cssVariable: '--otk-disable-bg-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'disable-bg-font' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Countdown Timer Text:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'countdown-timer-text' }));
-
-    // Sub-section for GUI Buttons
-    const guiButtonsSubHeading = document.createElement('h6');
-    guiButtonsSubHeading.textContent = "GUI Buttons";
-    guiButtonsSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;"; // Increased margin-top and margin-bottom
-    themeOptionsContainer.appendChild(guiButtonsSubHeading);
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Border:", storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Hover Background:", storageKey: 'guiButtonHoverBgColor', cssVariable: '--otk-button-hover-bg-color', defaultValue: '#666666', inputType: 'color', idSuffix: 'gui-button-hover-bg' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Active Background:", storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' }));
-
-    // themeOptionsContainer.appendChild(createDivider()); // Removed divider
-
-    // --- Viewer Section ---
-    const viewerSectionHeading = createSectionHeading('Viewer');
-    viewerSectionHeading.style.marginTop = "22px"; // Increased top margin for space before Viewer heading
-    viewerSectionHeading.style.marginBottom = "18px"; // Increased bottom margin for space after Viewer heading
-    themeOptionsContainer.appendChild(viewerSectionHeading);
-
-    // Add Message Layout Dropdown to Viewer section (moved to top)
-    // Add Message Layout Dropdown to Viewer section (moved to top)
-    const layoutSettingKey = 'otkMessageLayoutStyle';
-    const currentLayout = localStorage.getItem(layoutSettingKey) || 'default';
-    const layoutDropdownGroup = document.createElement('div');
-    // Using Flexbox to align with createThemeOptionRow
-    layoutDropdownGroup.style.cssText = `
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        width: 100%;
-        margin-bottom: 5px;
-    `;
-
-    const layoutDropdownLabel = document.createElement('label');
-    layoutDropdownLabel.textContent = "Message Layout:";
-    layoutDropdownLabel.htmlFor = 'otk-message-layout-dropdown';
-    layoutDropdownLabel.style.cssText = `
-        font-size: 12px;
-        text-align: left;
-        flex-basis: 230px; /* Consistent with createThemeOptionRow */
-        flex-shrink: 0;   /* Consistent with createThemeOptionRow */
-    `;
-
-    const controlsWrapperForDropdown = document.createElement('div');
-    controlsWrapperForDropdown.style.cssText = `
-        display: flex;
-        flex-grow: 1;
-        align-items: center;
-    `;
-
-    const messageLayoutDropdown = document.createElement('select');
-    messageLayoutDropdown.id = 'otk-message-layout-dropdown';
-    messageLayoutDropdown.style.cssText = `
-        flex-grow: 1; /* Allow dropdown to take available space in its wrapper */
-        height: 25px;
-        box-sizing: border-box;
-        font-size: 12px;
-        text-align: center; /* Attempt to center-align selected text */
-        text-align-last: center; /* For some browsers */
-        /* direction: ltr; */ /* Ensure default or ltr if issues with arrow */
-    `;
-
-    const layoutOptions = [
-        { label: 'Default', value: 'default' },
-        { label: 'New Design', value: 'new_design' }
-    ];
-
-    layoutOptions.forEach(opt => {
-        const optionElement = document.createElement('option');
-        optionElement.value = opt.value;
-        optionElement.textContent = opt.label;
-        if (currentLayout === opt.value) {
-            optionElement.selected = true;
-        }
-        messageLayoutDropdown.appendChild(optionElement);
-    });
-
-    messageLayoutDropdown.addEventListener('change', () => {
-        const selectedLayout = messageLayoutDropdown.value;
-            saveThemeSetting(layoutSettingKey, selectedLayout, true);
-    });
-
-    layoutDropdownGroup.appendChild(layoutDropdownLabel);
-    controlsWrapperForDropdown.appendChild(messageLayoutDropdown); // Add dropdown to its wrapper
-    layoutDropdownGroup.appendChild(controlsWrapperForDropdown); // Add wrapper to the group
-    themeOptionsContainer.appendChild(layoutDropdownGroup); // Appended first in Viewer section
-
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "GUI Bottom Border:", storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#555', inputType: 'color', idSuffix: 'gui-bottom-border' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Divider:", storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'new-msg-divider' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Text:", storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'new-msg-font' }));
-
-    // Anchor Highlight Colors
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Anchor Highlight Background:", storageKey: 'anchorHighlightBgColor', cssVariable: '--otk-anchor-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'anchor-bg', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Anchor Highlight Border:", storageKey: 'anchorHighlightBorderColor', cssVariable: '--otk-anchor-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'anchor-border', requiresRerender: true }));
-
-    const tweetEmbedModeGroup = document.createElement('div');
-    tweetEmbedModeGroup.style.cssText = `
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        width: 100%;
-        margin-bottom: 5px;
-    `;
-    const tweetEmbedModeLabel = document.createElement('label');
-    tweetEmbedModeLabel.textContent = "Tweet Embeds:";
-    tweetEmbedModeLabel.htmlFor = 'otk-tweet-embed-mode-dropdown';
-    tweetEmbedModeLabel.style.cssText = `
-        font-size: 12px;
-        text-align: left;
-        flex-basis: 230px;
-        flex-shrink: 0;
-    `;
-    const tweetEmbedModeControlsWrapper = document.createElement('div');
-    tweetEmbedModeControlsWrapper.style.cssText = `
-        display: flex;
-        flex-grow: 1;
-        align-items: center;
-    `;
-    const tweetEmbedModeDropdown = document.createElement('select');
-    tweetEmbedModeDropdown.id = 'otk-tweet-embed-mode-dropdown';
-    tweetEmbedModeDropdown.style.cssText = `
-        flex-grow: 1;
-        height: 25px;
-        box-sizing: border-box;
-        font-size: 12px;
-        text-align: center;
-        text-align-last: center;
-    `;
-    const tweetEmbedOptions = [
-        { label: 'Disabled', value: 'disabled' },
-        { label: 'Default', value: 'default' },
-        { label: 'Dark Mode', value: 'dark' }
-    ];
-    tweetEmbedOptions.forEach(opt => {
-        const optionElement = document.createElement('option');
-        optionElement.value = opt.value;
-        optionElement.textContent = opt.label;
-        tweetEmbedModeDropdown.appendChild(optionElement);
-    });
-    tweetEmbedModeDropdown.value = localStorage.getItem(TWEET_EMBED_MODE_KEY) || 'default';
-    tweetEmbedModeDropdown.addEventListener('change', () => {
-        saveThemeSetting(TWEET_EMBED_MODE_KEY, tweetEmbedModeDropdown.value, true);
-    });
-    tweetEmbedModeGroup.appendChild(tweetEmbedModeLabel);
-    tweetEmbedModeControlsWrapper.appendChild(tweetEmbedModeDropdown);
-    tweetEmbedModeGroup.appendChild(tweetEmbedModeControlsWrapper);
-    themeOptionsContainer.appendChild(tweetEmbedModeGroup);
-
-
-    // --- Message Limiting Feature ---
-    const messageLimitGroup = document.createElement('div');
-    messageLimitGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
-
-    const messageLimitLabel = document.createElement('label');
-    messageLimitLabel.textContent = "Limit Number of Messages:";
-    messageLimitLabel.htmlFor = 'otk-message-limit-checkbox';
-    messageLimitLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
-
-    const messageLimitControlsWrapper = document.createElement('div');
-    messageLimitControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
-
-    const messageLimitCheckbox = document.createElement('input');
-    messageLimitCheckbox.type = 'checkbox';
-    messageLimitCheckbox.id = 'otk-message-limit-checkbox';
-    messageLimitCheckbox.style.cssText = "height: 16px; width: 16px;";
-    messageLimitCheckbox.checked = localStorage.getItem('otkMessageLimitEnabled') === 'true';
-
-    const messageLimitInput = document.createElement('input');
-    messageLimitInput.type = 'number';
-    messageLimitInput.id = 'otk-message-limit-input';
-    messageLimitInput.min = '1';
-    messageLimitInput.style.cssText = "width: 70px; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
-    messageLimitInput.value = localStorage.getItem('otkMessageLimitValue') || '500';
-    messageLimitInput.disabled = !messageLimitCheckbox.checked;
-
-    messageLimitCheckbox.addEventListener('change', () => {
-        const isEnabled = messageLimitCheckbox.checked;
-        localStorage.setItem('otkMessageLimitEnabled', isEnabled);
-        messageLimitInput.disabled = !isEnabled;
-        forceViewerRerenderAfterThemeChange();
-    });
-
-    messageLimitInput.addEventListener('change', () => {
-        localStorage.setItem('otkMessageLimitValue', messageLimitInput.value);
-        if (messageLimitCheckbox.checked) {
-            forceViewerRerenderAfterThemeChange();
-        }
-    });
-
-    messageLimitControlsWrapper.appendChild(messageLimitCheckbox);
-    messageLimitControlsWrapper.appendChild(messageLimitInput);
-    messageLimitGroup.appendChild(messageLimitLabel);
-    messageLimitGroup.appendChild(messageLimitControlsWrapper);
-    themeOptionsContainer.appendChild(messageLimitGroup);
-
-    // themeOptionsContainer.appendChild(createDivider()); // Removed divider
-
-    // --- Messages Section Restructuring ---
-    // Remove old global "Messages" heading and global font size option (done by not adding them back here)
-
-    // --- Depth 0 Messages Section ---
-    const depth0MessagesHeading = createSectionHeading('Depth 0 Messages');
-    depth0MessagesHeading.style.marginTop = "22px";
-    depth0MessagesHeading.style.marginBottom = "18px";
-    themeOptionsContainer.appendChild(depth0MessagesHeading);
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepth0ContentFontSize', cssVariable: '--otk-msg-depth0-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth0-content-fontsize', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepth0BgColor', cssVariable: '--otk-msg-depth0-bg-color', defaultValue: '#343434', inputType: 'color', idSuffix: 'msg-depth0-bg', requiresRerender: true })); // Default for original theme, new theme uses #fff
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepth0TextColor', cssVariable: '--otk-msg-depth0-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-text', requiresRerender: true })); // Default for original theme, new theme uses #333
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepth0HeaderTextColor', cssVariable: '--otk-msg-depth0-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-header-text', requiresRerender: true })); // Default for original theme, new theme uses #555
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerHeaderBorderColor', cssVariable: '--otk-viewer-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Hide Message Underline:", storageKey: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth0-disable-header-underline', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Show Media Filenames:", storageKey: 'otkMsgDepth0DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth0-display-media-filename', requiresRerender: true }));
-
-    // --- Depth 1 Messages Section ---
-    const depth1MessagesHeading = createSectionHeading('Depth 1 Messages');
-    depth1MessagesHeading.style.marginTop = "22px";
-    depth1MessagesHeading.style.marginBottom = "18px";
-    themeOptionsContainer.appendChild(depth1MessagesHeading);
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepth1ContentFontSize', cssVariable: '--otk-msg-depth1-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth1-content-fontsize', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepth1BgColor', cssVariable: '--otk-msg-depth1-bg-color', defaultValue: '#525252', inputType: 'color', idSuffix: 'msg-depth1-bg', requiresRerender: true })); // Default for original theme
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepth1TextColor', cssVariable: '--otk-msg-depth1-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-text', requiresRerender: true })); // Default for original theme
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepth1HeaderTextColor', cssVariable: '--otk-msg-depth1-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-header-text', requiresRerender: true })); // Default for original theme
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerQuote1HeaderBorderColor', cssVariable: '--otk-viewer-quote1-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote1-border', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Hide Message Underline:", storageKey: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth1-disable-header-underline', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Show Media Filenames:", storageKey: 'otkMsgDepth1DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth1-display-media-filename', requiresRerender: true }));
-
-    // --- Depth 2+ Messages Section ---
-    const depth2plusMessagesHeading = createSectionHeading('Depth 2+ Messages');
-    depth2plusMessagesHeading.style.marginTop = "22px";
-    depth2plusMessagesHeading.style.marginBottom = "18px";
-    themeOptionsContainer.appendChild(depth2plusMessagesHeading);
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepth2plusContentFontSize', cssVariable: '--otk-msg-depth2plus-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth2plus-content-fontsize', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepth2plusBgColor', cssVariable: '--otk-msg-depth2plus-bg-color', defaultValue: '#484848', inputType: 'color', idSuffix: 'msg-depth2plus-bg', requiresRerender: true })); // Default for original theme
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepth2plusTextColor', cssVariable: '--otk-msg-depth2plus-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-text', requiresRerender: true })); // Default for original theme
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepth2plusHeaderTextColor', cssVariable: '--otk-msg-depth2plus-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-header-text', requiresRerender: true })); // Default for original theme
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerQuote2plusHeaderBorderColor', cssVariable: '--otk-viewer-quote2plus-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote2plus-border', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Hide Message Underline:", storageKey: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth2plus-disable-header-underline', requiresRerender: true }));
-    themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Show Media Filenames:", storageKey: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth2plus-display-media-filename', requiresRerender: true }));
-
-    // --- Options Panel Section ---
-    const optionsPanelSectionHeading = createSectionHeading('Options Panel');
-    optionsPanelSectionHeading.style.marginTop = "22px"; // Increased top margin
-    optionsPanelSectionHeading.style.marginBottom = "18px"; // Increased bottom margin
-    themeOptionsContainer.appendChild(optionsPanelSectionHeading);
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Panel Text:", storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' }));
-    // themeOptionsContainer.appendChild(createDivider()); // Removed divider
-
-    // --- Loading Screen Sub-Section (within Theme) ---
-    const loadingScreenSubHeading = document.createElement('h6');
-    loadingScreenSubHeading.textContent = "Loading Screen";
-    loadingScreenSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;"; // Increased margin-top and margin-bottom
-    themeOptionsContainer.appendChild(loadingScreenSubHeading);
-
-    // Add Overlay Opacity first
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Overlay Opacity:", storageKey: 'loadingOverlayOpacity', cssVariable: '--otk-loading-overlay-opacity', defaultValue: '0.8', inputType: 'number', min:0.0, max:1.0, step:0.05, idSuffix: 'loading-overlay-opacity' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Overlay Base:", storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'loadingTextColor', cssVariable: '--otk-loading-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-text' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Progress Bar Background:", storageKey: 'loadingProgressBarBgColor', cssVariable: '--otk-loading-progress-bar-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'loading-progress-bg' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Progress Bar Fill:", storageKey: 'loadingProgressBarFillColor', cssVariable: '--otk-loading-progress-bar-fill-color', defaultValue: '#4CAF50', inputType: 'color', idSuffix: 'loading-progress-fill' }));
-    themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Progress Bar Text:", storageKey: 'loadingProgressBarTextColor', cssVariable: '--otk-loading-progress-bar-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-progress-text' }));
-
-    // --- Custom Themes Section ---
-    // themeOptionsContainer.appendChild(createDivider()); // Removed divider
-    const customThemesSectionHeading = createSectionHeading('Custom Themes');
-    customThemesSectionHeading.style.marginTop = "22px"; // Increased top margin
-    customThemesSectionHeading.style.marginBottom = "18px"; // Increased bottom margin
-    themeOptionsContainer.appendChild(customThemesSectionHeading);
-
-    const customThemeActionsWrapper = document.createElement('div');
-    customThemeActionsWrapper.style.cssText = `
-        display: grid;
-        /* Adjusted grid: Col1 (Name/Dropdown), Col2 (Save/Load), Col3 (Delete) */
-        /* Col1 width aims to leave space for Col2 to align with hex inputs */
-        grid-template-columns: calc(238px - 8px) auto auto; /* 238px = 230px label + 8px gap. Subtract internal grid gap. */
-        gap: 8px;
-        align-items: center;
-    `;
-
-    // Name input (Row 1, Col 1)
-    const newThemeNameInput = document.createElement('input');
-    newThemeNameInput.type = 'text';
-    newThemeNameInput.id = 'otk-custom-theme-name-input';
-    newThemeNameInput.placeholder = 'Enter Theme Name';
-    newThemeNameInput.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
-    // No explicit grid-column needed if it's the first element for the first cell
-
-    // Save button (Row 1, Col 2)
-    const saveThemeButton = document.createElement('button');
-    saveThemeButton.id = 'otk-save-custom-theme-btn';
-    saveThemeButton.textContent = 'Save Theme';
-    saveThemeButton.style.cssText = "width: 100%; padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box; grid-column: 2 / 4;"; // Span columns 2 and 3
-    // No explicit grid-column needed if it's the second element for the second cell --> This comment is now misleading, removing
-
-    // Dropdown (Row 2, Col 1)
-    const customThemesDropdown = document.createElement('select');
-    customThemesDropdown.id = 'otk-custom-themes-dropdown';
-    customThemesDropdown.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: center; text-align-last: center;"; // Attempt to center-align
-    // Needs explicit grid-column to go to the next row in the same column
-    customThemesDropdown.style.gridColumn = '1 / 2';
-
-
-    // Load button (Row 2, Col 2)
-    const loadThemeButton = document.createElement('button');
-    loadThemeButton.id = 'otk-load-custom-theme-btn';
-    loadThemeButton.textContent = 'Load';
-    loadThemeButton.style.cssText = "width: 100%; padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box;";
-    loadThemeButton.style.gridColumn = '2 / 3';
-
-    // Delete button (Row 2, Col 3 - or could be Row 1, Col 3 if preferred visually)
-    // For simplicity, let's keep it with Load on Row 2 for now.
-    const deleteThemeButton = document.createElement('button');
-    deleteThemeButton.id = 'otk-delete-custom-theme-btn';
-    deleteThemeButton.textContent = 'Delete';
-    deleteThemeButton.style.cssText = "width: 100%; padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box; background-color: #803333; color: #ffffff;"; // Dark red, white text
-    deleteThemeButton.onmouseover = () => deleteThemeButton.style.backgroundColor = '#a04444';
-    deleteThemeButton.onmouseout = () => deleteThemeButton.style.backgroundColor = '#803333';
-    deleteThemeButton.style.gridColumn = '3 / 4';
-
-    // Append in order for grid flow
-    customThemeActionsWrapper.appendChild(newThemeNameInput);    // R1 C1
-    customThemeActionsWrapper.appendChild(saveThemeButton);      // R1 C2 (now spans C2-C3)
-    // r1c3Placeholder is no longer needed as saveThemeButton spans its cell.
-    // const r1c3Placeholder = document.createElement('div');
-    // customThemeActionsWrapper.appendChild(r1c3Placeholder);
-
-    customThemeActionsWrapper.appendChild(customThemesDropdown); // R2 C1
-    customThemeActionsWrapper.appendChild(loadThemeButton);      // R2 C2
-    customThemeActionsWrapper.appendChild(deleteThemeButton);    // R2 C3
-
-    themeOptionsContainer.appendChild(customThemeActionsWrapper);
-
-    const CUSTOM_THEMES_KEY = 'otkCustomThemes';
-
-    saveThemeButton.addEventListener('click', () => {
-        const themeName = newThemeNameInput.value.trim();
-        if (!themeName) {
-            alert("Please enter a name for the theme.");
-            return;
-        }
-
-        const allConfigs = getAllOptionConfigs();
-        let currentSettings = {};
-        allConfigs.forEach(config => {
-            const value = localStorage.getItem(config.storageKey);
-            if (value !== null) {
-                currentSettings[config.storageKey] = value;
-            }
+        blurDefaultBtn.addEventListener('click', () => {
+            blurInput.value = '60';
+            localStorage.setItem(IMAGE_BLUR_AMOUNT_KEY, '60');
+            consoleLog(`Image blur amount reset to default: 60%`);
         });
 
-        let allCustomThemes = {};
-        try {
-            allCustomThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
-        } catch (e) {
-            consoleError("Error parsing custom themes from localStorage:", e);
-        }
-        allCustomThemes[themeName] = currentSettings;
-        localStorage.setItem(CUSTOM_THEMES_KEY, JSON.stringify(allCustomThemes));
+        blurControlsWrapper.appendChild(blurInput);
+        blurControlsWrapper.appendChild(blurDefaultBtn);
 
-        alert(`Theme "${themeName}" saved!`);
-        populateCustomThemesDropdown();
-    });
+        const clearBlurredBtn = document.createElement('button');
+        clearBlurredBtn.textContent = 'Clear All';
+        clearBlurredBtn.style.cssText = `
+            flex-grow: 0;
+            flex-shrink: 0;
+            padding: 2px 6px;
+            height: 25px;
+            font-size: 11px;
+            box-sizing: border-box;
+            width: auto;
+            background-color: #803333;
+            color: white;
+        `;
+        clearBlurredBtn.onmouseover = () => clearBlurredBtn.style.backgroundColor = '#a04444';
+        clearBlurredBtn.onmouseout = () => clearBlurredBtn.style.backgroundColor = '#803333';
 
-    function populateCustomThemesDropdown() {
-        const dropdown = document.getElementById('otk-custom-themes-dropdown');
-        if (!dropdown) return;
+        clearBlurredBtn.addEventListener('click', () => {
+            if (confirm("Are you sure you want to clear all blurred images? This cannot be undone.")) {
+                blurredImages.clear();
+                localStorage.removeItem(BLURRED_IMAGES_KEY);
 
-        dropdown.innerHTML = ''; // Clear existing options
+                // Remove blur from all currently blurred images on the page
+                const allImagesOnPage = document.querySelectorAll('img[data-filehash]');
+                allImagesOnPage.forEach(img => {
+                    img.style.filter = '';
+                });
 
-        // Add the "Revert to Active" / "Current Settings" option first
-        const revertOption = document.createElement('option');
-        revertOption.value = "__REVERT__"; // Special value
-        revertOption.textContent = "‹ Active Settings ›"; // Display text
-        dropdown.appendChild(revertOption);
-
-        let customThemes = {};
-        try {
-            customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
-        } catch (e) {
-            consoleError("Error parsing custom themes from localStorage:", e);
-        }
-
-        const themeNames = Object.keys(customThemes);
-
-        if (themeNames.length === 0) {
-            // If no custom themes, the "Revert" option might be confusing or lonely.
-            // We can disable it or change its text, or simply let it be.
-            // For now, let it be. User can save a theme to make the list more useful.
-            // Alternatively, add a "No Saved Themes" disabled option after it.
-            const noThemesOption = document.createElement('option');
-            noThemesOption.textContent = "(No Saved Themes)";
-            noThemesOption.disabled = true;
-            dropdown.appendChild(noThemesOption);
-        } else {
-            themeNames.forEach(themeName => {
-                const option = document.createElement('option');
-                option.value = themeName; // Actual theme name
-                option.textContent = themeName;
-                dropdown.appendChild(option);
-            });
-        }
-        dropdown.value = "__REVERT__"; // Ensure the revert option is selected by default
-    }
-    // Initial population of the dropdown when options window is set up
-    populateCustomThemesDropdown();
-
-    let prePreviewSettings = null; // To store settings before previewing a theme
-    let currentlyPreviewingThemeName = null; // To track which theme is being previewed
-
-    customThemesDropdown.addEventListener('change', () => {
-        const selectedValue = customThemesDropdown.value;
-        let customThemes = {};
-        try {
-            customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
-        } catch (e) {
-            consoleError("Error parsing custom themes from localStorage:", e);
-        }
-
-        if (selectedValue === "__REVERT__") {
-            if (prePreviewSettings) {
-                consoleLog("[PreviewTheme] Reverting to pre-preview settings.");
-                applyThemeSettings(prePreviewSettings);
-                currentlyPreviewingThemeName = null;
-            } else {
-                consoleLog("[PreviewTheme] 'Active Settings' selected. Ensuring current active settings are applied.");
-                applyThemeSettings();
-                currentlyPreviewingThemeName = null;
+                consoleLog("Cleared all blurred images.");
+                alert("All blurred images have been cleared.");
             }
-        } else {
-            const themeToPreview = customThemes[selectedValue];
-            if (themeToPreview) {
-                if (currentlyPreviewingThemeName === null) {
-                    prePreviewSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-                    consoleLog("[PreviewTheme] Stored pre-preview settings:", JSON.parse(JSON.stringify(prePreviewSettings)));
-                }
+        });
+        blurControlsWrapper.appendChild(clearBlurredBtn);
 
-                consoleLog(`[PreviewTheme] Previewing theme "${selectedValue}".`);
-                applyThemeSettings(themeToPreview);
-                currentlyPreviewingThemeName = selectedValue;
-            }
-        }
-    });
+        blurGroup.appendChild(blurLabel);
+        blurGroup.appendChild(blurControlsWrapper);
+        themeOptionsContainer.appendChild(blurGroup);
 
-    loadThemeButton.addEventListener('click', () => {
-        const selectedThemeName = customThemesDropdown.value;
-
-        if (selectedThemeName === "__REVERT__" || !selectedThemeName || (customThemesDropdown.selectedOptions[0] && customThemesDropdown.selectedOptions[0].disabled)) {
-            alert("Please select a valid custom theme to load.");
-            return;
-        }
-
-        let customThemes = {};
-        try {
-            customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
-        } catch (e) {
-            consoleError("Error parsing custom themes from localStorage:", e);
-        }
-        const themeToLoad = customThemes[selectedThemeName];
-
-        if (!themeToLoad) {
-            alert(`Error: Could not find the theme "${selectedThemeName}" to load.`);
-            return;
-        }
-
-        consoleLog(`Loading custom theme: "${selectedThemeName}"`);
-
-        // Apply all settings from the loaded theme
-        for (const key in themeToLoad) {
-            if (themeToLoad.hasOwnProperty(key)) {
-                localStorage.setItem(key, themeToLoad[key]);
-            }
-        }
-
-        // Create a temporary theme settings object for applyThemeSettings
-        const tempThemeSettings = { ...themeToLoad };
-        applyThemeSettings(tempThemeSettings);
-
-        // Persist the loaded theme as the active theme
-        localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(themeToLoad));
-
-
-        prePreviewSettings = null;
-        currentlyPreviewingThemeName = null;
-        customThemesDropdown.value = "__REVERT__";
-
-        alert(`Theme "${selectedThemeName}" loaded successfully.`);
-    });
-
-    deleteThemeButton.addEventListener('click', () => {
-        const selectedThemeName = customThemesDropdown.value;
-        if (selectedThemeName === "__REVERT__" || !selectedThemeName || (customThemesDropdown.selectedOptions[0] && customThemesDropdown.selectedOptions[0].disabled)) {
-            alert("Please select a theme to delete.");
-            return;
-        }
-
-        if (!confirm(`Are you sure you want to delete the theme "${selectedThemeName}"? This action cannot be undone.`)) {
-            return;
-        }
-
-        let customThemes = {};
-        try {
-            customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
-        } catch (e) {
-            consoleError("Error parsing custom themes from localStorage:", e);
-        }
-
-        if (customThemes[selectedThemeName]) {
-            delete customThemes[selectedThemeName];
-            localStorage.setItem(CUSTOM_THEMES_KEY, JSON.stringify(customThemes));
-            populateCustomThemesDropdown();
-            alert(`Theme "${selectedThemeName}" deleted successfully!`);
-            consoleLog(`Custom theme "${selectedThemeName}" deleted.`);
-        } else {
-            alert(`Error: Theme "${selectedThemeName}" not found for deletion.`);
-        }
-    });
-
-
-    // --- Reset All Button ---
-    // It should be outside the normal flow of generated options, or the last item.
-    // For now, let's re-add it manually after all generated content.
-    const buttonWrapper = document.createElement('div');
-    buttonWrapper.style.cssText = "display: flex; margin-top: 20px; width: 100%; gap: 8px;";
-
-    const resetAllColorsButton = document.createElement('button');
-    resetAllColorsButton.textContent = "Reset All Colors to Default";
-    resetAllColorsButton.id = 'otk-reset-all-colors-btn'; // Keep ID if applyThemeSettings uses it
-    resetAllColorsButton.style.cssText = "padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box; flex-grow: 1;";
-    buttonWrapper.appendChild(resetAllColorsButton);
-
-    const setAsMainThemeButton = document.createElement('button');
-    setAsMainThemeButton.textContent = "Set as Main Theme";
-    setAsMainThemeButton.id = 'otk-set-main-theme-btn';
-    setAsMainThemeButton.style.cssText = "padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box; flex-grow: 1;";
-    buttonWrapper.appendChild(setAsMainThemeButton);
-
-    themeOptionsContainer.appendChild(buttonWrapper);
-
-    setAsMainThemeButton.addEventListener('click', async () => { // Make async
-        const currentSettings = localStorage.getItem(THEME_SETTINGS_KEY);
-        if (currentSettings) {
-            try {
-                await GM.setValue(MAIN_THEME_KEY, currentSettings); // Use await
-                alert("Current theme set as the main theme.");
-                consoleLog("Main theme saved to GM storage.");
-            } catch (error) {
-                consoleError("Error saving main theme to GM storage:", error);
-                alert("Failed to set the main theme. See console for details.");
-            }
-        } else {
-            alert("No theme settings to set as main.");
-        }
-    });
-
-    // Helper function to get all theme configurations (used by save and reset)
-    function getAllOptionConfigs() {
-        return [
-            // GUI
-            { storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' },
-            { storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'title-text' },
-            { storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' },
-            { storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' },
-            { storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' },
-            { storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' },
-            { storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' },
-            { storageKey: 'disableBgFontColor', cssVariable: '--otk-disable-bg-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'disable-bg-font' },
-            { storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'countdown-timer-text' },
-            // GUI Buttons
-            { storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' },
-            { storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' },
-            { storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' },
-            { storageKey: 'guiButtonHoverBgColor', cssVariable: '--otk-button-hover-bg-color', defaultValue: '#666666', inputType: 'color', idSuffix: 'gui-button-hover-bg' },
-            { storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' },
-            // Viewer
-            { storageKey: 'otkMessageLayoutStyle', defaultValue: 'default', inputType: 'dropdown' },
-            { storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' },
-            { storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#555', inputType: 'color', idSuffix: 'gui-bottom-border' },
-            { storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'new-msg-divider' },
-            { storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'new-msg-font' },
-            { storageKey: 'anchorHighlightBgColor', cssVariable: '--otk-anchor-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'anchor-bg', requiresRerender: true },
-            { storageKey: 'anchorHighlightBorderColor', cssVariable: '--otk-anchor-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'anchor-border', requiresRerender: true },
-            { storageKey: 'otkTweetEmbedMode', defaultValue: 'default', inputType: 'dropdown' },
-            { storageKey: 'otkMessageLimitEnabled', defaultValue: false, inputType: 'checkbox' },
-            { storageKey: 'otkMessageLimitValue', defaultValue: '500', inputType: 'number' },
-            // Depth 0 Messages
-            { storageKey: 'msgDepth0ContentFontSize', cssVariable: '--otk-msg-depth0-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth0-content-fontsize', requiresRerender: true },
-            { storageKey: 'msgDepth0BgColor', cssVariable: '--otk-msg-depth0-bg-color', defaultValue: '#343434', inputType: 'color', idSuffix: 'msg-depth0-bg', requiresRerender: true },
-            { storageKey: 'msgDepth0TextColor', cssVariable: '--otk-msg-depth0-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-text', requiresRerender: true },
-            { storageKey: 'msgDepth0HeaderTextColor', cssVariable: '--otk-msg-depth0-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-header-text', requiresRerender: true },
-            { storageKey: 'viewerHeaderBorderColor', cssVariable: '--otk-viewer-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border', requiresRerender: true },
-            { storageKey: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, inputType: 'checkbox', idSuffix: 'msg-depth0-disable-header-underline', requiresRerender: true },
-            { storageKey: 'otkMsgDepth0DisplayMediaFilename', defaultValue: true, inputType: 'checkbox', idSuffix: 'msg-depth0-display-media-filename', requiresRerender: true },
-            // Depth 1 Messages
-            { storageKey: 'msgDepth1ContentFontSize', cssVariable: '--otk-msg-depth1-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth1-content-fontsize', requiresRerender: true },
-            { storageKey: 'msgDepth1BgColor', cssVariable: '--otk-msg-depth1-bg-color', defaultValue: '#525252', inputType: 'color', idSuffix: 'msg-depth1-bg', requiresRerender: true },
-            { storageKey: 'msgDepth1TextColor', cssVariable: '--otk-msg-depth1-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-text', requiresRerender: true },
-            { storageKey: 'msgDepth1HeaderTextColor', cssVariable: '--otk-msg-depth1-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-header-text', requiresRerender: true },
-            { storageKey: 'viewerQuote1HeaderBorderColor', cssVariable: '--otk-viewer-quote1-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote1-border', requiresRerender: true },
-            { storageKey: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: false, inputType: 'checkbox', idSuffix: 'msg-depth1-disable-header-underline', requiresRerender: true },
-            { storageKey: 'otkMsgDepth1DisplayMediaFilename', defaultValue: true, inputType: 'checkbox', idSuffix: 'msg-depth1-display-media-filename', requiresRerender: true },
-            // Depth 2+ Messages
-            { storageKey: 'msgDepth2plusContentFontSize', cssVariable: '--otk-msg-depth2plus-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth2plus-content-fontsize', requiresRerender: true },
-            { storageKey: 'msgDepth2plusBgColor', cssVariable: '--otk-msg-depth2plus-bg-color', defaultValue: '#484848', inputType: 'color', idSuffix: 'msg-depth2plus-bg', requiresRerender: true },
-            { storageKey: 'msgDepth2plusTextColor', cssVariable: '--otk-msg-depth2plus-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-text', requiresRerender: true },
-            { storageKey: 'msgDepth2plusHeaderTextColor', cssVariable: '--otk-msg-depth2plus-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-header-text', requiresRerender: true },
-            { storageKey: 'viewerQuote2plusHeaderBorderColor', cssVariable: '--otk-viewer-quote2plus-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote2plus-border', requiresRerender: true },
-            { storageKey: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: false, inputType: 'checkbox', idSuffix: 'msg-depth2plus-disable-header-underline', requiresRerender: true },
-            { storageKey: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: true, inputType: 'checkbox', idSuffix: 'msg-depth2plus-display-media-filename', requiresRerender: true },
-            // Options Panel
-            { storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' },
-            // Loading Screen
-            { storageKey: 'loadingOverlayOpacity', cssVariable: '--otk-loading-overlay-opacity', defaultValue: '0.8', inputType: 'number', unit: null, min:0.0, max:1.0, step:0.05, idSuffix: 'loading-overlay-opacity' },
-            { storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' },
-            { storageKey: 'loadingTextColor', cssVariable: '--otk-loading-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-text' },
-            { storageKey: 'loadingProgressBarBgColor', cssVariable: '--otk-loading-progress-bar-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'loading-progress-bg' },
-            { storageKey: 'loadingProgressBarFillColor', cssVariable: '--otk-loading-progress-bar-fill-color', defaultValue: '#4CAF50', inputType: 'color', idSuffix: 'loading-progress-fill' },
-            { storageKey: 'loadingProgressBarTextColor', cssVariable: '--otk-loading-progress-bar-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-progress-text' }
+        const tweetEmbedModeGroup = document.createElement('div');
+        tweetEmbedModeGroup.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            width: 100%;
+            margin-bottom: 5px;
+        `;
+        const tweetEmbedModeLabel = document.createElement('label');
+        tweetEmbedModeLabel.textContent = "Tweet Embeds:";
+        tweetEmbedModeLabel.htmlFor = 'otk-tweet-embed-mode-dropdown';
+        tweetEmbedModeLabel.style.cssText = `
+            font-size: 12px;
+            text-align: left;
+            flex-basis: 230px;
+            flex-shrink: 0;
+        `;
+        const tweetEmbedModeControlsWrapper = document.createElement('div');
+        tweetEmbedModeControlsWrapper.style.cssText = `
+            display: flex;
+            flex-grow: 1;
+            align-items: center;
+        `;
+        const tweetEmbedModeDropdown = document.createElement('select');
+        tweetEmbedModeDropdown.id = 'otk-tweet-embed-mode-dropdown';
+        tweetEmbedModeDropdown.style.cssText = `
+            flex-grow: 1;
+            height: 25px;
+            box-sizing: border-box;
+            font-size: 12px;
+            text-align: center;
+            text-align-last: center;
+        `;
+        const tweetEmbedOptions = [
+            { label: 'Disabled', value: 'disabled' },
+            { label: 'Default', value: 'default' },
+            { label: 'Dark Mode', value: 'dark' }
         ];
-    }
-
-
-    function resetAllThemeSettingsToDefault(promptUser = true) {
-        if (promptUser && !confirm("Are you sure you want to reset all theme settings to their defaults?")) {
-            return;
-        }
-
-        consoleLog("Resetting all theme settings to default...");
-
-        const allOptionConfigs = getAllOptionConfigs();
-        let defaultSettings = {};
-
-        allOptionConfigs.forEach(opt => {
-            localStorage.removeItem(opt.storageKey);
-            defaultSettings[opt.storageKey] = opt.defaultValue;
+        tweetEmbedOptions.forEach(opt => {
+            const optionElement = document.createElement('option');
+            optionElement.value = opt.value;
+            optionElement.textContent = opt.label;
+            tweetEmbedModeDropdown.appendChild(optionElement);
         });
-
-        localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(defaultSettings));
-
-        if (promptUser) {
-            applyThemeSettings();
-            alert("All theme settings have been reset to their defaults.");
-        }
-    }
-
-    resetAllColorsButton.addEventListener('click', () => {
-        resetAllThemeSettingsToDefault(true); // true to prompt user
-    });
-
-    // Event Listeners for cog and close
-    const cogIcon = document.getElementById('otk-settings-cog');
-    if (cogIcon) {
-        cogIcon.addEventListener('click', () => {
-            optionsWindow.style.display = optionsWindow.style.display === 'none' ? 'flex' : 'none';
-            consoleLog("Toggled options window visibility to:", optionsWindow.style.display);
+        tweetEmbedModeDropdown.value = localStorage.getItem(TWEET_EMBED_MODE_KEY) || 'default';
+        tweetEmbedModeDropdown.addEventListener('change', () => {
+            saveThemeSetting(TWEET_EMBED_MODE_KEY, tweetEmbedModeDropdown.value, true);
         });
-    } else {
-        consoleError("Cog icon not found for options window toggle.");
-    }
+        tweetEmbedModeGroup.appendChild(tweetEmbedModeLabel);
+        tweetEmbedModeControlsWrapper.appendChild(tweetEmbedModeDropdown);
+        tweetEmbedModeGroup.appendChild(tweetEmbedModeControlsWrapper);
+        themeOptionsContainer.appendChild(tweetEmbedModeGroup);
 
-    closeButton.addEventListener('click', () => {
-        if (Object.keys(pendingThemeChanges).length > 0) {
-            if (confirm("You have unsaved changes that require a viewer refresh to apply. Do you want to discard them?")) {
-                pendingThemeChanges = {};
-                hideApplyDiscardButtons();
-                applyThemeSettings(); // Re-apply original settings
-            } else {
-                return; // Keep the options window open
+        // themeOptionsContainer.appendChild(createDivider()); // Removed divider
+
+        // --- Messages Section Restructuring ---
+        // Remove old global "Messages" heading and global font size option (done by not adding them back here)
+
+        // --- Depth 0 Messages Section ---
+        const depth0MessagesHeading = createSectionHeading('Depth 0 Messages');
+        depth0MessagesHeading.style.marginTop = "22px";
+        depth0MessagesHeading.style.marginBottom = "18px";
+        themeOptionsContainer.appendChild(depth0MessagesHeading);
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepth0ContentFontSize', cssVariable: '--otk-msg-depth0-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth0-content-fontsize', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepth0BgColor', cssVariable: '--otk-msg-depth0-bg-color', defaultValue: '#343434', inputType: 'color', idSuffix: 'msg-depth0-bg', requiresRerender: true })); // Default for original theme, new theme uses #fff
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepth0TextColor', cssVariable: '--otk-msg-depth0-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-text', requiresRerender: true })); // Default for original theme, new theme uses #333
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepth0HeaderTextColor', cssVariable: '--otk-msg-depth0-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-header-text', requiresRerender: true })); // Default for original theme, new theme uses #555
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerHeaderBorderColor', cssVariable: '--otk-viewer-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Hide Message Underline:", storageKey: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth0-disable-header-underline', requiresRerender: false }));
+        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Show Media Filenames:", storageKey: 'otkMsgDepth0DisplayMediaFilename', defaultValue: false, idSuffix: 'msg-depth0-display-media-filename', requiresRerender: false }));
+
+        // --- Depth 1 Messages Section ---
+        const depth1MessagesHeading = createSectionHeading('Depth 1 Messages');
+        depth1MessagesHeading.style.marginTop = "22px";
+        depth1MessagesHeading.style.marginBottom = "18px";
+        themeOptionsContainer.appendChild(depth1MessagesHeading);
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepth1ContentFontSize', cssVariable: '--otk-msg-depth1-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth1-content-fontsize', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepth1BgColor', cssVariable: '--otk-msg-depth1-bg-color', defaultValue: '#525252', inputType: 'color', idSuffix: 'msg-depth1-bg', requiresRerender: true })); // Default for original theme
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepth1TextColor', cssVariable: '--otk-msg-depth1-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-text', requiresRerender: true })); // Default for original theme
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepth1HeaderTextColor', cssVariable: '--otk-msg-depth1-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-header-text', requiresRerender: true })); // Default for original theme
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerQuote1HeaderBorderColor', cssVariable: '--otk-viewer-quote1-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote1-border', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Hide Message Underline:", storageKey: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: true, idSuffix: 'msg-depth1-disable-header-underline', requiresRerender: false }));
+        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Show Media Filenames:", storageKey: 'otkMsgDepth1DisplayMediaFilename', defaultValue: false, idSuffix: 'msg-depth1-display-media-filename', requiresRerender: false }));
+
+        // --- Depth 2+ Messages Section ---
+        const depth2plusMessagesHeading = createSectionHeading('Depth 2+ Messages');
+        depth2plusMessagesHeading.style.marginTop = "22px";
+        depth2plusMessagesHeading.style.marginBottom = "18px";
+        themeOptionsContainer.appendChild(depth2plusMessagesHeading);
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepth2plusContentFontSize', cssVariable: '--otk-msg-depth2plus-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth2plus-content-fontsize', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepth2plusBgColor', cssVariable: '--otk-msg-depth2plus-bg-color', defaultValue: '#484848', inputType: 'color', idSuffix: 'msg-depth2plus-bg', requiresRerender: true })); // Default for original theme
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepth2plusTextColor', cssVariable: '--otk-msg-depth2plus-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-text', requiresRerender: true })); // Default for original theme
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepth2plusHeaderTextColor', cssVariable: '--otk-msg-depth2plus-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-header-text', requiresRerender: true })); // Default for original theme
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerQuote2plusHeaderBorderColor', cssVariable: '--otk-viewer-quote2plus-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote2plus-border', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Hide Message Underline:", storageKey: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: true, idSuffix: 'msg-depth2plus-disable-header-underline', requiresRerender: false }));
+        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Show Media Filenames:", storageKey: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: false, idSuffix: 'msg-depth2plus-display-media-filename', requiresRerender: false }));
+
+        // --- Options Panel Section ---
+        const optionsPanelSectionHeading = createSectionHeading('Options Panel');
+        optionsPanelSectionHeading.style.marginTop = "22px"; // Increased top margin
+        optionsPanelSectionHeading.style.marginBottom = "18px"; // Increased bottom margin
+        themeOptionsContainer.appendChild(optionsPanelSectionHeading);
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Panel Text:", storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' }));
+
+        // --- Loading Screen Sub-Section (within Theme) ---
+        const loadingScreenSubHeading = document.createElement('h6');
+        loadingScreenSubHeading.textContent = "Loading Screen";
+        loadingScreenSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;"; // Increased margin-top and margin-bottom
+        themeOptionsContainer.appendChild(loadingScreenSubHeading);
+
+        // Add Overlay Opacity first
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Overlay Opacity:", storageKey: 'loadingOverlayOpacity', cssVariable: '--otk-loading-overlay-opacity', defaultValue: '0.8', inputType: 'number', min:0.0, max:1.0, step:0.05, idSuffix: 'loading-overlay-opacity' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Overlay Base:", storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'loadingTextColor', cssVariable: '--otk-loading-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-text' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Progress Bar Background:", storageKey: 'loadingProgressBarBgColor', cssVariable: '--otk-loading-progress-bar-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'loading-progress-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Progress Bar Fill:", storageKey: 'loadingProgressBarFillColor', cssVariable: '--otk-loading-progress-bar-fill-color', defaultValue: '#4CAF50', inputType: 'color', idSuffix: 'loading-progress-fill' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Progress Bar Text:", storageKey: 'loadingProgressBarTextColor', cssVariable: '--otk-loading-progress-bar-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-progress-text' }));
+
+        // --- Custom Themes Section ---
+        // themeOptionsContainer.appendChild(createDivider()); // Removed divider
+        const customThemesSectionHeading = createSectionHeading('Custom Themes');
+        customThemesSectionHeading.style.marginTop = "22px"; // Increased top margin
+        customThemesSectionHeading.style.marginBottom = "18px"; // Increased bottom margin
+        themeOptionsContainer.appendChild(customThemesSectionHeading);
+
+        const customThemeActionsWrapper = document.createElement('div');
+        customThemeActionsWrapper.style.cssText = `
+            display: grid;
+            /* Adjusted grid: Col1 (Name/Dropdown), Col2 (Save/Load), Col3 (Delete) */
+            /* Col1 width aims to leave space for Col2 to align with hex inputs */
+            grid-template-columns: calc(238px - 8px) auto auto; /* 238px = 230px label + 8px gap. Subtract internal grid gap. */
+            gap: 8px;
+            align-items: center;
+        `;
+
+        // Name input (Row 1, Col 1)
+        const newThemeNameInput = document.createElement('input');
+        newThemeNameInput.type = 'text';
+        newThemeNameInput.id = 'otk-custom-theme-name-input';
+        newThemeNameInput.placeholder = 'Enter Theme Name';
+        newThemeNameInput.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
+        // No explicit grid-column needed if it's the first element for the first cell
+
+        // Save button (Row 1, Col 2)
+        const saveThemeButton = document.createElement('button');
+        saveThemeButton.id = 'otk-save-custom-theme-btn';
+        saveThemeButton.textContent = 'Save Theme';
+        saveThemeButton.style.cssText = "width: 100%; padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box; grid-column: 2 / 4;"; // Span columns 2 and 3
+        // No explicit grid-column needed if it's the second element for the second cell --> This comment is now misleading, removing
+
+        // Dropdown (Row 2, Col 1)
+        const customThemesDropdown = document.createElement('select');
+        customThemesDropdown.id = 'otk-custom-themes-dropdown';
+        customThemesDropdown.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: center; text-align-last: center;"; // Attempt to center-align
+        // Needs explicit grid-column to go to the next row in the same column
+        customThemesDropdown.style.gridColumn = '1 / 2';
+
+
+        // Load button (Row 2, Col 2)
+        const loadThemeButton = document.createElement('button');
+        loadThemeButton.id = 'otk-load-custom-theme-btn';
+        loadThemeButton.textContent = 'Load';
+        loadThemeButton.style.cssText = "width: 100%; padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box;";
+        loadThemeButton.style.gridColumn = '2 / 3';
+
+        // Delete button (Row 2, Col 3 - or could be Row 1, Col 3 if preferred visually)
+        // For simplicity, let's keep it with Load on Row 2 for now.
+        const deleteThemeButton = document.createElement('button');
+        deleteThemeButton.id = 'otk-delete-custom-theme-btn';
+        deleteThemeButton.textContent = 'Delete';
+        deleteThemeButton.style.cssText = "width: 100%; padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box; background-color: #803333; color: #ffffff;"; // Dark red, white text
+        deleteThemeButton.onmouseover = () => deleteThemeButton.style.backgroundColor = '#a04444';
+        deleteThemeButton.onmouseout = () => deleteThemeButton.style.backgroundColor = '#803333';
+        deleteThemeButton.style.gridColumn = '3 / 4';
+
+        // Append in order for grid flow
+        customThemeActionsWrapper.appendChild(newThemeNameInput);    // R1 C1
+        customThemeActionsWrapper.appendChild(saveThemeButton);      // R1 C2 (now spans C2-C3)
+        // r1c3Placeholder is no longer needed as saveThemeButton spans its cell.
+        // const r1c3Placeholder = document.createElement('div');
+        // customThemeActionsWrapper.appendChild(r1c3Placeholder);
+
+        customThemeActionsWrapper.appendChild(customThemesDropdown); // R2 C1
+        customThemeActionsWrapper.appendChild(loadThemeButton);      // R2 C2
+        customThemeActionsWrapper.appendChild(deleteThemeButton);    // R2 C3
+
+        themeOptionsContainer.appendChild(customThemeActionsWrapper);
+
+        const CUSTOM_THEMES_KEY = 'otkCustomThemes';
+
+        saveThemeButton.addEventListener('click', () => {
+            const themeName = newThemeNameInput.value.trim();
+            if (!themeName) {
+                alert("Please enter a name for the theme.");
+                return;
             }
-        }
 
-        // Reversion logic for theme preview
-        if (prePreviewSettings) {
-            consoleLog("[OptionsClose] Reverting to pre-preview settings as options window is closing.");
-            applyThemeSettings(prePreviewSettings); // Apply the restored settings without saving
-            prePreviewSettings = null;
-            currentlyPreviewingThemeName = null;
+            let currentSettings = {};
+            try {
+                currentSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+            } catch (e) {
+                consoleError("Error parsing theme settings from localStorage:", e);
+            }
+            let allCustomThemes = {};
+            try {
+                allCustomThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
+            } catch (e) {
+                consoleError("Error parsing custom themes from localStorage:", e);
+            }
+            allCustomThemes[themeName] = currentSettings;
+            localStorage.setItem(CUSTOM_THEMES_KEY, JSON.stringify(allCustomThemes));
+
+            alert(`Theme "${themeName}" saved!`);
+            populateCustomThemesDropdown();
+        });
+
+        function populateCustomThemesDropdown() {
             const dropdown = document.getElementById('otk-custom-themes-dropdown');
-            if (dropdown) {
-                dropdown.value = "__REVERT__";
+            if (!dropdown) return;
+
+            dropdown.innerHTML = ''; // Clear existing options
+
+            // Add the "Revert to Active" / "Current Settings" option first
+            const revertOption = document.createElement('option');
+            revertOption.value = "__REVERT__"; // Special value
+            revertOption.textContent = "‹ Active Settings ›"; // Display text
+            dropdown.appendChild(revertOption);
+
+            let customThemes = {};
+            try {
+                customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
+            } catch (e) {
+                consoleError("Error parsing custom themes from localStorage:", e);
+            }
+
+            const themeNames = Object.keys(customThemes);
+
+            if (themeNames.length === 0) {
+                // If no custom themes, the "Revert" option might be confusing or lonely.
+                // We can disable it or change its text, or simply let it be.
+                // For now, let it be. User can save a theme to make the list more useful.
+                // Alternatively, add a "No Saved Themes" disabled option after it.
+                const noThemesOption = document.createElement('option');
+                noThemesOption.textContent = "(No Saved Themes)";
+                noThemesOption.disabled = true;
+                dropdown.appendChild(noThemesOption);
+            } else {
+                themeNames.forEach(themeName => {
+                    const option = document.createElement('option');
+                    option.value = themeName; // Actual theme name
+                    option.textContent = themeName;
+                    dropdown.appendChild(option);
+                });
+            }
+            dropdown.value = "__REVERT__"; // Ensure the revert option is selected by default
+        }
+        // Initial population of the dropdown when options window is set up
+        populateCustomThemesDropdown();
+
+        let prePreviewSettings = null; // To store settings before previewing a theme
+        let currentlyPreviewingThemeName = null; // To track which theme is being previewed
+
+        customThemesDropdown.addEventListener('change', () => {
+            const selectedValue = customThemesDropdown.value;
+            let customThemes = {};
+            try {
+                customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
+            } catch (e) {
+                consoleError("Error parsing custom themes from localStorage:", e);
+            }
+
+            if (selectedValue === "__REVERT__") {
+                if (prePreviewSettings) {
+                    consoleLog("[PreviewTheme] Reverting to pre-preview settings.");
+                    localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(prePreviewSettings));
+                    applyThemeSettings();
+                    currentlyPreviewingThemeName = null;
+                } else {
+                    consoleLog("[PreviewTheme] 'Active Settings' selected. Ensuring current active settings are applied.");
+                    const activeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+                    localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(activeSettings));
+                    applyThemeSettings();
+                    currentlyPreviewingThemeName = null;
+                }
+            } else {
+                const themeToPreview = customThemes[selectedValue];
+                if (themeToPreview) {
+                    if (currentlyPreviewingThemeName === null) {
+                        prePreviewSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+                        consoleLog("[PreviewTheme] Stored pre-preview settings:", JSON.parse(JSON.stringify(prePreviewSettings)));
+                    }
+                    consoleLog(`[PreviewTheme] Previewing theme "${selectedValue}". Settings:`, JSON.parse(JSON.stringify(themeToPreview)));
+                    localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(themeToPreview));
+                    applyThemeSettings();
+                    currentlyPreviewingThemeName = selectedValue;
+                }
+            }
+        });
+
+            loadThemeButton.addEventListener('click', () => {
+                const selectedValue = customThemesDropdown.value;
+                let customThemes = {};
+                try {
+                    customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
+                } catch (e) {
+                    consoleError("Error parsing custom themes from localStorage:", e);
+                }
+                if (selectedValue && selectedValue !== '__REVERT__') {
+                    const themeToLoad = customThemes[selectedValue];
+                    if (themeToLoad) {
+                        consoleLog(`[LoadTheme] Loading theme "${selectedValue}" and making it active.`);
+                        localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(themeToLoad));
+                        applyThemeSettings(); // Apply and save
+                        prePreviewSettings = null; // Clear pre-preview settings
+                        currentlyPreviewingThemeName = null;
+                        customThemesDropdown.value = '__REVERT__'; // Reset dropdown to the placeholder
+                        alert(`Theme "${selectedValue}" loaded and saved as active.`);
+                    }
+                } else {
+                    alert("Please select a theme to load.");
+                }
+            });
+
+        deleteThemeButton.addEventListener('click', () => {
+            const selectedValue = customThemesDropdown.value;
+            if (selectedValue && selectedValue !== '__REVERT__') {
+                if (confirm(`Are you sure you want to delete the theme "${selectedValue}"?`)) {
+                    let customThemes = {};
+                    try {
+                        customThemes = JSON.parse(localStorage.getItem(CUSTOM_THEMES_KEY)) || {};
+                    } catch (e) {
+                        consoleError("Error parsing custom themes from localStorage:", e);
+                    }
+                    delete customThemes[selectedValue];
+                    localStorage.setItem(CUSTOM_THEMES_KEY, JSON.stringify(customThemes));
+                    populateCustomThemesDropdown();
+                    alert(`Theme "${selectedValue}" deleted.`);
+                }
+            } else {
+                alert("Please select a theme to delete.");
+            }
+        });
+
+
+        // --- Reset All Button ---
+        // It should be outside the normal flow of generated options, or the last item.
+        // For now, let's re-add it manually after all generated content.
+        const buttonWrapper = document.createElement('div');
+        buttonWrapper.style.cssText = "display: flex; margin-top: 20px; width: 100%; gap: 8px;";
+
+        const resetAllColorsButton = document.createElement('button');
+        resetAllColorsButton.textContent = "Reset All Colors to Default";
+        resetAllColorsButton.id = 'otk-reset-all-colors-btn'; // Keep ID if applyThemeSettings uses it
+        resetAllColorsButton.style.cssText = "padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box; flex-grow: 1;";
+        buttonWrapper.appendChild(resetAllColorsButton);
+
+        const setAsMainThemeButton = document.createElement('button');
+        setAsMainThemeButton.textContent = "Set as Main Theme";
+        setAsMainThemeButton.id = 'otk-set-main-theme-btn';
+        setAsMainThemeButton.style.cssText = "padding: 4px 8px; font-size: 11px; height: 25px; box-sizing: border-box; flex-grow: 1;";
+        buttonWrapper.appendChild(setAsMainThemeButton);
+
+        themeOptionsContainer.appendChild(buttonWrapper);
+
+        setAsMainThemeButton.addEventListener('click', async () => {
+            const currentSettings = localStorage.getItem(THEME_SETTINGS_KEY);
+            if (currentSettings) {
+                try {
+                    await GM.setValue(MAIN_THEME_KEY, currentSettings);
+                    alert("Current theme set as the main theme.");
+                    consoleLog("Main theme saved to GM storage.");
+                } catch (error) {
+                    consoleError("Error saving main theme to GM storage:", error);
+                    alert("Failed to set the main theme. See console for details.");
+                }
+            } else {
+                alert("No theme settings to set as main.");
+            }
+        });
+
+        // Helper function to get all theme configurations (used by save and reset)
+        function getAllOptionConfigs() {
+            // Note: labelText is not part of this config object, it's passed directly to createThemeOptionRow.
+            // This function is primarily for mapping storageKey, cssVariable, defaultValue, inputType, etc.
+            // The spelling change from "Color" to "Colour" happens in the createThemeOptionRow calls.
+            return [
+                { storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' },
+                { storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'title-text' },
+                { storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' },
+                { storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' },
+                { storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'actual-stats-text' },
+                { storageKey: 'statsDashColor', cssVariable: '--otk-stats-dash-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'stats-dash' },
+                { storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' },
+                { storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#ffd1a4', inputType: 'color', idSuffix: 'viewer-bg' },
+                { storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'gui-bottom-border' },
+                // { storageKey: 'viewerMessageFontSize', cssVariable: '--otk-viewer-message-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', idSuffix: 'fontsize-message-text' }, // Removed old global
+                // New Depth-Specific Content Font Sizes
+                { storageKey: 'msgDepth0ContentFontSize', cssVariable: '--otk-msg-depth0-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth0-content-fontsize'},
+                { storageKey: 'msgDepth1ContentFontSize', cssVariable: '--otk-msg-depth1-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth1-content-fontsize'},
+                { storageKey: 'msgDepth2plusContentFontSize', cssVariable: '--otk-msg-depth2plus-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth2plus-content-fontsize'},
+                // Existing depth-specific color options (no changes needed to these specific lines, just context for new font sizes)
+                { storageKey: 'msgDepth0BgColor', cssVariable: '--otk-msg-depth0-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth0-bg' },
+                { storageKey: 'msgDepth0TextColor', cssVariable: '--otk-msg-depth0-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth0-text' },
+                { storageKey: 'msgDepth0HeaderTextColor', cssVariable: '--otk-msg-depth0-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth0-header-text' },
+                { storageKey: 'viewerHeaderBorderColor', cssVariable: '--otk-viewer-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border' },
+                { storageKey: 'msgDepth1BgColor', cssVariable: '--otk-msg-depth1-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'msg-depth1-bg' },
+                { storageKey: 'msgDepth1TextColor', cssVariable: '--otk-msg-depth1-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth1-text' },
+                { storageKey: 'msgDepth1HeaderTextColor', cssVariable: '--otk-msg-depth1-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth1-header-text' },
+                { storageKey: 'viewerQuote1HeaderBorderColor', cssVariable: '--otk-viewer-quote1-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote1-border' },
+                { storageKey: 'msgDepth2plusBgColor', cssVariable: '--otk-msg-depth2plus-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth2plus-bg' },
+                { storageKey: 'msgDepth2plusTextColor', cssVariable: '--otk-msg-depth2plus-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth2plus-text' },
+                { storageKey: 'msgDepth2plusHeaderTextColor', cssVariable: '--otk-msg-depth2plus-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth2plus-header-text' },
+                { storageKey: 'viewerQuote2plusHeaderBorderColor', cssVariable: '--otk-viewer-quote2plus-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote2plus-border' },
+                { storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' },
+                { storageKey: 'disableBgFontColor', cssVariable: '--otk-disable-bg-font-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'disable-bg-font' },
+                { storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' },
+                { storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' },
+                { storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' },
+                { storageKey: 'separatorColor', cssVariable: '--otk-separator-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'separator' },
+                { storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' },
+                { storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-divider' },
+                { storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-font' },
+                { storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '12px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: true },
+                { storageKey: 'blockedContentFontColor', cssVariable: '--otk-blocked-content-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'blocked-content-font' },
+
+                // Anchor Highlight Colors
+                { storageKey: 'anchorHighlightBgColor', cssVariable: '--otk-anchor-highlight-bg-color', defaultValue: '#ffd1a4', inputType: 'color', idSuffix: 'anchor-bg' },
+                { storageKey: 'anchorHighlightBorderColor', cssVariable: '--otk-anchor-highlight-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'anchor-border' },
+
+                // Icon Colors
+                { storageKey: 'blurIconColor', cssVariable: '--otk-blur-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'blur-icon' },
+                { storageKey: 'blurIconBgColor', cssVariable: '--otk-blur-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'blur-icon-bg' },
+                { storageKey: 'resizeIconColor', cssVariable: '--otk-resize-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'resize-icon' },
+                { storageKey: 'resizeIconBgColor', cssVariable: '--otk-resize-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'resize-icon-bg' },
+
+                // GUI Button Colours
+                { storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' },
+                { storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' },
+                { storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' },
+                { storageKey: 'guiButtonHoverBgColor', cssVariable: '--otk-button-hover-bg-color', defaultValue: '#666666', inputType: 'color', idSuffix: 'gui-button-hover-bg' },
+                { storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' },
+
+                // Loading Screen Colours
+                { storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' },
+                { storageKey: 'loadingOverlayOpacity', cssVariable: '--otk-loading-overlay-opacity', defaultValue: '1', inputType: 'number', unit: null, min:0.0, max:1.0, step:0.05, idSuffix: 'loading-overlay-opacity' },
+                { storageKey: 'loadingTextColor', cssVariable: '--otk-loading-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-text' },
+                { storageKey: 'loadingProgressBarBgColor', cssVariable: '--otk-loading-progress-bar-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'loading-progress-bg' },
+                { storageKey: 'loadingProgressBarFillColor', cssVariable: '--otk-loading-progress-bar-fill-color', defaultValue: '#4CAF50', inputType: 'color', idSuffix: 'loading-progress-fill' },
+                { storageKey: 'loadingProgressBarTextColor', cssVariable: '--otk-loading-progress-bar-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-progress-text' },
+
+                // Clock Colours
+                { storageKey: 'clockBgColor', cssVariable: '--otk-clock-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'clock-bg' },
+                { storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' },
+                { storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'clock-border' },
+                { storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' },
+                { storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }
+            ];
+        }
+
+        function resetAllThemeSettingsToDefault(promptUser = true) {
+            if (promptUser && !confirm("Are you sure you want to reset all theme settings to their defaults?")) {
+                return;
+            }
+
+            consoleLog("Resetting all theme settings to default...");
+            // Clear the active theme settings from localStorage.
+            localStorage.removeItem(THEME_SETTINGS_KEY);
+
+            const allOptionConfigs = getAllOptionConfigs();
+
+            allOptionConfigs.forEach(opt => {
+                const defaultValue = opt.defaultValue;
+                // Set the CSS variable to the default value.
+                if (opt.cssVariable) {
+                    document.documentElement.style.setProperty(opt.cssVariable, defaultValue);
+                }
+
+                // Update the input fields in the options panel to reflect the default values.
+                const mainInput = document.getElementById(`otk-${opt.idSuffix}`);
+                const hexInput = opt.inputType === 'color' ? document.getElementById(`otk-${opt.idSuffix}-hex`) : null;
+
+                let displayValue = defaultValue;
+                if (opt.unit && displayValue.endsWith(opt.unit)) {
+                    displayValue = displayValue.replace(opt.unit, '');
+                }
+
+                if (mainInput) mainInput.value = displayValue;
+                if (hexInput) hexInput.value = displayValue;
+
+                if (opt.storageKey === 'cogIconColor') {
+                    const cogIcon = document.getElementById('otk-settings-cog');
+                    if (cogIcon) cogIcon.style.color = defaultValue;
+                }
+            });
+
+            // Also reset new boolean settings to their defaults
+            const newBooleanSettings = [
+                { key: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth0-disable-header-underline' },
+                { key: 'otkMsgDepth0DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth0-display-media-filename' },
+                { key: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth1-disable-header-underline' },
+                { key: 'otkMsgDepth1DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth1-display-media-filename' },
+                { key: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth2plus-disable-header-underline' },
+                { key: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth2plus-display-media-filename' }
+            ];
+            newBooleanSettings.forEach(opt => {
+                const checkbox = document.getElementById(`otk-${opt.idSuffix}-checkbox`);
+                if (checkbox) {
+                    checkbox.checked = opt.defaultValue;
+                }
+            });
+
+            // The applyThemeSettings() call is no longer needed here if called by the initiator.
+            // If called from the reset button, it should call it.
+            // Let's call it for the standalone reset case.
+            if (promptUser) {
+                // No need to call applyThemeSettings() as we have manually set all the properties.
+                // Calling it might re-apply old settings from memory before a refresh.
+                forceViewerRerenderAfterThemeChange(); // Force a re-render if the viewer is open.
+                alert("All theme settings have been reset to their defaults.");
             }
         }
 
-        optionsWindow.style.display = 'none';
-        consoleLog("Options window closed.");
+        resetAllColorsButton.addEventListener('click', () => {
+            resetAllThemeSettingsToDefault(true); // true to prompt user
+        });
+
+        // Event Listeners for cog and close
+        const cogIcon = document.getElementById('otk-settings-cog');
+        if (cogIcon) {
+            cogIcon.addEventListener('click', () => {
+                optionsWindow.style.display = optionsWindow.style.display === 'none' ? 'flex' : 'none';
+                        consoleLog("Toggled options window visibility to:", optionsWindow.style.display);
+            });
+        } else {
+                    consoleError("Cog icon not found for options window toggle.");
+        }
+
+        closeButton.addEventListener('click', () => {
+            // Reversion logic for theme preview
+            if (prePreviewSettings) {
+                consoleLog("[OptionsClose] Reverting to pre-preview settings as options window is closing.");
+                localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(prePreviewSettings));
+                applyThemeSettings(); // Apply the restored settings
+
+                prePreviewSettings = null; // Clear the stored pre-preview settings
+                currentlyPreviewingThemeName = null; // Clear the currently previewing theme name
+
+                // Reset dropdown to "Active Settings"
+                const dropdown = document.getElementById('otk-custom-themes-dropdown');
+                if (dropdown) {
+                    dropdown.value = "__REVERT__";
+                }
+            } else {
+                consoleLog("[OptionsClose] No active preview to revert. Closing options window.");
+            }
+
+            optionsWindow.style.display = 'none';
+            consoleLog("Options window closed.");
+        });
+
+        // Make window draggable
+        let isOptionsDragging = false;
+        let optionsOffsetX, optionsOffsetY;
+
+        titleBar.addEventListener('mousedown', (e) => {
+            // Prevent dragging if clicking on the close button itself
+            if (e.target === closeButton || closeButton.contains(e.target) || e.target.tagName === 'BUTTON') {
+                return;
+            }
+            isOptionsDragging = true;
+            optionsOffsetX = e.clientX - optionsWindow.offsetLeft;
+            optionsOffsetY = e.clientY - optionsWindow.offsetTop;
+            titleBar.style.userSelect = 'none'; // Prevent text selection during drag
+            document.body.style.userSelect = 'none'; // Prevent text selection on body during drag
+            consoleLog("Draggable window: mousedown");
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (isOptionsDragging) {
+                let newLeft = e.clientX - optionsOffsetX;
+                let newTop = e.clientY - optionsOffsetY;
+
+                optionsWindow.style.left = newLeft + 'px';
+                optionsWindow.style.top = newTop + 'px';
+            }
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (isOptionsDragging) {
+                isOptionsDragging = false;
+                titleBar.style.userSelect = ''; // Re-enable text selection
+                document.body.style.userSelect = '';
+                consoleLog("Draggable window: mouseup");
+                // Future: save position to localStorage here if desired
+                // localStorage.setItem('otkOptionsWindowPos', JSON.stringify({top: optionsWindow.style.top, left: optionsWindow.style.left}));
+            }
+        });
+
+        consoleLog("Options Window setup complete with drag functionality.");
+    }
+
+    function renderNewFilterView(prefilledRule = '') {
+        const rightContent = document.getElementById('otk-filter-content');
+        if (!rightContent) return;
+
+        rightContent.innerHTML = ''; // Clear content area
+
+        const ruleInput = document.createElement('textarea');
+        ruleInput.id = 'otk-filter-rule-input';
+        ruleInput.style.cssText = 'width: 100%; height: 100px; margin-bottom: 10px;';
+        ruleInput.value = prefilledRule;
+        rightContent.appendChild(ruleInput);
+
+        const buttonContainer = document.createElement('div');
+        buttonContainer.style.cssText = 'display: flex; justify-content: flex-end; gap: 10px;';
+        rightContent.appendChild(buttonContainer);
+
+        const createBtn = createTrackerButton('Create Filter');
+        const createAndCloseBtn = createTrackerButton('Create and Close');
+
+        function handleCreateRule(andClose) {
+            const ruleInput = document.getElementById('otk-filter-rule-input');
+            if (!ruleInput) return;
+            const rule = ruleInput.value.trim();
+            if (rule) {
+                let rules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
+                if (!rules.includes(rule)) {
+                    rules.push(rule);
+                    localStorage.setItem('otkFilterRules', JSON.stringify(rules));
+                    ruleInput.value = ''; // Clear input after successful creation
+                    if (andClose) {
+                        document.getElementById('otk-filter-window').style.display = 'none';
+                    } else {
+                        document.getElementById('otk-filter-content').innerHTML = 'Filter created!';
+                    }
+                } else {
+                    alert('This filter rule already exists.');
+                }
+            }
+        }
+
+        createBtn.addEventListener('click', () => handleCreateRule(false));
+        createAndCloseBtn.addEventListener('click', () => handleCreateRule(true));
+
+        buttonContainer.appendChild(createBtn);
+        buttonContainer.appendChild(createAndCloseBtn);
+
+        const cancelBtn = createTrackerButton('Cancel');
+        cancelBtn.addEventListener('click', () => {
+            rightContent.innerHTML = '';
+        });
+        buttonContainer.appendChild(cancelBtn);
+    }
+// Move this function outside of setupFilterWindow
+function renderFilterList() {
+    const rightContent = document.getElementById('otk-filter-content');
+    if (!rightContent) return;
+    rightContent.innerHTML = '';
+
+    const header = document.createElement('div');
+    header.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;';
+
+    const checkAllContainer = document.createElement('div');
+    const checkAllLabel = document.createElement('label');
+    checkAllLabel.textContent = 'Select All';
+    checkAllLabel.style.marginRight = '5px';
+    const checkAllBox = document.createElement('input');
+    checkAllBox.type = 'checkbox';
+    checkAllContainer.appendChild(checkAllLabel);
+    checkAllContainer.appendChild(checkAllBox);
+    header.appendChild(checkAllContainer);
+
+    const deleteSelectedBtn = createTrackerButton('Delete Selected');
+    deleteSelectedBtn.id = 'otk-delete-selected-filters-btn';
+    deleteSelectedBtn.style.display = 'none';
+    header.appendChild(deleteSelectedBtn);
+
+    rightContent.appendChild(header);
+
+    const ruleListContainer = document.createElement('div');
+    ruleListContainer.style.cssText = 'display: flex; flex-direction: column; max-height: 280px; overflow-y: auto; padding-right: 15px;';
+    rightContent.appendChild(ruleListContainer);
+
+    const rules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
+    if (rules.length === 0) {
+        ruleListContainer.textContent = 'No filter rules saved.';
+        return;
+    }
+
+    rules.forEach((rule, index) => {
+        const ruleDiv = document.createElement('div');
+        ruleDiv.style.cssText = 'display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-top: 1px solid #444;';
+
+        const contentWrapper = document.createElement('div');
+        contentWrapper.style.display = 'flex';
+        contentWrapper.style.alignItems = 'center';
+
+        const parsed = parseFilterRule(rule);
+        let textContent = rule;
+        if (parsed.md5.length > 0 && parsed.text.length > 0) {
+            textContent = parsed.text.join(' ');
+        } else if (parsed.md5.length > 0) {
+            textContent = '';
+        }
+
+        const ruleText = document.createElement('span');
+        ruleText.textContent = textContent;
+        contentWrapper.appendChild(ruleText);
+
+        if (parsed.md5.length > 0 && otkMediaDB) {
+            parsed.md5.forEach(hash => {
+                const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+                const store = transaction.objectStore('mediaStore');
+                const request = store.get(hash);
+                request.onsuccess = (event) => {
+                    const item = event.target.result;
+                    if (item && item.blob) {
+                        const mediaElement = item.ext.toLowerCase().includes('webm') ? document.createElement('video') : document.createElement('img');
+                        mediaElement.src = URL.createObjectURL(item.blob);
+                        if (item.ext.toLowerCase().includes('webm')) mediaElement.controls = true;
+                        mediaElement.style.maxWidth = '100px';
+                        mediaElement.style.maxHeight = '100px';
+                        mediaElement.style.marginLeft = '10px';
+                        contentWrapper.appendChild(mediaElement);
+                    }
+                };
+            });
+        }
+
+        ruleDiv.appendChild(contentWrapper);
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.dataset.ruleIndex = index;
+        checkbox.style.marginLeft = '10px';
+        ruleDiv.appendChild(checkbox);
+        ruleListContainer.appendChild(ruleDiv);
     });
 
-    // Make window draggable
+    const checkboxes = Array.from(ruleListContainer.querySelectorAll('input[type="checkbox"]'));
+    const toggleDeleteButton = () => {
+        const anyChecked = checkboxes.some(cb => cb.checked);
+        deleteSelectedBtn.style.display = anyChecked ? 'inline-block' : 'none';
+    };
+
+    checkboxes.forEach(cb => cb.addEventListener('change', toggleDeleteButton));
+    checkAllBox.addEventListener('change', () => {
+        checkboxes.forEach(cb => cb.checked = checkAllBox.checked);
+        toggleDeleteButton();
+    });
+
+    deleteSelectedBtn.addEventListener('click', () => {
+        let currentRules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
+        const indicesToDelete = checkboxes
+            .filter(cb => cb.checked)
+            .map(cb => parseInt(cb.dataset.ruleIndex, 10));
+
+        const newRules = currentRules.filter((_, index) => !indicesToDelete.includes(index));
+        localStorage.setItem('otkFilterRules', JSON.stringify(newRules));
+        renderFilterList();
+    });
+}
+
+function setupFilterWindow() {
+    consoleLog("Setting up Filter Window...");
+
+    if (document.getElementById('otk-filter-window')) {
+        consoleLog("Filter window already exists.");
+        return;
+    }
+
+    const filterWindow = document.createElement('div');
+    filterWindow.id = 'otk-filter-window';
+    filterWindow.style.cssText = `
+        position: fixed;
+        top: 120px;
+        left: 120px;
+        width: 600px;
+        height: 400px;
+        background-color: #2c2c2c;
+        border: 1px solid #444;
+        border-radius: 5px;
+        z-index: 10001;
+        display: none;
+        flex-direction: column;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+        color: var(--otk-options-text-color);
+    `;
+
+    const titleBar = document.createElement('div');
+    titleBar.style.cssText = `
+        padding: 8px 12px;
+        background-color: #383838;
+        color: #f0f0f0;
+        font-weight: bold;
+        cursor: move;
+        border-bottom: 1px solid #444;
+        border-top-left-radius: 5px;
+        border-top-right-radius: 5px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    `;
+    titleBar.textContent = 'Filter Settings';
+
+    const closeButton = document.createElement('span');
+    closeButton.innerHTML = '&#x2715;';
+    closeButton.style.cssText = 'cursor: pointer; font-size: 16px;';
+    closeButton.addEventListener('click', () => {
+        filterWindow.style.display = 'none';
+    });
+
+    titleBar.appendChild(closeButton);
+    filterWindow.appendChild(titleBar);
+
     let isDragging = false;
     let offsetX, offsetY;
 
     titleBar.addEventListener('mousedown', (e) => {
-        // Prevent dragging if clicking on the close button itself
-        if (e.target === closeButton || closeButton.contains(e.target)) {
-            return;
-        }
+        if (e.target === closeButton) return;
         isDragging = true;
-        offsetX = e.clientX - optionsWindow.offsetLeft;
-        offsetY = e.clientY - optionsWindow.offsetTop;
-        titleBar.style.userSelect = 'none'; // Prevent text selection during drag
-        document.body.style.userSelect = 'none'; // Prevent text selection on body during drag
-        consoleLog("Draggable window: mousedown");
+        offsetX = e.clientX - filterWindow.offsetLeft;
+        offsetY = e.clientY - filterWindow.offsetTop;
+        titleBar.style.userSelect = 'none';
+        document.body.style.userSelect = 'none';
     });
 
     document.addEventListener('mousemove', (e) => {
         if (isDragging) {
-            // Ensure optionsWindow is not moved off-screen, with some buffer
-            let newLeft = e.clientX - offsetX;
-            let newTop = e.clientY - offsetY;
-
-            const buffer = 10; // pixels
-            const maxLeft = window.innerWidth - optionsWindow.offsetWidth - buffer;
-            const maxTop = window.innerHeight - optionsWindow.offsetHeight - buffer;
-
-            newLeft = Math.max(buffer, Math.min(newLeft, maxLeft));
-            newTop = Math.max(buffer, Math.min(newTop, maxTop));
-
-            optionsWindow.style.left = newLeft + 'px';
-            optionsWindow.style.top = newTop + 'px';
+            filterWindow.style.left = `${e.clientX - offsetX}px`;
+            filterWindow.style.top = `${e.clientY - offsetY}px`;
         }
     });
 
     document.addEventListener('mouseup', () => {
-        if (isDragging) {
-            isDragging = false;
-            titleBar.style.userSelect = ''; // Re-enable text selection
-            document.body.style.userSelect = '';
-            consoleLog("Draggable window: mouseup");
-            // Future: save position to localStorage here if desired
-            // localStorage.setItem('otkOptionsWindowPos', JSON.stringify({top: optionsWindow.style.top, left: optionsWindow.style.left}));
-        }
+        isDragging = false;
+        titleBar.style.userSelect = '';
+        document.body.style.userSelect = '';
     });
 
-    consoleLog("Options Window setup complete with drag functionality.");
+    const mainContent = document.createElement('div');
+    mainContent.style.cssText = 'display: flex; flex-grow: 1;';
+    filterWindow.appendChild(mainContent);
+
+    const leftMenu = document.createElement('div');
+    leftMenu.id = 'otk-filter-menu';
+    leftMenu.style.cssText = `
+        width: 120px;
+        padding: 10px;
+        border-right: 1px solid #444;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    `;
+    mainContent.appendChild(leftMenu);
+
+    const rightContent = document.createElement('div');
+    rightContent.id = 'otk-filter-content';
+    rightContent.style.cssText = 'padding: 10px; flex-grow: 1; display: flex; flex-direction: column;';
+    mainContent.appendChild(rightContent);
+
+    // ... (rest of the setupFilterWindow code remains unchanged, including the titleBar, closeButton, mainContent, leftMenu, rightContent, dragging logic, etc.)
+
+    const filterListBtn = createTrackerButton('Filter List');
+    filterListBtn.addEventListener('click', renderFilterList);
+    leftMenu.appendChild(filterListBtn);
+
+    const newFilterBtn = createTrackerButton('New Filter');
+    newFilterBtn.addEventListener('click', () => renderNewFilterView());
+    leftMenu.appendChild(newFilterBtn);
+
+    document.body.appendChild(filterWindow);
+    consoleLog("Filter Window setup complete.");
 }
 
-// --- Initial Actions / Main Execution ---
-async function main() {
-    consoleLog("Starting OTK Thread Tracker script (v2.7)...");
-
-    // Inject CSS for anchored messages
-    const styleElement = document.createElement('style');
-    styleElement.textContent = `
-        :root {
-            --otk-gui-bg-color: #181818;
-            --otk-gui-text-color: #e6e6e6; /* General text in the main GUI bar */
-            --otk-options-text-color: #e6e6e6; /* For text within the options panel */
-            --otk-title-text-color: #e6e6e6; /* Default for main title */
-            --otk-stats-text-color: #e6e6e6; /* For the actual stats text numbers in GUI bar */
-            --otk-background-updates-stats-text-color: #FFD700; /* For the 'new' stats text */
-            --otk-viewer-bg-color: #181818;
-            --otk-gui-threadlist-title-color: #e0e0e0;
-            --otk-gui-threadlist-time-color: #aaa;
-            --otk-viewer-header-border-color: #000000; /* Default theme's header underline for depth 0 - Now black */
-            --otk-viewer-quote1-header-border-color: #000000; /* Default theme's header underline for depth 1 - Now black */
-            /* New defaults based on example.html for the new design, now acting as global defaults */
-            --otk-msg-depth0-bg-color: #ffffff; /* example.html main bg */
-            --otk-msg-depth1-bg-color: rgba(0, 0, 0, 0.05); /* example.html quote1 bg */
-            --otk-msg-depth2plus-bg-color: #ffffff; /* example.html quote2 bg (alternating) */
-
-            --otk-msg-depth0-text-color: #333333; /* example.html content text (assumed) */
-            --otk-msg-depth1-text-color: #333333; /* example.html content text (assumed) */
-            --otk-msg-depth2plus-text-color: #333333; /* example.html content text (assumed) */
-
-            --otk-msg-depth0-header-text-color: #555555; /* example.html header text */
-            --otk-msg-depth1-header-text-color: #555555; /* example.html header text */
-            --otk-msg-depth2plus-header-text-color: #555555; /* example.html header text */
-
-            --otk-viewer-message-font-size: 13px; /* Default font size for message text - remains common */
-            --otk-gui-bottom-border-color: #555; /* Default for GUI bottom border - remains common */
-            --otk-cog-icon-color: #e6e6e6; /* Default for settings cog icon */
-            --otk-disable-bg-font-color: #e6e6e6; /* Default for "Disable Background Updates" text */
-            --otk-viewer-quote2plus-header-border-color: #000000; /* Default for Depth 2+ message header underline - Now black */
-            --otk-new-messages-divider-color: #FFD700; /* Default for new message separator line */
-            --otk-new-messages-font-color: #FFD700; /* Default for new message separator text */
-
-            /* New Depth-Specific Content Font Sizes */
-            --otk-msg-depth0-content-font-size: 13px;
-            --otk-msg-depth1-content-font-size: 13px;
-            --otk-msg-depth2plus-content-font-size: 13px;
-
-            /* GUI Button Colors */
-            --otk-button-bg-color: #555;
-            --otk-button-text-color: white;
-            --otk-button-border-color: #777;
-            --otk-button-hover-bg-color: #666;
-            --otk-button-active-bg-color: #444444; /* Ensured hex */
-
-            /* Loading Screen Colors */
-            --otk-loading-overlay-base-hex-color: #000000; /* Hex base for overlay */
-            --otk-loading-overlay-opacity: 0.8;
-            --otk-loading-text-color: #ffffff; /* Hex for white */
-            --otk-loading-progress-bar-bg-color: #333333; /* Hex for dark grey */
-            --otk-loading-progress-bar-fill-color: #4CAF50; /* Already hex */
-            --otk-loading-progress-bar-text-color: #ffffff; /* Hex for white */
-            /* Add more variables here as they are identified */
-
-            /* Anchor Highlight Colors */
-            --otk-anchor-highlight-bg-color: #4a4a3a;    /* Default: dark yellow/greenish */
-            --otk-anchor-highlight-border-color: #FFD700; /* Default: gold */
-
-            /* --- New Design Theme Variables --- */
-            --otk-newdesign-main-bg: #fff;
-            --otk-newdesign-quote1-bg: rgba(0, 0, 0, 0.05);
-            --otk-newdesign-quote2-bg: #fff; /* Alternating, same as main */
-            --otk-newdesign-colorsquare-bg: #4CAF50;
-            --otk-newdesign-header-text-color: #555;
-            --otk-newdesign-content-text-color: #333; /* Assuming content text is darker on white BG */
-            --otk-newdesign-main-border-bottom-color: #ccc; /* Unique to new design's top-level msg */
-            --otk-newdesign-viewer-bg-color: #fff4de; /* Viewer background for the new theme */
-            /* The --otk-newdesign-msg-depthX... variables are removed as we will directly use the shared --otk-msg-depthX... vars */
-        }
-
-        /* --- New Design Specific Styles --- */
-        #otk-viewer.otk-message-layout-newdesign { /* Target otkViewer when new design is active */
-            background-color: var(--otk-newdesign-viewer-bg-color);
-        }
-
-        /* These rules now use the shared --otk-msg-depthX... variables, which have new defaults from example.html */
-        .otk-message-layout-newdesign .otk-message-container-main {
-            background-color: var(--otk-msg-depth0-bg-color); /* Uses shared variable */
-            border-radius: 4px;
-            padding: 6px 8px;
-            margin-bottom: 15px;
-            border-bottom: 1px solid var(--otk-newdesign-main-border-bottom-color); /* Specific to new design */
-        }
-
-        .otk-message-layout-newdesign .otk-message-container-quote-depth-1 {
-            background-color: var(--otk-msg-depth1-bg-color); /* Uses shared variable */
-            border-radius: 4px;
-            padding: 6px 8px;
-            margin-bottom: 8px;
-        }
-
-        .otk-message-layout-newdesign .otk-message-container-quote-depth-2 {
-            background-color: var(--otk-msg-depth2plus-bg-color); /* Uses shared variable */
-            border-radius: 4px;
-            padding: 6px 8px; /* From example.html */
-            margin-bottom: 8px; /* From example.html */
-        }
-
-        .otk-message-layout-newdesign .otk-post-div { /* Common for main message block and quoted message blocks */
-            display: flex;
-            align-items: flex-start; /* Align items (square, text wrapper) to the top */
-        }
-
-        .otk-message-layout-newdesign .otk-color-square {
-            width: 15px;
-            height: 40px; /* Or adjust dynamically if needed */
-            background-color: var(--otk-newdesign-colorsquare-bg);
-            border-radius: 3px;
-            margin-right: 10px;
-            flex-shrink: 0;
-        }
-
-        .otk-message-layout-newdesign .otk-text-wrapper {
-            display: flex;
-            flex-direction: column;
-            flex-grow: 1;
-        }
-
-        .otk-message-layout-newdesign .otk-header-div {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 12px;
-            /* Default header color from shared variables, which now default to new theme's header color */
-            color: var(--otk-msg-depth0-header-text-color);
-            white-space: nowrap; /* From example.html */
-            border-bottom: 1px solid var(--otk-viewer-header-border-color); /* Added underline */
-            padding-bottom: 5px; /* Space for underline */
-            margin-bottom: 8px; /* Space after underline */
-        }
-        /* For quoted messages, the header text color might be the same or different based on depth.
-           Using shared variables allows this flexibility via settings. */
-        .otk-message-layout-newdesign .otk-message-container-quote-depth-1 .otk-header-div {
-             color: var(--otk-msg-depth1-header-text-color);
-             border-bottom-color: var(--otk-viewer-quote1-header-border-color); /* Specific underline color for depth 1 */
-        }
-        .otk-message-layout-newdesign .otk-message-container-quote-depth-2 .otk-header-div {
-             color: var(--otk-msg-depth2plus-header-text-color);
-             border-bottom-color: var(--otk-viewer-quote2plus-header-border-color); /* Specific underline color for depth 2+ */
-        }
-
-        .otk-message-layout-newdesign .otk-content-div {
-            white-space: pre-wrap;
-            word-wrap: break-word;
-            /* Default content text color from shared variables */
-            color: var(--otk-msg-depth0-text-color);
-            font-size: var(--otk-msg-depth0-content-font-size); /* Use new depth-specific variable */
-        }
-        .otk-message-layout-newdesign .otk-message-container-quote-depth-1 .otk-content-div {
-             color: var(--otk-msg-depth1-text-color);
-             font-size: var(--otk-msg-depth1-content-font-size); /* Use new depth-specific variable */
-        }
-        .otk-message-layout-newdesign .otk-message-container-quote-depth-2 .otk-content-div {
-             color: var(--otk-msg-depth2plus-text-color);
-             font-size: var(--otk-msg-depth2plus-content-font-size); /* Use new depth-specific variable */
-        }
 
 
-        /* Refined Chrome Scrollbar Styling for Overlay Effect */
-        #otk-messages-container::-webkit-scrollbar {
-            width: 8px; /* Thinner for a more subtle overlay appearance */
-        }
-
-        #otk-messages-container::-webkit-scrollbar-track {
-            background: transparent; /* Make track transparent for overlay effect */
-        }
-
-        #otk-messages-container::-webkit-scrollbar-thumb {
-            background-color: var(--otk-stats-text-color, #888); /* Use a theme variable, fallback to #888 */
-            border-radius: 4px; /* Slightly smaller radius for a thinner bar */
-            /* The border creates a visual separation from content, enhancing overlay feel */
-            border: 2px solid transparent; /* Keep border transparent initially */
-            background-clip: padding-box; /* Ensures background doesn't go under the border */
-        }
-
-        #otk-messages-container::-webkit-scrollbar-thumb:hover {
-            background-color: #aaa; /* Lighter on hover for better visibility */
-            border-color: var(--otk-viewer-bg-color, #181818); /* Show border matching background on hover */
-        }
-        /* Make scrollbar visible only when scrolling or hovering over the container */
-        /* This is harder to achieve with pure CSS for ::-webkit-scrollbar if not natively supported by OS/Browser settings */
-        /* The transparent track and subtle thumb provide a good approximation. */
-        /* True auto-hide on non-interaction often requires JavaScript or browser/OS support for overlay scrollbars. */
-
-        /* Placeholder styling */
-        #otk-custom-theme-name-input::placeholder {
-            text-align: center;
-        }
-
-        /* GUI Button States */
-        .otk-button--hover {
-            background-color: var(--otk-button-hover-bg-color) !important;
-        }
-        .otk-button--active {
-            background-color: var(--otk-button-active-bg-color) !important;
-        }
-
-        .${ANCHORED_MESSAGE_CLASS} {
-            background-color: var(--otk-anchor-highlight-bg-color) !important;
-            border: 1px solid var(--otk-anchor-highlight-border-color) !important;
-            /* Add other styles if needed, e.g., box-shadow */
-        }
-            .otk-youtube-embed-wrapper.otk-embed-inline {
-                /* max-width and margins are now controlled by inline styles in createYouTubeEmbedElement */
-                /* This class can be used for other common styles for these embeds if needed */
+    // --- Initial Actions / Main Execution ---
+    async function main() {
+        // Clock data migration
+        if (!localStorage.getItem('otkClocks')) {
+            const oldTimezone = localStorage.getItem('otkClockTimezone');
+            const oldDisplayPlace = localStorage.getItem('otkClockDisplayPlace');
+            let initialClocks = [];
+            if (oldTimezone) {
+                initialClocks.push({
+                    id: Date.now(),
+                    timezone: oldTimezone,
+                    displayPlace: oldDisplayPlace || oldTimezone.split('/').pop().replace(/_/g, ' ')
+                });
+            } else {
+                // Default clock if no old settings exist
+                initialClocks.push({
+                    id: Date.now(),
+                    timezone: 'America/Chicago',
+                    displayPlace: 'Chicago'
+                });
             }
-    `;
-    document.head.appendChild(styleElement);
-    consoleLog("Injected CSS for anchored messages.");
+            localStorage.setItem('otkClocks', JSON.stringify(initialClocks));
+            consoleLog('Clock settings migrated to new multi-clock format.');
+        }
 
-    await applyMainTheme();
-    setupOptionsWindow(); // Call to create the options window shell and event listeners
-    applyThemeSettings(); // Apply any saved theme settings
+        consoleLog("Starting OTK Thread Tracker script (v2.8)...");
 
-    consoleLog('Attempting to call setupLoadingScreen...');
-    setupLoadingScreen(); // Create loading screen elements early
-    consoleLog('Call to setupLoadingScreen finished.');
-    ensureViewerExists(); // Ensure viewer div is in DOM early
+        try {
+            const storedBlurred = JSON.parse(localStorage.getItem(BLURRED_IMAGES_KEY));
+            if (Array.isArray(storedBlurred)) {
+                blurredImages = new Set(storedBlurred);
+            }
+            consoleLog(`Loaded ${blurredImages.size} blurred image hashes.`);
+        } catch (e) {
+            consoleError("Error parsing blurred images from localStorage:", e);
+            blurredImages = new Set();
+        }
 
-    // Note: mediaIntersectionObserver itself is initialized within renderMessagesInViewer
+        try {
+            const storedBlocked = JSON.parse(localStorage.getItem(BLOCKED_THREADS_KEY));
+            if (Array.isArray(storedBlocked)) {
+                blockedThreads = new Set(storedBlocked);
+            }
+            consoleLog(`Loaded ${blockedThreads.size} blocked thread hashes.`);
+        } catch (e) {
+            consoleError("Error parsing blocked threads from localStorage:", e);
+            blockedThreads = new Set();
+        }
 
-    try {
-        consoleLog("Main function start.");
-        await initDB();
-            consoleLog("IndexedDB initialization attempt complete.");
-            messagesByThreadId = await loadMessagesFromDB();
-            consoleLog("messagesByThreadId after load:", messagesByThreadId);
+        // Inject CSS for anchored messages
+        const styleElement = document.createElement('style');
+        styleElement.textContent = `
+            :root {
+                --otk-clock-bg-color: #181818;
+                --otk-clock-text-color: #e6e6e6;
+                --otk-clock-border-color: #181818;
+                --otk-clock-search-bg-color: #333;
+                --otk-clock-search-text-color: #e6e6e6;
+                --otk-countdown-bg-color: #181818;
+                --otk-gui-bg-color: #181818;
+                --otk-gui-text-color: #e6e6e6; /* General text in the main GUI bar */
+                --otk-options-text-color: #e6e6e6; /* For text within the options panel */
+                --otk-title-text-color: #ff8040; /* Default for main title */
+                --otk-stats-text-color: #e6e6e6; /* For the actual stats text numbers in GUI bar */
+                --otk-stats-dash-color: #FFD700; /* For the dashes in the stats display */
+                --otk-background-updates-stats-text-color: #FFD700; /* For the 'new' stats text */
+                --otk-viewer-bg-color: #ffd1a4;
+                --otk-gui-threadlist-title-color: #e0e0e0;
+                --otk-gui-threadlist-time-color: #aaa;
+                --otk-viewer-header-border-color: #000000; /* Default theme's header underline for depth 0 - Now black */
+                --otk-viewer-quote1-header-border-color: #000000; /* Default theme's header underline for depth 1 - Now black */
+                /* New defaults based on example.html for the new design, now acting as global defaults */
+                --otk-msg-depth0-bg-color: #ffffff; /* example.html main bg */
+                --otk-msg-depth1-bg-color: #d9d9d9; /* example.html quote1 bg */
+                --otk-msg-depth2plus-bg-color: #ffffff; /* example.html quote2 bg (alternating) */
 
-            // Recalculate and display initial media stats
-            await recalculateAndStoreMediaStats(); // This updates localStorage
-            updateDisplayedStatistics(); // This reads from localStorage and updates GUI
-            consoleLog("Stats updated.");
+                --otk-msg-depth0-text-color: #333333; /* example.html content text (assumed) */
+                --otk-msg-depth1-text-color: #333333; /* example.html content text (assumed) */
+                --otk-msg-depth2plus-text-color: #333333; /* example.html content text (assumed) */
 
-            // Restore viewer state
-            if (localStorage.getItem(VIEWER_OPEN_KEY) === 'true' && otkViewer) {
-                const currentLayoutMain = localStorage.getItem('otkMessageLayoutStyle') || 'default';
-                if (currentLayoutMain === 'new_design') {
-                    otkViewer.classList.add('otk-message-layout-newdesign');
-                    otkViewer.classList.remove('otk-message-layout-default');
-                } else {
+                --otk-msg-depth0-header-text-color: #555555; /* example.html header text */
+                --otk-msg-depth1-header-text-color: #555555; /* example.html header text */
+                --otk-msg-depth2plus-header-text-color: #555555; /* example.html header text */
+
+                --otk-viewer-message-font-size: 13px; /* Default font size for message text - remains common */
+                --otk-gui-bottom-border-color: #ff8040; /* Default for GUI bottom border - remains common */
+                --otk-cog-icon-color: #e6e6e6; /* Default for settings cog icon */
+                --otk-disable-bg-font-color: #ff8040; /* Default for "Disable Background Updates" text */
+                --otk-countdown-timer-text-color: #ff8040; /* Default for countdown timer text */
+                --otk-viewer-quote2plus-header-border-color: #000000; /* Default for Depth 2+ message header underline - Now black */
+                --otk-new-messages-divider-color: #000000; /* Default for new message separator line */
+                --otk-new-messages-font-color: #000000; /* Default for new message separator text */
+                --otk-new-messages-font-size: 16px;
+
+                /* New Depth-Specific Content Font Sizes */
+                --otk-msg-depth0-content-font-size: 16px;
+                --otk-msg-depth1-content-font-size: 16px;
+                --otk-msg-depth2plus-content-font-size: 16px;
+
+                /* GUI Button Colors */
+                --otk-button-bg-color: #555;
+                --otk-button-text-color: white;
+                --otk-button-border-color: #777;
+                --otk-button-hover-bg-color: #666;
+                --otk-button-active-bg-color: #444444; /* Ensured hex */
+
+                /* Loading Screen Colors */
+                --otk-loading-overlay-base-hex-color: #000000; /* Hex base for overlay */
+                --otk-loading-overlay-opacity: 1.0;
+                --otk-loading-text-color: #ffffff; /* Hex for white */
+                --otk-loading-progress-bar-bg-color: #333333; /* Hex for dark grey */
+                --otk-loading-progress-bar-fill-color: #4CAF50; /* Already hex */
+                --otk-loading-progress-bar-text-color: #ffffff; /* Hex for white */
+                /* Add more variables here as they are identified */
+
+                /* Anchor Highlight Colors */
+                --otk-anchor-highlight-bg-color: #ff8040;    /* Default: dark yellow/greenish */
+                --otk-anchor-highlight-border-color: #000000; /* Default: gold */
+
+                /* Icon Colors */
+                --otk-resize-icon-color: #000000;
+                --otk-resize-icon-bg-color: #d9d9d9;
+                --otk-blur-icon-color: #000000;
+                --otk-blur-icon-bg-color: #d9d9d9;
+                --otk-blocked-content-font-color: #e6e6e6;
+            }
+
+            /* Refined Chrome Scrollbar Styling for Overlay Effect */
+            #otk-messages-container::-webkit-scrollbar {
+                width: 8px; /* Thinner for a more subtle overlay appearance */
+            }
+
+            #otk-messages-container::-webkit-scrollbar-track {
+                background: transparent; /* Make track transparent for overlay effect */
+            }
+
+            #otk-messages-container::-webkit-scrollbar-thumb {
+                background-color: var(--otk-stats-text-color, #888); /* Use a theme variable, fallback to #888 */
+                border-radius: 4px; /* Slightly smaller radius for a thinner bar */
+                /* The border creates a visual separation from content, enhancing overlay feel */
+                border: 2px solid transparent; /* Keep border transparent initially */
+                background-clip: padding-box; /* Ensures background doesn't go under the border */
+            }
+
+            #otk-messages-container::-webkit-scrollbar-thumb:hover {
+                background-color: #aaa; /* Lighter on hover for better visibility */
+                border-color: var(--otk-viewer-bg-color, #181818); /* Show border matching background on hover */
+            }
+            /* Make scrollbar visible only when scrolling or hovering over the container */
+            /* This is harder to achieve with pure CSS for ::-webkit-scrollbar if not natively supported by OS/Browser settings */
+            /* The transparent track and subtle thumb provide a good approximation. */
+            /* True auto-hide on non-interaction often requires JavaScript or browser/OS support for overlay scrollbars. */
+
+            /* Placeholder styling */
+            #otk-custom-theme-name-input::placeholder {
+                text-align: center;
+            }
+
+            /* GUI Button States */
+            .otk-button--hover {
+                background-color: var(--otk-button-hover-bg-color) !important;
+            }
+            .otk-button--active {
+                background-color: var(--otk-button-active-bg-color) !important;
+            }
+
+            .image-wrapper:not(:hover) .blur-icon {
+                display: none;
+            }
+
+            #otk-clock-search-icon {
+                display: none;
+            }
+            #otk-clock:hover #otk-clock-search-icon {
+                display: inline-block;
+            }
+            .${ANCHORED_MESSAGE_CLASS} {
+                background-color: var(--otk-anchor-highlight-bg-color) !important;
+                border: 1px solid var(--otk-anchor-highlight-border-color) !important;
+                /* Add other styles if needed, e.g., box-shadow */
+            }
+                .otk-youtube-embed-wrapper.otk-embed-inline {
+                    /* max-width and margins are now controlled by inline styles in createYouTubeEmbedElement */
+                    /* This class can be used for other common styles for these embeds if needed */
+                }
+        `;
+        document.head.appendChild(styleElement);
+        consoleLog("Injected CSS for anchored messages.");
+
+        await applyMainTheme();
+        setupOptionsWindow(); // Call to create the options window shell and event listeners
+        setupFilterWindow();
+        applyThemeSettings(); // Apply any saved theme settings
+        await fetchTimezones();
+        setupTimezoneSearch();
+
+        consoleLog('Attempting to call setupLoadingScreen...');
+        setupLoadingScreen(); // Create loading screen elements early
+        consoleLog('Call to setupLoadingScreen finished.');
+        ensureViewerExists(); // Ensure viewer div is in DOM early
+
+        // Note: mediaIntersectionObserver itself is initialized within renderMessagesInViewer
+
+        try {
+            consoleLog("Main function start.");
+            await initDB();
+                consoleLog("IndexedDB initialization attempt complete.");
+                messagesByThreadId = await loadMessagesFromDB();
+                consoleLog("messagesByThreadId after load:", messagesByThreadId);
+
+                // Trim messages according to limit to reduce memory usage
+                const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+                const messageLimitEnabled = themeSettings.otkMessageLimitEnabled !== false;
+                if (messageLimitEnabled) {
+                    const messageLimitValue = parseInt(themeSettings.otkMessageLimitValue || '500', 10);
+                    let allMessages = [];
+                    for (const threadId in messagesByThreadId) {
+                        allMessages.push(...messagesByThreadId[threadId]);
+                    }
+
+                    if (allMessages.length > messageLimitValue) {
+                        allMessages.sort((a, b) => b.time - a.time); // Sort descending to get newest
+                        const limitedMessages = allMessages.slice(0, messageLimitValue);
+                        const limitedMessageIds = new Set(limitedMessages.map(m => m.id));
+
+                        const newMessagesByThreadId = {};
+                        for (const threadId in messagesByThreadId) {
+                            const threadMessages = messagesByThreadId[threadId].filter(m => limitedMessageIds.has(m.id));
+                            if (threadMessages.length > 0) {
+                                newMessagesByThreadId[threadId] = threadMessages;
+                            }
+                        }
+                        messagesByThreadId = newMessagesByThreadId;
+                        consoleLog(`[Memory Fix] Trimmed in-memory messages down to ${messageLimitValue}`);
+                    }
+                }
+
+
+                // Recalculate and display initial media stats
+                await recalculateAndStoreMediaStats(); // This updates localStorage
+                updateDisplayedStatistics(); // This reads from localStorage and updates GUI
+                consoleLog("Stats updated.");
+
+                // Restore viewer state
+                if (localStorage.getItem(VIEWER_OPEN_KEY) === 'true' && otkViewer) {
                     otkViewer.classList.add('otk-message-layout-default');
                     otkViewer.classList.remove('otk-message-layout-newdesign');
+                    consoleLog('Viewer state restored to open. Layout class applied. Rendering all messages.');
+                    otkViewer.style.display = 'block';
+                    document.body.style.overflow = 'hidden';
+                    renderMessagesInViewer({isToggleOpen: true}); // Auto-populate with all messages
                 }
-                consoleLog('Viewer state restored to open. Layout class applied. Rendering all messages.');
-                otkViewer.style.display = 'block';
-                document.body.style.overflow = 'hidden';
-                renderMessagesInViewer({isToggleOpen: true}); // Auto-populate with all messages
-            }
 
 
-            // Load initial data and render list (stats are already updated)
-            renderThreadList();
-            updateDisplayedStatistics(); // Already called after recalculate
+                // Load initial data and render list (stats are already updated)
+                renderThreadList();
+                updateDisplayedStatistics(); // Already called after recalculate
 
-            // Background refresh is no longer started automatically on page load.
-            // It is started by clicking "Refresh Data" or by unchecking "Disable Background Updates".
-            if (localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) !== 'true') {
-                consoleLog("Background updates are enabled, initiating first check.");
-                startBackgroundRefresh();
-            } else {
-                consoleLog("Background updates are disabled by user preference.");
-            }
-            updateCountdownTimer();
+                // Background refresh is no longer started automatically on page load.
+                // It is started by clicking "Refresh Data" or by unchecking "Disable Background Updates".
+                if (localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) !== 'true') {
+                    consoleLog("Background updates are enabled, initiating first check.");
+                    startBackgroundRefresh();
+                } else {
+                    consoleLog("Background updates are disabled by user preference.");
+                    const countdownTimer = document.getElementById('otk-countdown-timer');
+                    if (countdownTimer) {
+                        countdownTimer.textContent = 'n/a';
+                    }
+                }
 
-            consoleLog("OTK Thread Tracker script initialized and running.");
+                consoleLog("OTK Thread Tracker script initialized and running.");
 
-        } catch (error) {
-            consoleError("Critical error during main initialization sequence:", error);
-            const errorDisplay = document.getElementById('otk-thread-title-display');
-            if (errorDisplay) {
-                errorDisplay.textContent = "Tracker Error! Check Console.";
-                errorDisplay.style.color = "red";
+            } catch (error) {
+                consoleError("Critical error during main initialization sequence:", error);
+                const errorDisplay = document.getElementById('otk-thread-title-display');
+                if (errorDisplay) {
+                    errorDisplay.textContent = "Tracker Error! Check Console.";
+                    errorDisplay.style.color = "red";
+                }
             }
         }
+
+        startAutoEmbedReloader();
+
+        // Kick off the script using the main async function
+        main().finally(() => {
+            // Final verification log after main execution sequence
+            const centerInfo = document.getElementById('otk-center-info-container');
+            if (centerInfo) {
+                consoleLog('[Final Check] Computed flex-grow for centerInfoContainer:', window.getComputedStyle(centerInfo).flexGrow);
+            } else {
+                consoleWarn('[Final Check] centerInfoContainer not found for flex-grow check.');
+            }
+        });
+
+        if (localStorage.getItem('otkClockEnabled') === 'true') {
+            const clockElement = document.getElementById('otk-clock');
+            if (clockElement) {
+                clockElement.style.display = 'flex';
+                renderClocks();
+            }
+        }
+
+        setInterval(updateClockTimes, 1000);
+
+        function handleActivity() {
+            if (scrollTimeout) {
+                clearTimeout(scrollTimeout);
+            }
+            if (isSuspended) {
+                consoleLog("[Activity] Activity detected, resuming background updates.");
+                isSuspended = false;
+                hideSuspendedScreen();
+                startBackgroundRefresh(); // Restart the refresh cycle
+            }
+            const suspendAfterInactiveMinutesValue = localStorage.getItem('otkSuspendAfterInactiveMinutes') || '1';
+            if (suspendAfterInactiveMinutesValue === 'Disabled') {
+                return; // Do not set a timeout if suspension is disabled
+            }
+            const suspendAfterInactiveMinutes = parseInt(suspendAfterInactiveMinutesValue, 10);
+            scrollTimeout = setTimeout(() => {
+                consoleLog(`[Activity] No activity for ${suspendAfterInactiveMinutes} minutes, suspending background updates.`);
+                isSuspended = true;
+                stopBackgroundRefresh();
+                showSuspendedScreen();
+            }, suspendAfterInactiveMinutes * 60 * 1000);
+        }
+
+        window.addEventListener('scroll', handleActivity);
+        window.addEventListener('mousemove', handleActivity);
+        window.addEventListener('mousedown', handleActivity);
+        window.addEventListener('keydown', handleActivity);
+        window.addEventListener('touchstart', handleActivity);
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') {
+                if (scrollTimeout) {
+                    clearTimeout(scrollTimeout);
+                }
+            } else {
+                handleActivity();
+            }
+        });
+
+        async function generateMemoryUsageReport() {
+            showLoadingScreen("Generating memory usage report...");
+
+            let report = "--- Memory Usage Report ---\n\n";
+
+            // 1. `messagesByThreadId`
+            try {
+                const messagesSize = new TextEncoder().encode(JSON.stringify(messagesByThreadId)).length;
+                report += `messagesByThreadId Size: ${(messagesSize / 1024 / 1024).toFixed(2)} MB\n`;
+            } catch (e) {
+                report += `messagesByThreadId Size: Error calculating size\n`;
+            }
+
+            // 2. IndexedDB
+            if (otkMediaDB) {
+                try {
+                    const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+                    const store = transaction.objectStore('mediaStore');
+                    const request = store.openCursor();
+                    let dbSize = 0;
+                    await new Promise((resolve, reject) => {
+                        request.onsuccess = (event) => {
+                            const cursor = event.target.result;
+                            if (cursor) {
+                                dbSize += cursor.value.blob.size;
+                                cursor.continue();
+                            } else {
+                                resolve();
+                            }
+                        };
+                        request.onerror = (event) => {
+                            reject(event.target.error);
+                        };
+                    });
+                    report += `IndexedDB (mediaStore) Size: ${(dbSize / 1024 / 1024).toFixed(2)} MB\n`;
+                    consoleLog(`[Memory Report] IndexedDB (mediaStore) Size: ${(dbSize / 1024 / 1024).toFixed(2)} MB`);
+                } catch (e) {
+                    report += `IndexedDB (mediaStore) Size: Error calculating size\n`;
+                }
+            } else {
+                report += `IndexedDB (mediaStore) Size: Not available\n`;
+            }
+
+            // 3. `tweetCache`
+            try {
+                const tweetCacheSize = new TextEncoder().encode(JSON.stringify(tweetCache)).length;
+                report += `tweetCache Size: ${(tweetCacheSize / 1024).toFixed(2)} KB\n`;
+            } catch (e) {
+                report += `tweetCache Size: Error calculating size\n`;
+            }
+
+            // 4. `createdBlobUrls`
+            report += `Created Blob URLs: ${createdBlobUrls.size}\n`;
+
+            // 5. Other data structures
+            report += `\n--- Other Data Structures ---\n`;
+            report += `activeThreads: ${activeThreads.length} items\n`;
+
+            const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+            const messageLimitEnabled = themeSettings.otkMessageLimitEnabled !== false;
+            const messageLimitValue = parseInt(themeSettings.otkMessageLimitValue || '500', 10);
+            report += `Message Limit Enabled: ${messageLimitEnabled}\n`;
+            if (messageLimitEnabled) {
+                report += `Message Limit Value: ${messageLimitValue}\n`;
+            }
+
+            report += `renderedMessageIdsInViewer: ${renderedMessageIdsInViewer.size} items\n`;
+            report += `uniqueImageViewerHashes: ${uniqueImageViewerHashes.size} items\n`;
+            report += `viewerTopLevelAttachedVideoHashes: ${viewerTopLevelAttachedVideoHashes.size} items\n`;
+            report += `viewerTopLevelEmbedIds: ${viewerTopLevelEmbedIds.size} items\n`;
+
+            hideLoadingScreen();
+
+            const reportWindow = window.open("", "Memory Report", "width=600,height=400");
+            reportWindow.document.write('<pre>' + report.replace(/\n/g, '<br>') + '</pre>');
+        }
+
+    async function fetchTimezones() {
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: 'https://github.com/johnt1884/ff/releases/download/firefox/cities_geonames.json',
+                onload: function(response) {
+                    if (response.status === 200) {
+                        try {
+                            cityData = JSON.parse(response.responseText);
+                            consoleLog(`Successfully fetched and parsed ${cityData.length} cities.`);
+                        } catch (e) {
+                            consoleError("Failed to parse city data JSON:", e);
+                            cityData = []; // Ensure it's an empty array on error
+                        }
+                    } else {
+                        consoleError(`Failed to fetch city data: ${response.status}`);
+                        cityData = [];
+                    }
+                    resolve();
+                },
+                onerror: function(error) {
+                    consoleError('Error fetching city data:', error);
+                    cityData = [];
+                    resolve();
+                }
+            });
+        });
     }
 
-    startAutoEmbedReloader();
-    startTweetEmbedBackupSystem();
+    function setupTimezoneSearch() {
+        const searchInput = document.getElementById('otk-timezone-search-input');
+        const searchResultsDiv = document.getElementById('otk-timezone-search-results');
 
-    // Kick off the script using the main async function
-    main().finally(() => {
-        // Final verification log after main execution sequence
-        const centerInfo = document.getElementById('otk-center-info-container');
-        if (centerInfo) {
-            consoleLog('[Final Check] Computed flex-grow for centerInfoContainer:', window.getComputedStyle(centerInfo).flexGrow);
-        } else {
-            consoleWarn('[Final Check] centerInfoContainer not found for flex-grow check.');
-        }
-    });
+        function addZoneItem(city) {
+            const resultDiv = document.createElement('div');
+            // Display format: "City, State (Country)"
+            const displayText = `${city.city}, ${city.admin1} (${city.country_code})`;
+            resultDiv.textContent = displayText;
+            resultDiv.dataset.timezone = city.timezone;
+            resultDiv.style.cssText = `
+                padding: 4px;
+                cursor: pointer;
+                color: var(--otk-clock-search-text-color, #e6e6e6);
+            `;
+            resultDiv.addEventListener('mouseenter', () => {
+                resultDiv.style.backgroundColor = '#555';
+            });
+            resultDiv.addEventListener('mouseleave', () => {
+                resultDiv.style.backgroundColor = '';
+            });
+            resultDiv.addEventListener('click', () => {
+                const selectedTimezone = resultDiv.dataset.timezone;
+                let clocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+                const clockIndex = clocks.findIndex(c => c.id === activeClockSearchId);
 
-    // The Twitter widget script is now loaded dynamically in processTweetEmbed.
+                if (clockIndex !== -1) {
+                    clocks[clockIndex].timezone = selectedTimezone;
+                    clocks[clockIndex].displayPlace = city.city;
+                    localStorage.setItem('otkClocks', JSON.stringify(clocks));
+                }
 
-    window.addEventListener('scroll', () => {
-        if (scrollTimeout) {
-            clearTimeout(scrollTimeout);
-        }
-        if (isSuspended) {
-            consoleLog("[Scroll] Activity detected, resuming background updates.");
-            isSuspended = false;
-            hideSuspendedScreen();
-            startBackgroundRefresh(); // Restart the refresh cycle
-        }
-        const suspendAfterInactiveMinutes = parseInt(localStorage.getItem('otkSuspendAfterInactiveMinutes') || '30', 10);
-        scrollTimeout = setTimeout(() => {
-            consoleLog(`[Activity] No scroll activity for ${suspendAfterInactiveMinutes} minutes, suspending background updates.`);
-            isSuspended = true;
-            stopBackgroundRefresh();
-            showSuspendedScreen();
-        }, suspendAfterInactiveMinutes * 60 * 1000);
-    });
-
-    async function generateMemoryUsageReport() {
-        showLoadingScreen("Generating memory usage report...");
-
-        let report = "--- Memory Usage Report ---\\n\\n";
-
-        // 1. `messagesByThreadId`
-        try {
-            const messagesSize = new TextEncoder().encode(JSON.stringify(messagesByThreadId)).length;
-            report += `messagesByThreadId Size: ${(messagesSize / 1024 / 1024).toFixed(2)} MB\\n`;
-        } catch (e) {
-            report += `messagesByThreadId Size: Error calculating size\\n`;
+                renderClocks(); // Re-render to show changes
+                document.getElementById('otk-timezone-search-container').style.display = 'none'; // Hide search
+                searchInput.value = '';
+                searchResultsDiv.innerHTML = '';
+                activeClockSearchId = null; // Reset active clock
+            });
+            searchResultsDiv.appendChild(resultDiv);
         }
 
-        // 2. IndexedDB
-        if (otkMediaDB) {
-            try {
-                const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
-                const store = transaction.objectStore('mediaStore');
-                const request = store.openCursor();
-                let dbSize = 0;
-                await new Promise((resolve, reject) => {
-                    request.onsuccess = (event) => {
-                        const cursor = event.target.result;
-                        if (cursor) {
-                            dbSize += cursor.value.blob.size;
-                            cursor.continue();
-                        } else {
-                            resolve();
-                        }
-                    };
-                    request.onerror = (event) => {
-                        reject(event.target.error);
-                    };
-                });
-                report += `IndexedDB (mediaStore) Size: ${(dbSize / 1024 / 1024).toFixed(2)} MB\\n`;
-                consoleLog(`[Memory Report] IndexedDB (mediaStore) Size: ${(dbSize / 1024 / 1024).toFixed(2)} MB`);
-            } catch (e) {
-                report += `IndexedDB (mediaStore) Size: Error calculating size\\n`;
+        searchInput.addEventListener('input', () => {
+            const query = searchInput.value.trim().toLowerCase();
+            searchResultsDiv.innerHTML = '';
+
+            if (query.length < 2) {
+                return;
             }
-        } else {
-            report += `IndexedDB (mediaStore) Size: Not available\\n`;
-        }
 
-        // 3. `tweetCache`
-        try {
-            const tweetCacheSize = new TextEncoder().encode(JSON.stringify(tweetCache)).length;
-            report += `tweetCache Size: ${(tweetCacheSize / 1024).toFixed(2)} KB\\n`;
-        } catch (e) {
-            report += `tweetCache Size: Error calculating size\\n`;
-        }
+            const queryWords = query.split(/\s+/).filter(w => w.length > 0);
 
-        // 4. `createdBlobUrls`
-        report += `Created Blob URLs: ${createdBlobUrls.size}\\n`;
+            const results = cityData.filter(city => {
+                const fullCityName = `${city.city}, ${city.admin1}`.toLowerCase();
+                // Check if all query words are present in the city name
+                return queryWords.every(word => fullCityName.includes(word));
+            });
 
-        // 5. Other data structures
-        report += `\\n--- Other Data Structures ---\\n`;
-        report += `activeThreads: ${activeThreads.length} items\\n`;
-        report += `renderedMessageIdsInViewer: ${renderedMessageIdsInViewer.size} items\\n`;
-        report += `uniqueImageViewerHashes: ${uniqueImageViewerHashes.size} items\\n`;
-        report += `viewerTopLevelAttachedVideoHashes: ${viewerTopLevelAttachedVideoHashes.size} items\\n`;
-        report += `viewerTopLevelEmbedIds: ${viewerTopLevelEmbedIds.size} items\\n`;
+            // Sort results by population (descending)
+            results.sort((a, b) => b.population - a.population);
 
-        hideLoadingScreen();
-
-        const reportWindow = window.open("", "Memory Report", "width=600,height=400");
-        reportWindow.document.write('<pre>' + report + '</pre>');
+            // Display top results
+            results.slice(0, 50).forEach(city => {
+                addZoneItem(city);
+            });
+        });
     }
 
 })();
