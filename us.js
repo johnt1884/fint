@@ -4308,7 +4308,6 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             localStorage.removeItem(LAST_SEEN_MESSAGES_KEY);
             localStorage.removeItem(LAST_SEEN_IMAGES_KEY);
             localStorage.removeItem(LAST_SEEN_VIDEOS_KEY);
-            localStorage.removeItem(THEME_SETTINGS_KEY);
             localStorage.removeItem(BLOCKED_THREADS_KEY);
             consoleLog('[Clear] LocalStorage (threads, messages, seen embeds, media counts, ACTIVE theme) cleared/reset. CUSTOM THEMES PRESERVED.');
 
@@ -6537,36 +6536,103 @@ function applyThemeSettings(options = {}) {
         guiBackgroundSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;";
         themeOptionsContainer.appendChild(guiBackgroundSubHeading);
 
-        function createTextInputRow(options) {
+        const bgImageUrlRow = document.createElement('div');
+        bgImageUrlRow.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const bgImageUrlLabel = document.createElement('label');
+        bgImageUrlLabel.textContent = 'Background Image URL:';
+        bgImageUrlLabel.htmlFor = 'otk-gui-bg-image-url-input';
+        bgImageUrlLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const bgImageUrlControlsWrapper = document.createElement('div');
+        bgImageUrlControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
+
+        const bgImageUrlInput = document.createElement('input');
+        bgImageUrlInput.type = 'text';
+        bgImageUrlInput.id = 'otk-gui-bg-image-url-input';
+        bgImageUrlInput.placeholder = 'Enter image URL or browse';
+        bgImageUrlInput.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align: left;";
+
+        const initialBgUrl = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {}).guiBackgroundImageUrl || '';
+        if (initialBgUrl.startsWith('data:image')) {
+            bgImageUrlInput.value = '(Local file is selected)';
+            bgImageUrlInput.dataset.fullUrl = initialBgUrl;
+        } else {
+            bgImageUrlInput.value = initialBgUrl;
+        }
+
+        bgImageUrlInput.addEventListener('input', () => {
+            bgImageUrlInput.dataset.fullUrl = '';
+        });
+
+        bgImageUrlInput.addEventListener('change', () => {
+            const valueToSave = bgImageUrlInput.dataset.fullUrl || bgImageUrlInput.value;
+            saveThemeSetting('guiBackgroundImageUrl', valueToSave, false);
+            applyThemeSettings({ forceRerender: false });
+        });
+
+        const browseButton = document.createElement('button');
+        browseButton.textContent = "Browse...";
+        browseButton.style.cssText = "height: 25px; flex-shrink: 0; padding: 2px 6px; font-size: 11px;";
+
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = 'image/*';
+        fileInput.style.display = 'none';
+
+        browseButton.addEventListener('click', (e) => {
+            e.preventDefault();
+            fileInput.click();
+        });
+
+        fileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const dataUrl = e.target.result;
+                    bgImageUrlInput.value = `(Local file: ${file.name})`;
+                    bgImageUrlInput.dataset.fullUrl = dataUrl;
+                    bgImageUrlInput.dispatchEvent(new Event('change'));
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+
+        bgImageUrlControlsWrapper.appendChild(bgImageUrlInput);
+        bgImageUrlControlsWrapper.appendChild(browseButton);
+        bgImageUrlControlsWrapper.appendChild(fileInput);
+
+        bgImageUrlRow.appendChild(bgImageUrlLabel);
+        bgImageUrlRow.appendChild(bgImageUrlControlsWrapper);
+
+        themeOptionsContainer.appendChild(bgImageUrlRow);
+
+        function createDropdownRow(options) {
             const group = document.createElement('div');
             group.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
             const label = document.createElement('label');
             label.textContent = options.labelText;
-            label.htmlFor = `otk-${options.idSuffix}-input`;
             label.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
             const controlsWrapperDiv = document.createElement('div');
             controlsWrapperDiv.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
-            const input = document.createElement('input');
-            input.type = 'text';
-            input.id = `otk-${options.idSuffix}-input`;
-            input.placeholder = options.placeholder || '';
-            input.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
-            input.value = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || '';
-            input.addEventListener('change', () => {
-                saveThemeSetting(options.storageKey, input.value, true);
+            const select = document.createElement('select');
+            select.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px;";
+            options.options.forEach(opt => {
+                const optionElement = document.createElement('option');
+                optionElement.value = opt;
+                optionElement.textContent = opt;
+                select.appendChild(optionElement);
             });
-            controlsWrapperDiv.appendChild(input);
+            select.value = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || options.defaultValue;
+            select.addEventListener('change', () => {
+                saveThemeSetting(options.storageKey, select.value, true);
+            });
+            controlsWrapperDiv.appendChild(select);
             group.appendChild(label);
             group.appendChild(controlsWrapperDiv);
             return group;
         }
-
-        themeOptionsContainer.appendChild(createTextInputRow({
-            labelText: 'Background Image URL:',
-            storageKey: 'guiBackgroundImageUrl',
-            idSuffix: 'gui-bg-image-url',
-            placeholder: 'Enter image URL'
-        }));
 
         function createDropdownRow(options) {
             const group = document.createElement('div');
