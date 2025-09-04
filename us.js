@@ -46,8 +46,10 @@ document.addEventListener("visibilitychange", () => {
     const BLURRED_IMAGES_KEY = 'otkBlurredImages';
     const IMAGE_BLUR_AMOUNT_KEY = 'otkImageBlurAmount';
     const BLOCKED_THREADS_KEY = 'otkBlockedThreads';
+    const FILTER_RULES_V2_KEY = 'otkFilterRulesV2';
 
     // --- Global variables ---
+    let originalTitle = document.title;
     let otkViewer = null;
     let cityData = [];
     let tweetCache = {};
@@ -231,6 +233,7 @@ document.addEventListener("visibilitychange", () => {
         `;
         overlay.textContent = 'Thread Tracker is suspended due to inactivity.';
         document.body.appendChild(overlay);
+        document.title = "[Suspended] " + originalTitle;
     }
 
     function hideSuspendedScreen() {
@@ -238,6 +241,7 @@ document.addEventListener("visibilitychange", () => {
         if (overlay) {
             overlay.remove();
         }
+        document.title = originalTitle;
     }
 
     function updateLoadingProgress(percentage, detailsText) {
@@ -632,6 +636,14 @@ function createTweetEmbedElement(tweetId) {
         return decoded;
     }
 
+    function toTitleCase(str) {
+        if (!str) return '';
+        let title = str.toLowerCase().replace(/\b\w/g, s => s.toUpperCase());
+        // Special case for 'OTK'
+        title = title.replace(/\botk\b/gi, 'OTK');
+        return title;
+    }
+
     function getAllMessagesSorted() {
         let allMessages = [];
         const allThreadIds = Object.keys(messagesByThreadId);
@@ -731,7 +743,7 @@ function createTweetEmbedElement(tweetId) {
     // Color palette for thread indicators
     const COLORS = [
         '#e6194B', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
-        '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe',
+        '#911eb4', '#46f0f0', '#f032e6', '#bcf60c',
         '#008080', '#e6beff', '#9A6324', '#800000',
         '#aaffc3', '#808000', '#ffd8b1', '#000075', '#808080'
     ];
@@ -1277,14 +1289,88 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
         return title.substr(0, maxLength - 3) + '...'; // Fallback if no good space
     }
 
+    // --- Color Similarity Functions ---
+    const SIMILARITY_THRESHOLD = 20; // Lower is more similar. 1-5 is imperceptible, >10 is distinct.
+
+    function hexToRgb(hex) {
+        let shorthandRegex = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
+        hex = hex.replace(shorthandRegex, (m, r, g, b) => r + r + g + g + b + b);
+        let result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+        return result ? {
+            r: parseInt(result[1], 16),
+            g: parseInt(result[2], 16),
+            b: parseInt(result[3], 16)
+        } : null;
+    }
+
+    function rgbToLab(rgb) {
+        let r = rgb.r / 255, g = rgb.g / 255, b = rgb.b / 255;
+        r = (r > 0.04045) ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
+        g = (g > 0.04045) ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
+        b = (b > 0.04045) ? Math.pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
+
+        let x = (r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047;
+        let y = (r * 0.2126 + g * 0.7152 + b * 0.0722) / 1.00000;
+        let z = (r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883;
+
+        x = (x > 0.008856) ? Math.pow(x, 1/3) : (7.787 * x) + 16/116;
+        y = (y > 0.008856) ? Math.pow(y, 1/3) : (7.787 * y) + 16/116;
+        z = (z > 0.008856) ? Math.pow(z, 1/3) : (7.787 * z) + 16/116;
+
+        return { l: (116 * y) - 16, a: 500 * (x - y), b: 200 * (y - z) };
+    }
+
+    function deltaE(labA, labB){
+        const deltaL = labA.l - labB.l;
+        const deltaA = labA.a - labB.a;
+        const deltaB = labA.b - labB.b;
+        return Math.sqrt(Math.pow(deltaL, 2) + Math.pow(deltaA, 2) + Math.pow(deltaB, 2));
+    }
+
     function getThreadColor(threadId) {
-        if (!threadColors[threadId]) {
-            const usedColors = new Set(Object.values(threadColors));
-            const availableColors = COLORS.filter(c => !usedColors.has(c));
-            threadColors[threadId] = availableColors.length ? availableColors[0] : '#888'; // Default color if all are used
-            localStorage.setItem(COLORS_KEY, JSON.stringify(threadColors));
+        if (threadColors[threadId]) {
+            return threadColors[threadId];
         }
-        return threadColors[threadId];
+
+        const usedColorHexes = new Set(Object.values(threadColors));
+        const availableColors = COLORS.filter(c => !usedColorHexes.has(c));
+
+        if (availableColors.length === 0) {
+            // All colors from the palette are used, assign a fallback.
+            const fallbackColor = '#888';
+            threadColors[threadId] = fallbackColor;
+            localStorage.setItem(COLORS_KEY, JSON.stringify(threadColors));
+            return fallbackColor;
+        }
+
+        if (usedColorHexes.size === 0) {
+            // If no colors are in use, any color is fine. Pick a random one.
+            const randomColor = availableColors[Math.floor(Math.random() * availableColors.length)];
+            threadColors[threadId] = randomColor;
+            localStorage.setItem(COLORS_KEY, JSON.stringify(threadColors));
+            return randomColor;
+        }
+
+        const usedLabColors = Array.from(usedColorHexes).map(hex => rgbToLab(hexToRgb(hex)));
+
+        // For each available color, find its minimum distance to any of the used colors.
+        const colorDistances = availableColors.map(candidateHex => {
+            const candidateLab = rgbToLab(hexToRgb(candidateHex));
+            const minDistance = Math.min(
+                ...usedLabColors.map(usedLab => deltaE(candidateLab, usedLab))
+            );
+            return { color: candidateHex, distance: minDistance };
+        });
+
+        // Sort the candidates by their minimum distance in descending order.
+        colorDistances.sort((a, b) => b.distance - a.distance);
+
+        // The best candidate is the one with the largest minimum distance.
+        const colorToAssign = colorDistances[0].color;
+
+        threadColors[threadId] = colorToAssign;
+        localStorage.setItem(COLORS_KEY, JSON.stringify(threadColors));
+        return colorToAssign;
     }
 
     function toggleImageBlur(filehash) {
@@ -1309,47 +1395,182 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
 
     // --- Core Logic: Rendering, Fetching, Updating ---
 
-    function parseFilterRule(ruleString) {
-        const textRegex = /"([^"]*)"/g;
-        const md5Regex = /md5:([a-zA-Z0-9+/=]+)/gi;
-        const parsed = { text: [], md5: [] };
-        let match;
 
-        while ((match = textRegex.exec(ruleString)) !== null) {
-            parsed.text.push(match[1].toLowerCase());
+function isMessageFiltered(message, rules) {
+    const messageText = (message.text || '').toLowerCase();
+    const messageMd5 = message.attachment?.filehash_db_key || '';
+
+    const matchingFilterOutRule = rules.find(rule => {
+        if (!rule.enabled || rule.action !== 'filterOut') {
+            return false;
         }
-        while ((match = md5Regex.exec(ruleString)) !== null) {
-            parsed.md5.push(match[1]);
+
+        const matchContent = rule.matchContent; // Keep case for JSON parsing
+        if (!matchContent) return false;
+
+        switch (rule.category) {
+            case 'keyword':
+                return messageText.includes(matchContent.toLowerCase());
+            case 'attachedMedia':
+                // Do not convert to lower case, as MD5 (base64) is case sensitive.
+                return messageMd5 === matchContent.replace('md5:', '');
+            case 'entireMessage':
+                try {
+                    const conditions = JSON.parse(matchContent);
+                    const textMatch = conditions.text ? messageText.includes(conditions.text.toLowerCase()) : true;
+                    // Do not convert to lower case for media hash
+                    const mediaHashInRule = conditions.media ? conditions.media.replace('md5:', '') : null;
+                    const mediaMatch = mediaHashInRule ? messageMd5 === mediaHashInRule : true;
+                    return textMatch && mediaMatch;
+                } catch (e) {
+                    return messageText.includes(matchContent.toLowerCase());
+                }
+            case 'embeddedLink':
+                const urlRegex = /(https?:\/\/[^\s]+)/g;
+                let urls;
+                while ((urls = urlRegex.exec(message.text || '')) !== null) { // Use original case text for this check
+                    if (urls[0].toLowerCase().includes(matchContent.toLowerCase())) {
+                        return true;
+                    }
+                }
+                return false;
+            default:
+                return false;
         }
-        return parsed;
+    });
+
+    return !!matchingFilterOutRule;
+}
+
+function doesAnyRuleMatch(message, rules) {
+    const messageText = (message.text || '').toLowerCase();
+    const messageMd5 = message.attachment?.filehash_db_key || '';
+
+    return rules.some(rule => {
+        if (!rule.enabled) return false;
+        const matchContent = rule.matchContent;
+        if (!matchContent) return false;
+
+        switch (rule.category) {
+            case 'keyword':
+                return messageText.includes(matchContent.toLowerCase());
+            case 'attachedMedia':
+                // Do not convert to lower case, as MD5 (base64) is case sensitive.
+                return messageMd5 === matchContent.replace('md5:', '');
+            case 'entireMessage':
+                 try {
+                    const conditions = JSON.parse(matchContent);
+                    const textMatch = conditions.text ? messageText.includes(conditions.text.toLowerCase()) : false;
+                    // Do not convert to lower case for media hash
+                    const mediaHashInRule = conditions.media ? conditions.media.replace('md5:', '') : null;
+                    const mediaMatch = mediaHashInRule ? messageMd5 === mediaHashInRule : false;
+                    return textMatch || mediaMatch;
+                } catch (e) {
+                    // Fallback for old plain text rules
+                    const matchContentLower = matchContent.toLowerCase();
+                    return messageText.includes(matchContentLower) || (messageMd5 === matchContentLower);
+                }
+            case 'embeddedLink':
+                const urlRegex = /(https?:\/\/[^\s]+)/g;
+                let urls;
+                while ((urls = urlRegex.exec(message.text || '')) !== null) {
+                    if (urls[0].toLowerCase().includes(matchContent.toLowerCase())) {
+                        return true;
+                    }
+                }
+                return false;
+            default:
+                return false;
+        }
+    });
+}
+
+function applyFiltersToMessageContent(message, rules) {
+    const modifiedMessage = JSON.parse(JSON.stringify(message));
+    let modifiedText = modifiedMessage.text || '';
+    let attachmentFiltered = false;
+
+    for (const rule of rules) {
+        if (!rule.enabled || rule.action === 'filterOut') {
+            continue;
+        }
+
+        const matchContent = rule.matchContent;
+        const matchContentLower = matchContent.toLowerCase();
+
+        switch (rule.category) {
+            case 'keyword':
+                if (modifiedText.toLowerCase().includes(matchContentLower)) {
+                    if (rule.action === 'remove') {
+                        modifiedText = modifiedText.replace(new RegExp(matchContent.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'gi'), '');
+                    } else if (rule.action === 'replace') {
+                        modifiedText = modifiedText.replace(new RegExp(matchContent.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'gi'), rule.replaceContent);
+                    }
+                }
+                break;
+            case 'attachedMedia':
+                if (modifiedMessage.attachment && modifiedMessage.attachment.filehash_db_key === matchContent.replace('md5:', '')) {
+                    if (rule.action === 'remove' || rule.action === 'replace') {
+                        attachmentFiltered = true;
+                    }
+                }
+                break;
+            case 'embeddedLink':
+                const urlRegex = /(https?:\/\/[^\s]+)/g;
+                if (rule.action === 'remove') {
+                    modifiedText = modifiedText.replace(urlRegex, (url) => {
+                        return url.toLowerCase().includes(matchContentLower) ? '' : url;
+                    });
+                } else if (rule.action === 'replace') {
+                    modifiedText = modifiedText.replace(urlRegex, (url) => {
+                        return url.toLowerCase().includes(matchContentLower) ? rule.replaceContent : url;
+                    });
+                }
+                break;
+            case 'entireMessage':
+                try {
+                    const conditions = JSON.parse(matchContent);
+                    const textToMatch = conditions.text;
+                    const mediaToMatch = conditions.media ? conditions.media.replace('md5:', '') : null;
+
+                    const textMatches = textToMatch && modifiedText.toLowerCase().includes(textToMatch.toLowerCase());
+                    const mediaMatches = mediaToMatch && modifiedMessage.attachment && modifiedMessage.attachment.filehash_db_key === mediaToMatch;
+
+                    if (textMatches && mediaMatches) { // AND logic for applying filter
+                        if (rule.action === 'remove') {
+                            modifiedText = modifiedText.replace(new RegExp(textToMatch.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'gi'), '');
+                            attachmentFiltered = true;
+                        } else if (rule.action === 'replace') {
+                            modifiedText = modifiedText.replace(new RegExp(textToMatch.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'gi'), rule.replaceContent);
+                            attachmentFiltered = true; // Also remove/replace attachment
+                        }
+                    }
+                } catch (e) {
+                    // Fallback for old plain text rules
+                    if (modifiedText.toLowerCase().includes(matchContentLower)) {
+                        if (rule.action === 'remove') {
+                            modifiedText = modifiedText.replace(new RegExp(matchContent.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'gi'), '');
+                        } else if (rule.action === 'replace') {
+                            modifiedText = modifiedText.replace(new RegExp(matchContent.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'gi'), rule.replaceContent);
+                        }
+                    }
+                    if (modifiedMessage.attachment && modifiedMessage.attachment.filehash_db_key === matchContentLower) {
+                        if (rule.action === 'remove' || rule.action === 'replace') {
+                            attachmentFiltered = true;
+                        }
+                    }
+                }
+                break;
+        }
     }
 
-    function isMessageFiltered(message, parsedRules) {
-        const messageText = (message.text || '').toLowerCase();
-        const messageMd5 = message.attachment?.filehash_db_key || '';
-
-        for (const rule of parsedRules) {
-            const hasText = rule.text.length > 0;
-            const hasMd5 = rule.md5.length > 0;
-
-            if (!hasText && !hasMd5) continue;
-
-            let textMatch = !hasText;
-            if (hasText) {
-                textMatch = rule.text.every(t => messageText.includes(t));
-            }
-
-            let md5Match = !hasMd5;
-            if (hasMd5) {
-                md5Match = rule.md5.some(m => messageMd5 === m);
-            }
-
-            if (textMatch && md5Match) {
-                return true;
-            }
-        }
-        return false;
+    modifiedMessage.text = modifiedText;
+    if (attachmentFiltered) {
+        modifiedMessage.attachment = null;
     }
+
+    return modifiedMessage;
+}
 
     function renderThreadList() {
         const threadDisplayContainer = document.getElementById('otk-thread-display-container');
@@ -1368,6 +1589,9 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
             return;
         }
 
+    const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+    const timePosition = themeSettings.otkThreadTimePosition || 'After Title';
+
         // Prepare display objects, ensuring messages exist for titles/times
         const threadDisplayObjects = activeThreads.map(threadId => {
             const messages = messagesByThreadId[threadId] || [];
@@ -1377,7 +1601,7 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
 
 
             if (messages.length > 0 && messages[0]) {
-                title = messages[0].title ? decodeEntities(messages[0].title) : `Thread ${threadId}`;
+                title = messages[0].title ? toTitleCase(decodeEntities(messages[0].title)) : `Thread ${threadId}`;
                 firstMessageTime = messages[0].time;
             } else {
                 consoleWarn(`Thread ${threadId} has no messages or messages[0] is undefined for title/time. Using default title.`);
@@ -1404,7 +1628,7 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
             let marginBottom = index < (threadsToDisplayInList.length -1) ? '0px' : '3px';
             threadItemDiv.style.cssText = `
                 display: flex;
-                align-items: flex-start;
+                align-items: center;
                 padding: 4px;
                 border-radius: 3px;
                 margin-bottom: ${marginBottom};
@@ -1418,7 +1642,7 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
                 border-radius: 2px;
                 margin-right: 6px;
                 flex-shrink: 0;
-                margin-top: 1px;
+                border: var(--otk-gui-thread-box-outline, none);
             `;
             threadItemDiv.appendChild(colorBox);
 
@@ -1448,17 +1672,34 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
 
             const time = new Date(thread.firstMessageTime * 1000);
             const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-            const formattedTimestamp = `[${timeStr}]`;
+
+            const bracketStyle = themeSettings.otkThreadTimeBracketStyle || '[]';
+            const bracketColor = themeSettings.otkThreadTimeBracketColor || 'var(--otk-gui-threadlist-time-color)';
+
             const timestampSpan = document.createElement('span');
-            timestampSpan.textContent = formattedTimestamp;
-            let timestampSpanStyle = `
-                font-size: 10px;
-                color: var(--otk-gui-threadlist-time-color);
-                margin-left: 5px;
-            `;
+            timestampSpan.style.marginLeft = '5px';
+
+            if (bracketStyle !== 'none') {
+                const openBracket = document.createElement('span');
+                openBracket.textContent = bracketStyle[0];
+                openBracket.style.color = bracketColor;
+                timestampSpan.appendChild(openBracket);
+            }
+
+            const timeText = document.createElement('span');
+            timeText.textContent = timeStr;
+            timeText.style.color = 'var(--otk-gui-threadlist-time-color)';
+            timeText.style.fontSize = '12px'; // Match title font size
+            timestampSpan.appendChild(timeText);
+
+            if (bracketStyle !== 'none') {
+                const closeBracket = document.createElement('span');
+                closeBracket.textContent = bracketStyle[1];
+                closeBracket.style.color = bracketColor;
+                timestampSpan.appendChild(closeBracket);
+            }
 
             titleLink.style.cssText = titleLinkStyle;
-            timestampSpan.style.cssText = timestampSpanStyle;
 
             titleLink.onmouseover = () => { titleLink.style.textDecoration = 'underline'; };
             titleLink.onmouseout = () => { titleLink.style.textDecoration = 'none'; };
@@ -1513,8 +1754,29 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
             const titleTimeContainer = document.createElement('div');
             titleTimeContainer.style.display = 'flex';
             titleTimeContainer.style.alignItems = 'baseline';
+
+            const dividerEnabled = themeSettings.otkThreadTimeDividerEnabled || false;
+            const dividerSymbol = themeSettings.otkThreadTimeDividerSymbol || '|';
+            const dividerColor = themeSettings.otkThreadTimeDividerColor || '#ffffff';
+
+            if (timePosition === 'Before Title') {
+                titleTimeContainer.appendChild(timestampSpan);
+            }
+
+            if (dividerEnabled) {
+                const dividerSpan = document.createElement('span');
+                dividerSpan.textContent = ` ${dividerSymbol} `;
+                dividerSpan.style.color = dividerColor;
+                dividerSpan.style.fontSize = '10px';
+                dividerSpan.style.margin = '0 3px';
+                titleTimeContainer.appendChild(dividerSpan);
+            }
+
             titleTimeContainer.appendChild(titleLink);
-            titleTimeContainer.appendChild(timestampSpan);
+
+            if (timePosition === 'After Title') {
+                titleTimeContainer.appendChild(timestampSpan);
+            }
 
             const crayonIcon = document.createElement('span');
             crayonIcon.innerHTML = '🖍️';
@@ -1628,19 +1890,14 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
                 const textContentDiv = lastThreadItemDiv?.children[1];
                 if (textContentDiv && textContentDiv.firstChild) {
                     const titleTimeContainer = textContentDiv.firstChild;
-                    const timestampSpan = titleTimeContainer.querySelector('span');
+                    const titleLink = titleTimeContainer.querySelector('a');
 
-                    if (timestampSpan && timestampSpan.parentNode === titleTimeContainer) {
-                        timestampSpan.parentNode.insertBefore(hoverContainer, timestampSpan.nextSibling);
-                    } else if (titleTimeContainer) {
-                        titleTimeContainer.appendChild(hoverContainer);
-                        consoleWarn('Timestamp span not found for (+n), appended to title-time container.');
-                    } else if (textContentDiv) {
-                        textContentDiv.appendChild(hoverContainer);
-                        consoleWarn('Title-time container not found for (+n), appended to text content div.');
+                    if (timePosition === 'Before Title') {
+                        // When time is before the title, append after the title link.
+                        titleLink.parentNode.insertBefore(hoverContainer, titleLink.nextSibling);
                     } else {
-                        threadDisplayContainer.appendChild(hoverContainer);
-                        consoleWarn('Last thread item structure not found for (+n), appended to thread display container.');
+                        // When time is after the title, append to the end of the container.
+                        titleTimeContainer.appendChild(hoverContainer);
                     }
                 }
             } else {
@@ -1869,15 +2126,64 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
 
         otkViewer.innerHTML = ''; // Clear previous content
 
+        messagesByThreadId = await loadMessagesFromDB();
+
         let allMessages = getAllMessagesSorted();
 
     const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
     const messageLimitEnabled = themeSettings.otkMessageLimitEnabled !== false;
-    const messageLimitValue = parseInt(themeSettings.otkMessageLimitValue || '500', 10);
+    if (messageLimitEnabled) {
+        const messageLimitValue = parseInt(themeSettings.otkMessageLimitValue || '500', 10);
+        consoleLog(`[ViewerPruning] Message limit check: Total messages=${allMessages.length}, Limit=${messageLimitValue}, Enabled=${messageLimitEnabled}`);
+        if (allMessages.length > messageLimitValue) {
+            consoleLog(`[ViewerPruning] Message limit exceeded. Starting advanced pruning for viewer.`);
 
-        if (messageLimitEnabled && allMessages.length > messageLimitValue) {
-            allMessages = allMessages.slice(allMessages.length - messageLimitValue);
+            const allMessagesById = new Map(allMessages.map(m => [m.id, m]));
+            const newestMessages = allMessages.slice(-messageLimitValue);
+            const messagesToKeepIds = new Set(newestMessages.map(m => m.id));
+            const quoteRegex = />>(\d+)/g;
+            const processingQueue = [...newestMessages];
+
+            consoleLog(`[ViewerPruning] Initial set of newest messages for quote chasing: ${processingQueue.length}`);
+
+            let processedCount = 0;
+            const MAX_PROCESSED = processingQueue.length * 5; // Safety break
+
+            while (processingQueue.length > 0) {
+                processedCount++;
+                if (processedCount > MAX_PROCESSED) {
+                    consoleWarn("[ViewerPruning] Exceeded max processing iterations. Breaking quote search to prevent infinite loop.");
+                    break;
+                }
+
+                const message = processingQueue.shift();
+                if (!message || !message.text) continue;
+
+                let match;
+                while ((match = quoteRegex.exec(message.text)) !== null) {
+                    const quoteId = parseInt(match[1], 10);
+                    if (!messagesToKeepIds.has(quoteId)) {
+                        messagesToKeepIds.add(quoteId);
+                        const quotedMessage = allMessagesById.get(quoteId);
+                        if (quotedMessage) {
+                            processingQueue.push(quotedMessage);
+                        }
+                    }
+                }
+            }
+            consoleLog(`[ViewerPruning] Total messages to keep after quote search: ${messagesToKeepIds.size}`);
+
+            allMessages = allMessages.filter(m => messagesToKeepIds.has(m.id));
+
+        // Enforce the hard limit after context-aware quote chasing
+        if (allMessages.length > messageLimitValue) {
+            consoleLog(`[ViewerPruning] Post-quote-chase count (${allMessages.length}) exceeds limit. Trimming to ${messageLimitValue} newest messages from the context-aware set.`);
+            allMessages = allMessages.slice(-messageLimitValue);
         }
+
+            consoleLog(`[ViewerPruning] Pruning complete. Messages to render in viewer: ${allMessages.length}`);
+        }
+    }
         if (!allMessages || allMessages.length === 0) {
             otkViewer.textContent = 'No messages found to display.'; // User-friendly message
             consoleWarn(`No messages to render in viewer.`);
@@ -1928,13 +2234,12 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
         for (let i = 0; i < totalMessagesToRender; i++) {
             const message = allMessages[i];
 
-            renderedMessageIdsInViewer.add(message.id);
-
             const boardForLink = message.board || 'b';
             const threadColor = getThreadColor(message.originalThreadId);
 
             const messageElement = createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, true, 0, threadColor, null); // Top-level messages have no parent
             if (messageElement) {
+                renderedMessageIdsInViewer.add(message.id);
                 messagesContainer.appendChild(messageElement);
                 const wrappers = messageElement.querySelectorAll('.otk-youtube-embed-wrapper, .otk-twitch-embed-wrapper, .otk-streamable-embed-wrapper, .otk-tweet-embed-wrapper');
                 wrappers.forEach(wrapper => embedWrappers.push(wrapper));
@@ -2040,6 +2345,9 @@ updateDisplayedStatistics(false); // Update stats after all media processing is 
             return;
         }
 
+        const messageElementsBefore = messagesContainer.querySelectorAll('.otk-message-container-main');
+        consoleLog(`[AppendLimit] Before append: DOM has ${messageElementsBefore.length} messages. renderedMessageIdsInViewer has ${renderedMessageIdsInViewer.size} IDs.`);
+
         let anchorInfo = { id: null, offset: 0 };
         const containerRect = messagesContainer.getBoundingClientRect();
         const messageElements = messagesContainer.querySelectorAll('.otk-message-container-main, .otk-message-container-quote-depth-1');
@@ -2065,26 +2373,35 @@ updateDisplayedStatistics(false); // Update stats after all media processing is 
 
         const newContentDiv = document.createElement('div');
 
+        const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
         const separatorDiv = document.createElement('div');
-        separatorDiv.style.cssText = `
-            border-top: 2px dashed var(--otk-new-messages-divider-color);
-            margin: 20px 0;
-            padding-top: 10px;
-            padding-bottom: 10px;
-            padding-left: 15px;
-            text-align: left;
-            color: var(--otk-new-messages-font-color);
-            font-size: var(--otk-new-messages-font-size);
-            font-style: italic;
-            width: 100%;
-            box-sizing: border-box;
-        `;
+        const separatorAlignment = themeSettings.otkNewMessagesSeparatorAlignment || 'left';
+        separatorDiv.style.borderTop = '2px dashed var(--otk-new-messages-divider-color)';
+        separatorDiv.style.margin = '20px 0';
+        separatorDiv.style.paddingTop = '10px';
+        separatorDiv.style.paddingBottom = '10px';
+        separatorDiv.style.color = 'var(--otk-new-messages-font-color)';
+        separatorDiv.style.fontSize = 'var(--otk-new-messages-font-size)';
+        separatorDiv.style.fontStyle = 'italic';
+        separatorDiv.style.width = '100%';
+        separatorDiv.style.boxSizing = 'border-box';
+
+        if (separatorAlignment.toLowerCase() === 'center') {
+            separatorDiv.style.textAlign = 'center';
+            const scrollbarWidth = messagesContainer.offsetWidth - messagesContainer.clientWidth;
+            if (scrollbarWidth > 0) {
+                separatorDiv.style.position = 'relative';
+                separatorDiv.style.left = `${scrollbarWidth / 2}px`;
+            }
+        } else {
+            separatorDiv.style.textAlign = separatorAlignment.toLowerCase();
+            separatorDiv.style.paddingLeft = '0px';
+        }
         const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
         separatorDiv.textContent = `--- ${currentTime} : ${newMessages.length} New Messages Loaded ---`;
         newContentDiv.appendChild(separatorDiv);
 
         const mediaLoadPromises = [];
-        const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
         const messageLimitEnabled = themeSettings.otkMessageLimitEnabled !== false;
         const messageLimitValue = parseInt(themeSettings.otkMessageLimitValue || '500', 10);
 
@@ -2092,17 +2409,22 @@ updateDisplayedStatistics(false); // Update stats after all media processing is 
             const boardForLink = message.board || 'b';
             const threadColor = getThreadColor(message.originalThreadId);
             const messageElement = createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, true, 0, threadColor, null);
-            newContentDiv.appendChild(messageElement);
-            renderedMessageIdsInViewer.add(message.id);
+            if (messageElement) {
+                newContentDiv.appendChild(messageElement);
+                renderedMessageIdsInViewer.add(message.id);
+            }
         }
 
         messagesContainer.appendChild(newContentDiv);
+
+        const messageElementsAfter = messagesContainer.querySelectorAll('.otk-message-container-main');
+        consoleLog(`[AppendLimit] After append: DOM has ${messageElementsAfter.length} messages. renderedMessageIdsInViewer has ${renderedMessageIdsInViewer.size} IDs.`);
 
         if (messageLimitEnabled) {
             const messageElements = messagesContainer.querySelectorAll('.otk-message-container-main');
             if (messageElements.length > messageLimitValue) {
                 const numToRemove = messageElements.length - messageLimitValue;
-                consoleLog(`[MessageLimit] Viewer message limit exceeded by ${numToRemove}. Removing oldest messages.`);
+                consoleLog(`[AppendLimit] Exceeds limit of ${messageLimitValue}. Removing ${numToRemove} oldest messages.`);
                 for (let i = 0; i < numToRemove; i++) {
                     const messageToRemove = messageElements[i];
                     const messageId = parseInt(messageToRemove.dataset.messageId, 10);
@@ -2111,6 +2433,8 @@ updateDisplayedStatistics(false); // Update stats after all media processing is 
                     }
                     messageToRemove.remove();
                 }
+                const messageElementsFinal = messagesContainer.querySelectorAll('.otk-message-container-main');
+                consoleLog(`[AppendLimit] After removal: DOM has ${messageElementsFinal.length} messages. renderedMessageIdsInViewer has ${renderedMessageIdsInViewer.size} IDs.`);
             }
         }
 
@@ -2178,7 +2502,12 @@ function _populateAttachmentDivWithMedia(
         return;
     }
 
-    const mediaLoadMode = localStorage.getItem('otkMediaLoadMode') || 'source_first';
+    const isArchived = !activeThreads.includes(message.originalThreadId);
+    const mediaLoadModeSetting = localStorage.getItem('otkMediaLoadMode') || 'source_first';
+    const mediaLoadMode = isArchived ? 'cache_only' : mediaLoadModeSetting;
+    if (isArchived && mediaLoadModeSetting !== 'cache_only') {
+        consoleLog(`[MediaLoad] Message ${message.id} is in archived thread ${message.originalThreadId}. Forcing cache-only mode.`);
+    }
     const extLower = message.attachment.ext.toLowerCase();
     const filehash = message.attachment.filehash_db_key || `${message.attachment.tim}${extLower}`;
 
@@ -2591,18 +2920,296 @@ function wrapInCollapsibleContainer(elementsToWrap) {
     return container;
 }
 
+function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, ancestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline) {
+    const textElement = document.createElement('div');
+    textElement.style.whiteSpace = 'pre-wrap';
+    textElement.style.overflowWrap = 'break-word';
+    textElement.style.wordBreak = 'normal';
+
+    if (isTopLevelMessage) {
+        textElement.style.fontSize = 'var(--otk-msg-depth0-content-font-size)';
+    } else if (currentDepth === 1) {
+        textElement.style.fontSize = 'var(--otk-msg-depth1-content-font-size)';
+    } else {
+        textElement.style.fontSize = 'var(--otk-msg-depth2plus-content-font-size)';
+    }
+
+    if (shouldDisableUnderline) {
+        textElement.style.marginTop = '0px';
+        textElement.style.paddingTop = '0px';
+    }
+
+    if (message.text && typeof message.text === 'string') {
+        const lines = message.text.split('\n');
+        const quoteRegex = /^>>(\d+)/;
+        const inlineQuoteRegex = />>(\d+)/;
+
+        lines.forEach((line, lineIndex) => {
+            const trimmedLine = line.trim();
+            const isBlockQuote = trimmedLine.match(quoteRegex) && trimmedLine.match(quoteRegex)[0] === trimmedLine;
+            if (isBlockQuote && currentDepth >= MAX_QUOTE_DEPTH) {
+                return;
+            }
+
+            let processedAsEmbed = false;
+            let soleUrlEmbedMade = false;
+
+            const youtubePatterns = [
+                { regex: /^(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?(?=.*v=([a-zA-Z0-9_-]+))(?:[?&%#\w\-=\.\/;:]+)+$/, idGroup: 1 },
+                { regex: /^(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 },
+                { regex: /^(?:https?:\/\/)?youtu\.be\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 }
+            ];
+            const youtubeTimestampRegex = /[?&]t=([0-9hm_s]+)/;
+            const inlineYoutubePatterns = [
+                { type: 'watch', regex: /(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?(?:[^#&?\s]*&)*v=([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;]*)?/, idGroup: 1 },
+                { type: 'short', regex: /(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;]*)?/, idGroup: 1 },
+                { type: 'youtu.be', regex: /(?:https?:\/\/)?youtu\.be\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;]*)?/, idGroup: 1 }
+            ];
+            const twitchPatterns = [
+                { type: 'clip_direct', regex: /^(?:https?:\/\/)?clips\.twitch\.tv\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 },
+                { type: 'clip_channel', regex: /^(?:https?:\/\/)?(?:www\.)?twitch\.tv\/[a-zA-Z0-9_]+\/clip\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 },
+                { type: 'vod', regex: /^(?:https?:\/\/)?(?:www\.)?twitch\.tv\/(?:videos|v)\/(\d+)(?:[?&%#\w\-=\.\/;:]*)?$/, idGroup: 1 }
+            ];
+            const twitchTimestampRegex = /[?&]t=((?:\d+h)?(?:\d+m)?(?:\d+s)?)/;
+            const inlineTwitchPatterns = [
+                { type: 'clip_direct', regex: /(?:https?:\/\/)?clips\.twitch\.tv\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 },
+                { type: 'clip_channel', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/[a-zA-Z0-9_]+\/clip\/([a-zA-Z0-9_-]+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 },
+                { type: 'vod', regex: /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/(?:videos|v)\/(\d+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 }
+            ];
+            const streamablePatterns = [
+                { type: 'video', regex: /^(?:https?:\/\/)?streamable\.com\/([a-zA-Z0-9]+)(?:[?#][^\s]*)?$/, idGroup: 1 }
+            ];
+            const inlineStreamablePatterns = [
+                { type: 'video', regex: /(?:https?:\/\/)?streamable\.com\/([a-zA-Z0-9]+)(?:[?&%#\w\-=\.\/;:]*)?/, idGroup: 1 }
+            ];
+            const tiktokPatterns = [
+                { type: 'video', regex: /^(?:https?:\/\/)?(?:www\.)?tiktok\.com\/@[\w.-]+\/video\/(\d+)/, idGroup: 1 }
+            ];
+            const inlineTiktokPatterns = [
+                { type: 'video', regex: /(?:https?:\/\/)?(?:www\.)?tiktok\.com\/@[\w.-]+\/video\/(\d+)/, idGroup: 1 }
+            ];
+            const kickPatterns = [
+                { type: 'clip', regex: /^(?:https?:\/\/)?kick\.com\/[\w.-]+\?clip=([\w-]+)/, idGroup: 1 }
+            ];
+            const inlineKickPatterns = [
+                { type: 'clip', regex: /(?:https?:\/\/)?kick\.com\/[\w.-]+\?clip=([\w-]+)/, idGroup: 1 }
+            ];
+
+            if (!soleUrlEmbedMade) {
+                for (const patternObj of youtubePatterns) {
+                    const match = trimmedLine.match(patternObj.regex);
+                    if (match) {
+                        const videoId = match[patternObj.idGroup];
+                        let timestampStr = null;
+                        const timeMatch = trimmedLine.match(youtubeTimestampRegex);
+                        if (timeMatch && timeMatch[1]) timestampStr = timeMatch[1];
+                        if (videoId) {
+                            textElement.appendChild(createYouTubeEmbedElement(videoId, timestampStr));
+                            soleUrlEmbedMade = true;
+                            processedAsEmbed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!soleUrlEmbedMade) {
+                for (const patternObj of twitchPatterns) {
+                    const match = trimmedLine.match(patternObj.regex);
+                    if (match) {
+                        const id = match[patternObj.idGroup];
+                        let timestampStr = null;
+                        if (patternObj.type === 'vod') {
+                            const timeMatch = trimmedLine.match(twitchTimestampRegex);
+                            if (timeMatch && timeMatch[1]) timestampStr = timeMatch[1];
+                        }
+                        if (id) {
+                            textElement.appendChild(createTwitchEmbedElement(patternObj.type, id, timestampStr));
+                            soleUrlEmbedMade = true;
+                            processedAsEmbed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!soleUrlEmbedMade) {
+                for (const patternObj of tiktokPatterns) {
+                    const match = trimmedLine.match(patternObj.regex);
+                    if (match) {
+                        const videoId = match[patternObj.idGroup];
+                        if (videoId) {
+                            textElement.appendChild(createTikTokEmbedElement(videoId));
+                            soleUrlEmbedMade = true;
+                            processedAsEmbed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!soleUrlEmbedMade) {
+                for (const patternObj of streamablePatterns) {
+                    const match = trimmedLine.match(patternObj.regex);
+                    if (match) {
+                        const videoId = match[patternObj.idGroup];
+                        if (videoId) {
+                            textElement.appendChild(createStreamableEmbedElement(videoId));
+                            soleUrlEmbedMade = true;
+                            processedAsEmbed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!soleUrlEmbedMade) {
+                let currentTextSegment = line;
+                while (currentTextSegment.length > 0) {
+                    let earliestMatch = null;
+                    let earliestMatchPattern = null;
+                    let earliestMatchType = null;
+                    let earliestMatchIsQuoteLink = false;
+
+                    for (const patternObj of [...inlineYoutubePatterns, ...inlineKickPatterns, ...inlineTiktokPatterns, ...inlineTwitchPatterns, ...inlineStreamablePatterns]) {
+                        const matchAttempt = currentTextSegment.match(patternObj.regex);
+                        if (matchAttempt && (earliestMatch === null || matchAttempt.index < earliestMatch.index)) {
+                            earliestMatch = matchAttempt;
+                            earliestMatchPattern = patternObj;
+                            if (inlineYoutubePatterns.includes(patternObj)) earliestMatchType = 'youtube';
+                            else if (inlineKickPatterns.includes(patternObj)) earliestMatchType = 'kick';
+                            else if (inlineTiktokPatterns.includes(patternObj)) earliestMatchType = 'tiktok';
+                            else if (inlineTwitchPatterns.includes(patternObj)) earliestMatchType = 'twitch';
+                            else if (inlineStreamablePatterns.includes(patternObj)) earliestMatchType = 'streamable';
+                            earliestMatchIsQuoteLink = false;
+                        }
+                    }
+
+                    const quoteLinkMatch = currentTextSegment.match(inlineQuoteRegex);
+                    if (quoteLinkMatch && (earliestMatch === null || quoteLinkMatch.index < earliestMatch.index)) {
+                        earliestMatch = quoteLinkMatch;
+                        earliestMatchType = null;
+                        earliestMatchIsQuoteLink = true;
+                    }
+
+                    if (earliestMatch) {
+                        processedAsEmbed = true;
+                        if (earliestMatch.index > 0) {
+                            textElement.appendChild(document.createTextNode(currentTextSegment.substring(0, earliestMatch.index)));
+                        }
+                        const matchedText = earliestMatch[0];
+                        if (earliestMatchIsQuoteLink) {
+                            if (currentDepth >= MAX_QUOTE_DEPTH) {
+                                textElement.appendChild(document.createTextNode(matchedText));
+                            } else {
+                                const quotedMessageId = earliestMatch[1];
+                                let quotedMessageObject = null;
+                                for (const threadIdKey in messagesByThreadId) {
+                                    if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
+                                        const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === Number(quotedMessageId));
+                                        if (foundMsg) {
+                                            quotedMessageObject = foundMsg;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (quotedMessageObject) {
+                                    const quotedElement = createMessageElementDOM(quotedMessageObject, mediaLoadPromises, uniqueImageViewerHashes, quotedMessageObject.board || boardForLink, false, currentDepth + 1, null, message.id, ancestors);
+                                    if (quotedElement) {
+                                        textElement.appendChild(quotedElement);
+                                    }
+                                } else {
+                                    const notFoundSpan = document.createElement('span');
+                                    notFoundSpan.textContent = `>>${quotedMessageId} (Not Found)`;
+                                    notFoundSpan.style.color = '#88ccee';
+                                    notFoundSpan.style.textDecoration = 'underline';
+                                    textElement.appendChild(notFoundSpan);
+                                }
+                            }
+                        } else {
+                            const id = earliestMatch[earliestMatchPattern.idGroup];
+                            let timestampStr = null;
+                            let embedElement = null;
+                            if (earliestMatchType === 'youtube') {
+                                const timeMatchInUrl = matchedText.match(youtubeTimestampRegex);
+                                if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
+                                embedElement = createYouTubeEmbedElement(id, timestampStr);
+                            } else if (earliestMatchType === 'twitch') {
+                                if (earliestMatchPattern.type === 'vod') {
+                                    const timeMatchInUrl = matchedText.match(twitchTimestampRegex);
+                                    if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
+                                }
+                                embedElement = createTwitchEmbedElement(earliestMatchPattern.type, id, timestampStr);
+                            } else if (earliestMatchType === 'streamable') {
+                                embedElement = createStreamableEmbedElement(id);
+                            } else if (earliestMatchType === 'tiktok') {
+                                embedElement = createTikTokEmbedElement(id);
+                            } else if (earliestMatchType === 'kick') {
+                                embedElement = createKickEmbedElement(id);
+                            }
+                            if (embedElement) {
+                                textElement.appendChild(embedElement);
+                            }
+                        }
+                        currentTextSegment = currentTextSegment.substring(earliestMatch.index + matchedText.length);
+                    } else {
+                        if (currentTextSegment.length > 0) {
+                            if (textElement.lastChild && textElement.lastChild.nodeType === 1 && textElement.lastChild.tagName !== 'BR' && !/^\s/.test(currentTextSegment)) {
+                                textElement.appendChild(document.createTextNode(' '));
+                            }
+                            textElement.appendChild(document.createTextNode(currentTextSegment));
+                        }
+                        currentTextSegment = "";
+                    }
+                }
+            }
+            if (lineIndex < lines.length - 1 && (trimmedLine.length > 0 || processedAsEmbed)) {
+                textElement.appendChild(document.createElement('br'));
+            }
+        });
+    } else {
+        textElement.textContent = message.text || '';
+    }
+
+    if (shouldDisableUnderline && textElement.firstChild && textElement.firstChild.nodeName === 'BR') {
+        textElement.removeChild(textElement.firstChild);
+    }
+
+    let attachmentDiv = null;
+    if (message.attachment && message.attachment.tim) {
+        const actualBoardForLink = boardForLink || message.board || 'b';
+        attachmentDiv = document.createElement('div');
+        attachmentDiv.style.marginTop = '10px';
+
+        if (shouldDisplayFilenames) {
+            const filenameLink = document.createElement('a');
+            filenameLink.textContent = `${message.attachment.filename} (${message.attachment.ext.substring(1)})`;
+            filenameLink.href = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
+            filenameLink.target = "_blank";
+            filenameLink.style.cssText = "color: #60a5fa; display: block; margin-bottom: 5px; text-decoration: underline;";
+            attachmentDiv.appendChild(filenameLink);
+        }
+
+        _populateAttachmentDivWithMedia(
+            attachmentDiv, message, actualBoardForLink, mediaLoadPromises,
+            uniqueImageViewerHashes, isTopLevelMessage, 'default',
+            renderedFullSizeImageHashes, viewerTopLevelAttachedVideoHashes, otkMediaDB
+        );
+    }
+
+    return [textElement, attachmentDiv];
+}
     // Signature now includes parentMessageId and ancestors
     function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId = null, ancestors = new Set()) {
-        const filterRules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
-        const parsedRules = filterRules.map(parseFilterRule);
-        const isFiltered = isMessageFiltered(message, parsedRules);
+        const filterRules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
 
-        if (isFiltered) {
-            if (currentDepth === 0 && (!message.text || !message.text.includes('>>'))) {
-                consoleLog(`[Filter] Removing filtered top-level message ${message.id} because it has no quotes.`);
+        const shouldBeFilteredOut = isMessageFiltered(message, filterRules);
+        if (shouldBeFilteredOut) {
+            if (!(currentDepth === 0 && message.text && message.text.includes('>>'))) {
+                consoleLog(`[Filter] Filtering out message ${message.id} due to a 'filterOut' rule.`);
                 return null;
             }
         }
+
+        const processedMessage = applyFiltersToMessageContent(message, filterRules);
+        const isFiltered = shouldBeFilteredOut || doesAnyRuleMatch(message, filterRules);
 
         // const layoutStyle = localStorage.getItem('otkMessageLayoutStyle') || 'default';
         consoleLog(`[DepthCheck] Rendering message: ${message.id}, parent: ${parentMessageId}, currentDepth: ${currentDepth}, MAX_QUOTE_DEPTH: ${MAX_QUOTE_DEPTH}, isTopLevel: ${isTopLevelMessage}`);
@@ -2793,9 +3400,6 @@ function wrapInCollapsibleContainer(elementsToWrap) {
                 width: 100%;
             `;
 
-            if (isFiltered) {
-                messageHeader.style.textDecoration = 'line-through';
-            }
 
             if (shouldDisableUnderline) {
                 messageHeader.style.borderBottom = 'none';
@@ -2825,6 +3429,7 @@ function wrapInCollapsibleContainer(elementsToWrap) {
                         margin-right: 6px; /* Space between square and '#' */
                         border-radius: 2px; /* Optional: for rounded corners */
                         flex-shrink: 0; /* Prevent square from shrinking */
+                        border: var(--otk-viewer-thread-box-outline, none);
                     `;
                     leftHeaderContent.appendChild(colorSquare);
                 }
@@ -2832,6 +3437,9 @@ function wrapInCollapsibleContainer(elementsToWrap) {
                 const idSpan = document.createElement('span');
                 idSpan.textContent = `#${message.id}`;
                 idSpan.style.cursor = 'pointer';
+                if (isFiltered) {
+                    idSpan.style.textDecoration = 'line-through';
+                }
                 idSpan.addEventListener('click', (e) => {
                     e.stopPropagation();
                     const threadUrl = `https://boards.4chan.org/b/thread/${message.originalThreadId}`;
@@ -2852,9 +3460,13 @@ function wrapInCollapsibleContainer(elementsToWrap) {
                     }
                 });
 
-                const timeText = document.createTextNode(`\u00A0| ${timestampParts.time}`);
+                const timeTextSpan = document.createElement('span');
+                timeTextSpan.textContent = `\u00A0| ${timestampParts.time}`;
+                if (isFiltered) {
+                    timeTextSpan.style.textDecoration = 'line-through';
+                }
                 leftHeaderContent.appendChild(idSpan);
-                leftHeaderContent.appendChild(timeText);
+                leftHeaderContent.appendChild(timeTextSpan);
 
                 const blockIcon = document.createElement('span');
                 blockIcon.innerHTML = '&#128711;'; // Block icon
@@ -2877,25 +3489,52 @@ function wrapInCollapsibleContainer(elementsToWrap) {
 
                 blockIcon.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    let rule = '';
-                    if (message.text) {
-                        const cleanedText = message.text.replace(/>>\d+(\s\(You\))?/g, '').trim();
-                        if (cleanedText) {
-                            rule += `"${cleanedText}"`;
+
+                    const hasText = message.text && message.text.replace(/>>\d+(\s\(You\))?/g, '').trim().length > 0;
+                    const hasAttachment = message.attachment && message.attachment.filehash_db_key;
+
+                    const newRule = {
+                        id: Date.now(),
+                        action: 'filterOut',
+                        enabled: true,
+                        category: 'keyword', // default
+                        matchContent: '',
+                        replaceContent: ''
+                    };
+
+                    if (hasText && hasAttachment) {
+                        newRule.category = 'entireMessage';
+                        try {
+                            newRule.matchContent = JSON.stringify({
+                                text: message.text.replace(/>>\d+(\s\(You\))?/g, '').trim(),
+                                media: `md5:${message.attachment.filehash_db_key}`
+                            }, null, 2);
+                        } catch (err) {
+                            consoleError("Failed to stringify composite filter", err);
+                            // Fallback to simpler filter if stringify fails
+                            newRule.category = 'attachedMedia';
+                            newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
                         }
+                    } else if (hasText) {
+                        newRule.category = 'keyword';
+                        newRule.matchContent = message.text.replace(/>>\d+(\s\(You\))?/g, '').trim();
+                    } else if (hasAttachment) {
+                        newRule.category = 'attachedMedia';
+                        newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
                     }
-                    if (message.attachment && message.attachment.filehash_db_key) {
-                        rule += ` md5:${message.attachment.filehash_db_key}`;
-                    }
+
                     const filterWindow = document.getElementById('otk-filter-window');
                     if (filterWindow) {
                         filterWindow.style.display = 'flex';
-                        renderNewFilterView(rule.trim());
+                        renderFilterEditorView(newRule);
                     }
                 });
 
                 const dateSpan = document.createElement('span');
                 dateSpan.textContent = timestampParts.date;
+                if (isFiltered) {
+                    dateSpan.style.textDecoration = 'line-through';
+                }
 
                 messageHeader.appendChild(leftHeaderContent);
                 messageHeader.appendChild(dateSpan);
@@ -2909,6 +3548,9 @@ function wrapInCollapsibleContainer(elementsToWrap) {
                 const idSpan = document.createElement('span');
                 idSpan.textContent = ` >>${message.id}`; // Changed prefix for quoted messages
                 idSpan.style.cursor = 'pointer';
+                if (isFiltered) {
+                    idSpan.style.textDecoration = 'line-through';
+                }
                 idSpan.addEventListener('click', (e) => {
                     e.stopPropagation();
                     const threadUrl = `https://boards.4chan.org/b/thread/${message.originalThreadId}`;
@@ -2952,313 +3594,49 @@ function wrapInCollapsibleContainer(elementsToWrap) {
 
                 blockIcon.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    let rule = '';
-                    if (message.text) {
-                        const cleanedText = message.text.replace(/>>\d+(\s\(You\))?/g, '').trim();
-                        if (cleanedText) {
-                            rule += `"${cleanedText}"`;
+
+                    const hasText = message.text && message.text.replace(/>>\d+(\s\(You\))?/g, '').trim().length > 0;
+                    const hasAttachment = message.attachment && message.attachment.filehash_db_key;
+
+                    const newRule = {
+                        id: Date.now(),
+                        action: 'filterOut',
+                        enabled: true,
+                        category: 'keyword', // default
+                        matchContent: '',
+                        replaceContent: ''
+                    };
+
+                    if (hasText && hasAttachment) {
+                        newRule.category = 'entireMessage';
+                         try {
+                            newRule.matchContent = JSON.stringify({
+                                text: message.text.replace(/>>\d+(\s\(You\))?/g, '').trim(),
+                                media: `md5:${message.attachment.filehash_db_key}`
+                            }, null, 2);
+                        } catch (err) {
+                            consoleError("Failed to stringify composite filter", err);
+                            // Fallback to simpler filter if stringify fails
+                            newRule.category = 'attachedMedia';
+                            newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
                         }
+                    } else if (hasText) {
+                        newRule.category = 'keyword';
+                        newRule.matchContent = message.text.replace(/>>\d+(\s\(You\))?/g, '').trim();
+                    } else if (hasAttachment) {
+                        newRule.category = 'attachedMedia';
+                        newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
                     }
-                    if (message.attachment && message.attachment.filehash_db_key) {
-                        rule += ` md5:${message.attachment.filehash_db_key}`;
-                    }
+
                     const filterWindow = document.getElementById('otk-filter-window');
                     if (filterWindow) {
                         filterWindow.style.display = 'flex';
-                        renderNewFilterView(rule.trim());
+                        renderFilterEditorView(newRule);
                     }
                 });
             }
             messageDiv.appendChild(messageHeader);
-
-            const textElement = document.createElement('div');
-            textElement.style.whiteSpace = 'pre-wrap'; // Preserve line breaks
-            textElement.style.overflowWrap = 'break-word'; // Allow breaking normally unbreakable words
-            textElement.style.wordBreak = 'normal'; // Prefer whole word wrapping
-            // Apply depth-specific font size for default layout
-            if (isTopLevelMessage) {
-                textElement.style.fontSize = 'var(--otk-msg-depth0-content-font-size)';
-            } else if (currentDepth === 1) {
-                textElement.style.fontSize = 'var(--otk-msg-depth1-content-font-size)';
-            } else { // currentDepth >= 2
-                textElement.style.fontSize = 'var(--otk-msg-depth2plus-content-font-size)';
-            }
-
-            if (shouldDisableUnderline) { // Apply to all depths when underline is hidden
-                textElement.style.marginTop = '0px';
-                textElement.style.paddingTop = '0px';
-            }
-
-            if (message.text && typeof message.text === 'string') {
-                const lines = message.text.split('\n');
-                const quoteRegex = /^>>(\d+)/; // For block-level quotes
-                const inlineQuoteRegex = />>(\d+)/; // For inline quotes
-
-                lines.forEach((line, lineIndex) => {
-                    const trimmedLine = line.trim();
-                    const isBlockQuote = trimmedLine.match(quoteRegex) && trimmedLine.match(quoteRegex)[0] === trimmedLine;
-
-                    if (isBlockQuote && currentDepth >= MAX_QUOTE_DEPTH) {
-                        return; // Skip rendering this line entirely if it's a blockquote at max depth
-                    }
-
-                    let processedAsEmbed = false;
-                    let soleUrlEmbedMade = false;
-
-                    // --- 1. Handle lines that are solely a media URL ---
-                    // Check for Sole YouTube URL
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of youtubePatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const videoId = match[patternObj.idGroup];
-                                let timestampStr = null;
-                                const timeMatch = trimmedLine.match(youtubeTimestampRegex);
-                                if (timeMatch && timeMatch[1]) timestampStr = timeMatch[1];
-                                if (videoId) {
-                                    const canonicalEmbedId = `youtube_${videoId}`;
-                                    if (isTopLevelMessage) {
-                                        viewerTopLevelEmbedIds.add(canonicalEmbedId);
-                                        if (!seenEmbeds.includes(canonicalEmbedId)) {
-                                            seenEmbeds.push(canonicalEmbedId);
-                                            localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
-                                            let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
-                                            localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics(false);
-                                        }
-                                    }
-                                    textElement.appendChild(createYouTubeEmbedElement(videoId, timestampStr));
-                                    soleUrlEmbedMade = true;
-                                    processedAsEmbed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // (Similar blocks for Twitch, TikTok, Streamable as in the original code)
-                    // Check for Sole Twitch URL
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of twitchPatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const id = match[patternObj.idGroup];
-                                let timestampStr = null;
-                                if (patternObj.type === 'vod') {
-                                    const timeMatch = trimmedLine.match(twitchTimestampRegex);
-                                    if (timeMatch && timeMatch[1]) timestampStr = timeMatch[1];
-                                }
-                                if (id) {
-                                    const canonicalEmbedId = `twitch_${patternObj.type}_${id}`;
-                                    if (isTopLevelMessage) {
-                                        viewerTopLevelEmbedIds.add(canonicalEmbedId);
-                                        if (!seenEmbeds.includes(canonicalEmbedId)) {
-                                            seenEmbeds.push(canonicalEmbedId);
-                                            localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
-                                            let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
-                                            localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics(false);
-                                        }
-                                    }
-                                    textElement.appendChild(createTwitchEmbedElement(patternObj.type, id, timestampStr));
-                                    soleUrlEmbedMade = true;
-                                    processedAsEmbed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // Check for Sole TikTok URL
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of tiktokPatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const videoId = match[patternObj.idGroup];
-                                if (videoId) {
-                                    const canonicalEmbedId = `tiktok_${videoId}`;
-                                    if (isTopLevelMessage) {
-                                        viewerTopLevelEmbedIds.add(canonicalEmbedId);
-                                        if (!seenEmbeds.includes(canonicalEmbedId)) {
-                                            seenEmbeds.push(canonicalEmbedId);
-                                            localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
-                                            let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
-                                            localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics(false);
-                                        }
-                                    }
-                                    textElement.appendChild(createTikTokEmbedElement(videoId));
-                                    soleUrlEmbedMade = true;
-                                    processedAsEmbed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // Check for Sole Streamable URL
-                    if (!soleUrlEmbedMade) {
-                        for (const patternObj of streamablePatterns) {
-                            const match = trimmedLine.match(patternObj.regex);
-                            if (match) {
-                                const videoId = match[patternObj.idGroup];
-                                if (videoId) {
-                                    const canonicalEmbedId = `streamable_${videoId}`;
-                                    if (isTopLevelMessage) {
-                                        viewerTopLevelEmbedIds.add(canonicalEmbedId);
-                                        if (!seenEmbeds.includes(canonicalEmbedId)) {
-                                            seenEmbeds.push(canonicalEmbedId);
-                                            localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
-                                            let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
-                                            localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                            updateDisplayedStatistics(false);
-                                        }
-                                    }
-                                    textElement.appendChild(createStreamableEmbedElement(videoId));
-                                    soleUrlEmbedMade = true;
-                                    processedAsEmbed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-
-                    // --- 2. Handle mixed content lines iteratively ---
-                    if (!soleUrlEmbedMade) {
-                        let currentTextSegment = line;
-
-                        while (currentTextSegment.length > 0) {
-                            let earliestMatch = null;
-                            let earliestMatchPattern = null;
-                            let earliestMatchType = null;
-                            let earliestMatchIsQuoteLink = false;
-
-                            // Find earliest media embed match
-                            for (const patternObj of [...inlineYoutubePatterns, ...inlineKickPatterns, ...inlineTiktokPatterns, ...inlineTwitchPatterns, ...inlineStreamablePatterns]) {
-                                const matchAttempt = currentTextSegment.match(patternObj.regex);
-                                if (matchAttempt && (earliestMatch === null || matchAttempt.index < earliestMatch.index)) {
-                                    earliestMatch = matchAttempt;
-                                    earliestMatchPattern = patternObj;
-                                    // Determine type based on pattern object properties if needed, simplified here
-                                    if (inlineYoutubePatterns.includes(patternObj)) earliestMatchType = 'youtube';
-                                    else if (inlineKickPatterns.includes(patternObj)) earliestMatchType = 'kick';
-                                    else if (inlineTiktokPatterns.includes(patternObj)) earliestMatchType = 'tiktok';
-                                    else if (inlineTwitchPatterns.includes(patternObj)) earliestMatchType = 'twitch';
-                                    else if (inlineStreamablePatterns.includes(patternObj)) earliestMatchType = 'streamable';
-                                    earliestMatchIsQuoteLink = false;
-                                }
-                            }
-
-                            // Find earliest >>ddd quote link match
-                            const quoteLinkMatch = currentTextSegment.match(inlineQuoteRegex);
-                            if (quoteLinkMatch && (earliestMatch === null || quoteLinkMatch.index < earliestMatch.index)) {
-                                earliestMatch = quoteLinkMatch;
-                                earliestMatchType = null;
-                                earliestMatchIsQuoteLink = true;
-                            }
-
-                            if (earliestMatch) {
-                                processedAsEmbed = true;
-                                // Append text before the match
-                                if (earliestMatch.index > 0) {
-                                    textElement.appendChild(document.createTextNode(currentTextSegment.substring(0, earliestMatch.index)));
-                                }
-
-                                const matchedText = earliestMatch[0];
-
-                                if (earliestMatchIsQuoteLink) {
-                                    // Handle quote rendering directly, respecting MAX_QUOTE_DEPTH
-                                    if (currentDepth >= MAX_QUOTE_DEPTH) {
-                                        textElement.appendChild(document.createTextNode(matchedText));
-                                    } else {
-                                        const quotedMessageId = earliestMatch[1];
-                                        let quotedMessageObject = null;
-                                        for (const threadIdKey in messagesByThreadId) {
-                                            if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
-                                                const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === Number(quotedMessageId));
-                                                if (foundMsg) {
-                                                    quotedMessageObject = foundMsg;
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        if (quotedMessageObject) {
-                                            const quotedElement = createMessageElementDOM(quotedMessageObject, mediaLoadPromises, uniqueImageViewerHashes, quotedMessageObject.board || boardForLink, false, currentDepth + 1, null, message.id, newAncestors);
-                                            if (quotedElement) {
-                                                textElement.appendChild(quotedElement);
-                                            }
-                                        } else {
-                                            const notFoundSpan = document.createElement('span');
-                                            notFoundSpan.textContent = `>>${quotedMessageId} (Not Found)`;
-                                            notFoundSpan.style.color = '#88ccee';
-                                            notFoundSpan.style.textDecoration = 'underline';
-                                            textElement.appendChild(notFoundSpan);
-                                        }
-                                    }
-                                } else { // It's a media embed
-                                    const id = earliestMatch[earliestMatchPattern.idGroup];
-                                    let timestampStr = null;
-                                    let embedElement = null;
-                                    let canonicalEmbedId = null;
-
-                                    if (earliestMatchType === 'youtube') {
-                                        const timeMatchInUrl = matchedText.match(youtubeTimestampRegex);
-                                        if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
-                                        canonicalEmbedId = `youtube_${id}`;
-                                        embedElement = createYouTubeEmbedElement(id, timestampStr);
-                                    } else if (earliestMatchType === 'twitch') {
-                                        if (earliestMatchPattern.type === 'vod') {
-                                            const timeMatchInUrl = matchedText.match(twitchTimestampRegex);
-                                            if (timeMatchInUrl && timeMatchInUrl[1]) timestampStr = timeMatchInUrl[1];
-                                        }
-                                        canonicalEmbedId = `twitch_${earliestMatchPattern.type}_${id}`;
-                                        embedElement = createTwitchEmbedElement(earliestMatchPattern.type, id, timestampStr);
-                                    } else if (earliestMatchType === 'streamable') {
-                                        canonicalEmbedId = `streamable_${id}`;
-                                        embedElement = createStreamableEmbedElement(id);
-                                    } else if (earliestMatchType === 'tiktok') {
-                                        canonicalEmbedId = `tiktok_${id}`;
-                                        embedElement = createTikTokEmbedElement(id);
-                                    } else if (earliestMatchType === 'kick') {
-                                        canonicalEmbedId = `kick_${id}`;
-                                        embedElement = createKickEmbedElement(id);
-                                    }
-
-                                    if (embedElement) {
-                                        if (isTopLevelMessage && canonicalEmbedId) {
-                                            viewerTopLevelEmbedIds.add(canonicalEmbedId);
-                                            if (!seenEmbeds.includes(canonicalEmbedId)) {
-                                                seenEmbeds.push(canonicalEmbedId);
-                                                localStorage.setItem(SEEN_EMBED_URL_IDS_KEY, JSON.stringify(seenEmbeds));
-                                                let currentVideoCount = parseInt(localStorage.getItem(LOCAL_VIDEO_COUNT_KEY) || '0');
-                                                localStorage.setItem(LOCAL_VIDEO_COUNT_KEY, (currentVideoCount + 1).toString());
-                                                updateDisplayedStatistics(false);
-                                            }
-                                        }
-                                        textElement.appendChild(embedElement);
-                                    }
-                                }
-                                currentTextSegment = currentTextSegment.substring(earliestMatch.index + matchedText.length);
-                            } else {
-                                // No more matches, append the rest of the text
-                                if (currentTextSegment.length > 0) {
-                                    textElement.appendChild(document.createTextNode(currentTextSegment));
-                                }
-                                currentTextSegment = ""; // Exit loop
-                            }
-                        }
-                    }
-
-                    if (lineIndex < lines.length - 1 && (trimmedLine.length > 0 || processedAsEmbed)) {
-                        textElement.appendChild(document.createElement('br'));
-                    }
-                });
-            } else {
-                textElement.textContent = message.text || ''; // Handle null or undefined message.text
-            }
-
-            if (shouldDisableUnderline && textElement.firstChild && textElement.firstChild.nodeName === 'BR') {
-                textElement.removeChild(textElement.firstChild);
-            }
+            const [textElement, attachmentDiv] = _populateMessageBody(processedMessage, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
 
             // Click listener for anchoring
             const persistentInstanceId = `otk-msg-${parentMessageId || 'toplevel'}-${message.id}`;
@@ -3323,32 +3701,65 @@ function wrapInCollapsibleContainer(elementsToWrap) {
                 messageDiv.classList.add(ANCHORED_MESSAGE_CLASS);
             }
 
-            let attachmentDiv = null;
-            if (message.attachment && message.attachment.tim) {
-                const actualBoardForLink = boardForLink || message.board || 'b';
-                attachmentDiv = document.createElement('div');
-                attachmentDiv.style.marginTop = '10px';
-
-                if (shouldDisplayFilenames) {
-                    const filenameLink = document.createElement('a');
-                    filenameLink.textContent = `${message.attachment.filename} (${message.attachment.ext.substring(1)})`;
-                    filenameLink.href = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
-                    filenameLink.target = "_blank";
-                    filenameLink.style.cssText = "color: #60a5fa; display: block; margin-bottom: 5px; text-decoration: underline;";
-                    attachmentDiv.appendChild(filenameLink);
-                }
-
-                _populateAttachmentDivWithMedia(
-                    attachmentDiv, message, actualBoardForLink, mediaLoadPromises,
-                    uniqueImageViewerHashes, isTopLevelMessage, 'default',
-                    renderedFullSizeImageHashes, viewerTopLevelAttachedVideoHashes, otkMediaDB
-                );
-            }
-
             if (isFiltered) {
-                const collapsibleContainer = wrapInCollapsibleContainer([textElement, attachmentDiv]);
-                messageDiv.appendChild(collapsibleContainer);
+                const hasQuotes = textElement.querySelector('div[data-message-id]') !== null;
+                const hasUnfilteredContent = ((processedMessage.text || '').trim().length > 0) || (processedMessage.attachment !== null);
+
+                if (!hasUnfilteredContent && !hasQuotes) {
+                    // Case 1: No unfiltered content and no quotes. Collapse the original message.
+                    const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
+                    const collapsibleContainer = wrapInCollapsibleContainer([originalTextElement, originalAttachmentDiv]);
+                    messageDiv.appendChild(collapsibleContainer);
+                } else {
+                    // Case 2: Has unfiltered content or quotes. Show processed content with an eye icon to toggle original.
+                    const blockIcon = messageHeader.querySelector('span[title*="blocked"]');
+                    if (blockIcon) {
+                        const eyeIcon = document.createElement('span');
+                        eyeIcon.innerHTML = '👁️';
+                        eyeIcon.style.cssText = 'margin-left: 5px; cursor: pointer;';
+                        eyeIcon.title = 'Show filtered content';
+                        blockIcon.parentNode.insertBefore(eyeIcon, blockIcon.nextSibling);
+
+                        const bodyContainer = document.createElement('div');
+                        const processedBodyContainer = document.createElement('div');
+                        processedBodyContainer.append(textElement);
+                        if (attachmentDiv) {
+                            processedBodyContainer.append(attachmentDiv);
+                        }
+
+                        const originalBodyContainer = document.createElement('div');
+                        originalBodyContainer.style.display = 'none';
+
+                        bodyContainer.appendChild(processedBodyContainer);
+                        bodyContainer.appendChild(originalBodyContainer);
+                        messageDiv.appendChild(bodyContainer);
+
+                        let originalBodyGenerated = false;
+
+                        eyeIcon.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            if (!originalBodyGenerated) {
+                                const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
+                                if(originalTextElement) originalBodyContainer.append(originalTextElement);
+                                if (originalAttachmentDiv) originalBodyContainer.append(originalAttachmentDiv);
+                                originalBodyGenerated = true;
+                            }
+
+                            const isProcessedVisible = processedBodyContainer.style.display !== 'none';
+                            processedBodyContainer.style.display = isProcessedVisible ? 'none' : 'block';
+                            originalBodyContainer.style.display = isProcessedVisible ? 'block' : 'none';
+                            eyeIcon.title = isProcessedVisible ? 'Hide filtered content' : 'Show filtered content';
+                        });
+                    } else {
+                        // Fallback if block icon isn't found for some reason
+                        messageDiv.appendChild(textElement);
+                        if (attachmentDiv) {
+                            messageDiv.appendChild(attachmentDiv);
+                        }
+                    }
+                }
             } else {
+                // Original logic for non-filtered messages
                 messageDiv.appendChild(textElement);
                 if (attachmentDiv) {
                     messageDiv.appendChild(attachmentDiv);
@@ -3398,11 +3809,11 @@ function wrapInCollapsibleContainer(elementsToWrap) {
 
             catalog.forEach(page => {
                 page.threads.forEach(thread => {
-                    let title = (thread.sub || '').toLowerCase();
-                    let com = (thread.com || '').toLowerCase();
-                    const combinedText = title + " " + com;
+                    const title = (thread.sub || '').toLowerCase();
+                    // const com = (thread.com || '').toLowerCase(); // No longer needed
+                    // const combinedText = title + " " + com; // No longer needed
 
-                    if (keywords.some(keyword => combinedText.includes(keyword)) && !blockedThreads.has(Number(thread.no))) {
+                    if (keywords.some(keyword => title.includes(keyword)) && !blockedThreads.has(Number(thread.no))) {
                         foundThreads.push({
                             id: Number(thread.no),
                             title: thread.sub || `Thread ${thread.no}` // Store original case title
@@ -3503,7 +3914,7 @@ function wrapInCollapsibleContainer(elementsToWrap) {
                     time: post.time,
                     originalThreadId: threadId, // Store the original thread ID for color lookup
                     text: '', // Will be populated after decoding
-                    title: opPost.sub ? decodeEntities(opPost.sub) : `Thread ${threadId}`, // Assuming decodeEntities here handles what it needs for title
+                    title: opPost.sub ? toTitleCase(decodeEntities(opPost.sub)) : `Thread ${threadId}`, // Assuming decodeEntities here handles what it needs for title
                     attachment: null
                 };
 
@@ -3796,6 +4207,7 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         try {
             consoleLog('[BG] Calling scanCatalog...');
             const foundThreads = await scanCatalog();
+            if (isManualRefreshInProgress) { consoleLog('[BG] Aborting due to manual refresh starting during catalog scan.'); return; }
             const foundIds = new Set(foundThreads.map(t => Number(t.id)));
             consoleLog(`[BG] scanCatalog found ${foundThreads.length} threads:`, Array.from(foundIds));
 
@@ -3832,6 +4244,7 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             });
 
             const resultsBg = await Promise.all(fetchPromisesBg);
+            if (isManualRefreshInProgress) { consoleLog('[BG] Aborting due to manual refresh starting during message fetch.'); return; }
 
             let newMessages = [];
             resultsBg.forEach(result => {
@@ -3895,6 +4308,8 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
                 }
             }
             localStorage.setItem(COLORS_KEY, JSON.stringify(threadColors));
+
+            if (isManualRefreshInProgress) { consoleLog('[BG] Aborting due to manual refresh starting during data save.'); return; }
 
             consoleLog('[BG] Data saved. Dispatching otkMessagesUpdated event.');
             window.dispatchEvent(new CustomEvent('otkMessagesUpdated'));
@@ -4313,13 +4728,31 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
 
             if (otkMediaDB) {
                 consoleLog('[Clear] Clearing IndexedDB mediaStore (preserving filtered media)...');
-                const filterRules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
-                const parsedRules = filterRules.map(parseFilterRule);
+                const filterRules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
                 const preservedHashes = new Set();
-                parsedRules.forEach(rule => {
-                    rule.md5.forEach(hash => preservedHashes.add(hash));
+
+                filterRules.forEach(rule => {
+                    let mediaHash = null;
+                    if (rule.category === 'attachedMedia' && rule.matchContent) {
+                        mediaHash = rule.matchContent.replace('md5:', '');
+                    } else if (rule.category === 'entireMessage' && rule.matchContent) {
+                        try {
+                            const conditions = JSON.parse(rule.matchContent);
+                            if (conditions.media) {
+                                mediaHash = conditions.media.replace('md5:', '');
+                            }
+                        } catch (err) {
+                            consoleError(`[Clear] Failed to parse media hash from 'entireMessage' rule:`, rule.matchContent, err);
+                        }
+                    }
+
+                    if (mediaHash) {
+                        preservedHashes.add(mediaHash);
+                        preservedHashes.add(`${mediaHash}_thumb`); // Also preserve the thumbnail
+                    }
                 });
-                consoleLog(`[Clear] Preserving ${preservedHashes.size} media files from filter rules.`);
+
+                consoleLog(`[Clear] Preserving ${preservedHashes.size} media files (including thumbnails) from filter rules.`);
 
                 const mediaTransaction = otkMediaDB.transaction(['mediaStore'], 'readwrite');
                 const mediaStore = mediaTransaction.objectStore('mediaStore');
@@ -4329,7 +4762,7 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
                     cursorRequest.onsuccess = (event) => {
                         const cursor = event.target.result;
                         if (cursor) {
-                            if (!preservedHashes.has(cursor.value.filehash)) {
+                            if (!preservedHashes.has(cursor.key)) {
                                 cursor.delete();
                             }
                             cursor.continue();
@@ -4551,6 +4984,12 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         const mainImagesCount = viewerIsOpen ? uniqueImageViewerHashes.size : totalImagesInStorage;
         const mainVideosCount = viewerIsOpen ? (viewerTopLevelAttachedVideoHashes.size + viewerTopLevelEmbedIds.size) : totalVideosInStorage;
 
+        if(viewerIsOpen) {
+            consoleLog(`[StatDebug] Viewer is OPEN. Using viewer-specific counts: Msgs=${mainMessagesCount}, Imgs=${mainImagesCount}, Vids=${mainVideosCount}`);
+        } else {
+            consoleLog(`[StatDebug] Viewer is CLOSED. Using total storage counts: Msgs=${mainMessagesCount}, Imgs=${mainImagesCount}, Vids=${mainVideosCount}`);
+        }
+
         const liveThreadsCount = activeThreads.length;
 
         const updateStatLine = (container, baseText, newCount, startCount, id) => {
@@ -4604,6 +5043,33 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         updateStatLine(totalMessagesElem, `- ${padNumber(mainMessagesCount, paddingLength)} Total Message${mainMessagesCount === 1 ? '' : 's'}`, newMessages, oldNewMessages, 'messages');
         updateStatLine(localImagesElem, `- ${padNumber(mainImagesCount, paddingLength)} Image${mainImagesCount === 1 ? '' : 's'}`, newImages, oldNewImages, 'images');
         updateStatLine(localVideosElem, `- ${padNumber(mainVideosCount, paddingLength)} Video${mainVideosCount === 1 ? '' : 's'}`, newVideos, oldNewVideos, 'videos');
+    }
+
+    function setupTitleObserver() {
+        const targetNode = document.getElementById('otk-stat-new-messages');
+        if (!targetNode) {
+            consoleError("Could not find the target node for title observer: #otk-stat-new-messages");
+            return;
+        }
+
+        const observer = new MutationObserver(mutations => {
+            mutations.forEach(mutation => {
+                const newMessagesText = targetNode.textContent.trim();
+                if (newMessagesText) {
+                    document.title = `${newMessagesText} ${originalTitle}`;
+                } else {
+                    document.title = originalTitle;
+                }
+            });
+        });
+
+        observer.observe(targetNode, {
+            childList: true,
+            characterData: true,
+            subtree: true
+        });
+
+        consoleLog("Title observer is set up and watching for changes on #otk-stat-new-messages.");
     }
 
     function createTrackerButton(text, id = null) {
@@ -4782,6 +5248,7 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         align-items: center;
         cursor: move;
         font-size: 14px;
+        white-space: nowrap;
     `;
     const countdownTimer = document.createElement('span');
     countdownTimer.id = 'otk-countdown-timer';
@@ -4840,7 +5307,12 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
 
     // Hide search if clicking outside
     document.addEventListener('click', (e) => {
-        if (!clockElement.contains(e.target) && !timezoneSearchContainer.contains(e.target)) {
+        const clockOptionsWindow = document.getElementById('otk-clock-options-window');
+        if (
+            !clockElement.contains(e.target) &&
+            !timezoneSearchContainer.contains(e.target) &&
+            (!clockOptionsWindow || !clockOptionsWindow.contains(e.target))
+        ) {
             timezoneSearchContainer.style.display = 'none';
         }
     });
@@ -4973,7 +5445,8 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
     }
 
     // --- Background Refresh Control ---
-    let scrollTimeout = null;
+    let lastActivityTimestamp = Date.now();
+    let suspensionCheckIntervalId = null;
     let countdownIntervalId = null;
 
     function updateCountdown() {
@@ -5046,6 +5519,96 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
 
     let activeClockSearchId = null;
 
+    function renderClockOptions() {
+        const contentArea = document.getElementById('otk-clock-options-content');
+        if (!contentArea) return;
+
+        contentArea.innerHTML = ''; // Clear previous content
+
+        const clocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+
+        clocks.forEach((clock, index) => {
+            const clockRow = document.createElement('div');
+            clockRow.style.cssText = `
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 0;
+                border-bottom: 1px solid #444;
+            `;
+
+            const clockName = document.createElement('span');
+            clockName.textContent = clock.displayPlace || clock.timezone;
+            clockRow.appendChild(clockName);
+
+            const buttonsWrapper = document.createElement('div');
+
+            const changeBtn = createTrackerButton('Change');
+            changeBtn.dataset.clockId = clock.id;
+            changeBtn.addEventListener('click', (e) => {
+                activeClockSearchId = clock.id;
+                const timezoneSearchContainer = document.getElementById('otk-timezone-search-container');
+                if (timezoneSearchContainer) {
+                    const buttonRect = e.target.getBoundingClientRect();
+                    timezoneSearchContainer.style.top = `${buttonRect.bottom + 5}px`;
+                    timezoneSearchContainer.style.left = `${buttonRect.left - timezoneSearchContainer.offsetWidth + buttonRect.width}px`;
+                    timezoneSearchContainer.style.display = 'block';
+                }
+            });
+            buttonsWrapper.appendChild(changeBtn);
+
+            if (index > 0) { // Don't allow removing the first (primary) clock
+                const removeBtn = createTrackerButton('Remove');
+                removeBtn.dataset.clockId = clock.id;
+                removeBtn.style.marginLeft = '5px';
+                removeBtn.addEventListener('click', () => {
+                    let currentClocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+                    currentClocks = currentClocks.filter(c => c.id !== clock.id);
+                    localStorage.setItem('otkClocks', JSON.stringify(currentClocks));
+                    renderClockOptions();
+                    renderClocks();
+                });
+                buttonsWrapper.appendChild(removeBtn);
+            }
+
+            clockRow.appendChild(buttonsWrapper);
+            contentArea.appendChild(clockRow);
+        });
+
+        const footerWrapper = document.createElement('div');
+        footerWrapper.style.cssText = `
+            display: flex;
+            justify-content: space-between;
+            margin-top: 15px;
+            gap: 10px;
+        `;
+
+        const addClockBtn = createTrackerButton('Add New Clock');
+        addClockBtn.style.flex = '1';
+        addClockBtn.addEventListener('click', () => {
+            const currentClocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+            const newClock = {
+                id: Date.now(),
+                timezone: 'America/New_York',
+                displayPlace: 'New York'
+            };
+            currentClocks.push(newClock);
+            localStorage.setItem('otkClocks', JSON.stringify(currentClocks));
+            renderClockOptions();
+            renderClocks();
+        });
+
+        const closeBtn = createTrackerButton('Close');
+        closeBtn.style.flex = '1';
+        closeBtn.addEventListener('click', () => {
+            document.getElementById('otk-clock-options-window').style.display = 'none';
+        });
+
+        footerWrapper.appendChild(addClockBtn);
+        footerWrapper.appendChild(closeBtn);
+        contentArea.appendChild(footerWrapper);
+    }
+
     function renderClocks() {
         const clockContainer = document.getElementById('otk-clock');
         if (!clockContainer) return;
@@ -5066,74 +5629,6 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             clockTextSpan.id = `otk-clock-text-${clock.id}`;
             clockInstance.appendChild(clockTextSpan);
 
-            const iconsWrapper = document.createElement('span');
-            iconsWrapper.className = 'otk-clock-icons-wrapper';
-            iconsWrapper.style.marginLeft = '8px';
-            iconsWrapper.style.display = 'flex';
-            iconsWrapper.style.alignItems = 'center';
-
-
-            const searchIcon = document.createElement('span');
-            searchIcon.className = 'otk-clock-icon otk-clock-search-icon';
-            searchIcon.innerHTML = '&#128269;'; // Search icon
-            searchIcon.style.cssText = 'cursor: default; display: none;';
-            searchIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                activeClockSearchId = clock.id;
-                const timezoneSearchContainer = document.getElementById('otk-timezone-search-container');
-                if (timezoneSearchContainer.style.display === 'block' && activeClockSearchId === clock.id) {
-                    timezoneSearchContainer.style.display = 'none';
-                } else {
-                    const clockRect = clockContainer.getBoundingClientRect();
-                    timezoneSearchContainer.style.top = `${clockRect.bottom + 5}px`;
-                    timezoneSearchContainer.style.left = `${clockRect.left}px`;
-                    timezoneSearchContainer.style.display = 'block';
-                }
-            });
-            iconsWrapper.appendChild(searchIcon);
-
-            const addIcon = document.createElement('span');
-            addIcon.className = 'otk-clock-icon otk-clock-add-icon';
-            addIcon.innerHTML = '&#10133;'; // Plus icon
-            addIcon.style.cssText = 'margin-left: 5px; cursor: default; display: none;';
-            addIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                const currentClocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
-                const newClock = {
-                    id: Date.now(),
-                    timezone: 'America/New_York',
-                    displayPlace: 'New York'
-                };
-                currentClocks.splice(index + 1, 0, newClock);
-                localStorage.setItem('otkClocks', JSON.stringify(currentClocks));
-                renderClocks();
-            });
-            iconsWrapper.appendChild(addIcon);
-
-            if (index > 0) {
-                const removeIcon = document.createElement('span');
-                removeIcon.className = 'otk-clock-icon otk-clock-remove-icon';
-                removeIcon.innerHTML = '&#10060;'; // Cross icon
-                removeIcon.style.cssText = 'margin-left: 5px; cursor: default; display: none;';
-                removeIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    let currentClocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
-                    currentClocks = currentClocks.filter(c => c.id !== clock.id);
-                    localStorage.setItem('otkClocks', JSON.stringify(currentClocks));
-                    renderClocks();
-                });
-                iconsWrapper.appendChild(removeIcon);
-            }
-
-            clockInstance.appendChild(iconsWrapper);
-
-            clockInstance.addEventListener('mouseenter', () => {
-                clockInstance.querySelectorAll('.otk-clock-icon').forEach(icon => icon.style.display = 'inline-block');
-            });
-            clockInstance.addEventListener('mouseleave', () => {
-                clockInstance.querySelectorAll('.otk-clock-icon').forEach(icon => icon.style.display = 'none');
-            });
-
             clockContainer.appendChild(clockInstance);
 
             if (index < clocks.length - 1) {
@@ -5144,6 +5639,24 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
                 clockContainer.appendChild(divider);
             }
         });
+
+        const cogIcon = document.createElement('span');
+        cogIcon.id = 'otk-clock-cog';
+        cogIcon.innerHTML = '&#x2699;';
+        cogIcon.style.cssText = 'font-size: 16px; margin-left: 10px; cursor: pointer; display: inline-block; color: var(--otk-clock-cog-color);';
+        cogIcon.title = "Edit Clocks";
+        cogIcon.addEventListener('click', () => {
+            const clockOptionsWindow = document.getElementById('otk-clock-options-window');
+            if (clockOptionsWindow) {
+                const isHidden = clockOptionsWindow.style.display === 'none';
+                clockOptionsWindow.style.display = isHidden ? 'flex' : 'none';
+                if (isHidden) {
+                    renderClockOptions();
+                }
+            }
+        });
+        clockContainer.appendChild(cogIcon);
+
         updateClockTimes();
     }
 
@@ -5161,7 +5674,19 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
                     minute: '2-digit',
                     second: '2-digit'
                 });
-                clockTextElement.textContent = `${timeString} ${timeZoneName}`;
+
+                clockTextElement.innerHTML = ''; // Clear existing content
+                const timeSpan = document.createElement('span');
+                timeSpan.style.width = '65px'; // Fixed width to prevent "jiggle"
+                timeSpan.style.display = 'inline-block'; // Needed for width to apply
+                timeSpan.style.textAlign = 'center'; // Center the time within the fixed-width span
+                timeSpan.textContent = timeString;
+
+                const tzSpan = document.createElement('span');
+                tzSpan.textContent = ` ${timeZoneName}`;
+
+                clockTextElement.appendChild(timeSpan);
+                clockTextElement.appendChild(tzSpan);
             }
         });
     }
@@ -5327,6 +5852,17 @@ async function forceViewerRerenderAfterThemeChange() {
 }
 
 function saveThemeSetting(key, value, requiresRerender = false) {
+    const threadListRerenderKeys = [
+        'guiThreadListTitleColor',
+        'guiThreadListTimeColor',
+        'otkThreadTimePosition',
+        'otkThreadTimeDividerEnabled',
+        'otkThreadTimeDividerSymbol',
+        'otkThreadTimeDividerColor',
+        'otkThreadTimeBracketStyle',
+        'otkThreadTimeBracketColor'
+    ];
+
     if (requiresRerender) {
         pendingThemeChanges[key] = value;
         showApplyDiscardButtons();
@@ -5346,6 +5882,9 @@ function saveThemeSetting(key, value, requiresRerender = false) {
         consoleLog("Saved theme setting:", key, value);
         if (key.startsWith('otkMsgDepth')) {
             forceViewerRerenderAfterThemeChange();
+        }
+        if (threadListRerenderKeys.includes(key)) {
+            renderThreadList();
         }
     }
 }
@@ -5576,6 +6115,10 @@ function applyThemeSettings(options = {}) {
             document.documentElement.style.setProperty('--otk-clock-search-text-color', settings.clockSearchTextColor);
             updateColorInputs('clock-search-text', settings.clockSearchTextColor);
         }
+        if (settings.clockCogColor) {
+            document.documentElement.style.setProperty('--otk-clock-cog-color', settings.clockCogColor);
+            updateColorInputs('clock-cog', settings.clockCogColor);
+        }
 
         // GUI Button Colors
         const buttonColorConfigs = [
@@ -5675,6 +6218,152 @@ function applyThemeSettings(options = {}) {
         if (forceRerender) {
             forceViewerRerenderAfterThemeChange();
         }
+
+        // Viewer Background Image
+        const viewerWrapper = document.getElementById('otk-viewer');
+        if (viewerWrapper) {
+            if (settings.viewerBackgroundImageUrl) {
+                viewerWrapper.style.backgroundImage = `url('${settings.viewerBackgroundImageUrl}')`;
+                viewerWrapper.style.backgroundSize = settings.viewerBgSize || 'cover';
+                viewerWrapper.style.backgroundRepeat = settings.viewerBgRepeat || 'no-repeat';
+                viewerWrapper.style.backgroundPosition = settings.viewerBgPosition || 'center';
+            } else {
+                viewerWrapper.style.backgroundImage = '';
+            }
+        }
+
+        // GUI Thread Box Outline
+        if (settings.guiThreadBoxOutlineColor && settings.guiThreadBoxOutlineColor.toLowerCase() !== 'none') {
+            document.documentElement.style.setProperty('--otk-gui-thread-box-outline', `1px solid ${settings.guiThreadBoxOutlineColor}`);
+        } else {
+            document.documentElement.style.setProperty('--otk-gui-thread-box-outline', 'none');
+        }
+
+        // Viewer Thread Box Outline
+        if (settings.viewerThreadBoxOutlineColor && settings.viewerThreadBoxOutlineColor.toLowerCase() !== 'none') {
+            document.documentElement.style.setProperty('--otk-viewer-thread-box-outline', `1px solid ${settings.viewerThreadBoxOutlineColor}`);
+        } else {
+            document.documentElement.style.setProperty('--otk-viewer-thread-box-outline', 'none');
+        }
+    }
+
+
+    function createColorOrNoneOptionRow(options) {
+        // options = { labelText, storageKey, defaultValue, idSuffix }
+        const group = document.createElement('div');
+        group.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            width: 100%;
+            margin-bottom: 5px;
+        `;
+
+        const label = document.createElement('label');
+        label.textContent = options.labelText;
+        label.htmlFor = `otk-${options.idSuffix}-text`;
+        label.style.cssText = `
+            font-size: 12px;
+            text-align: left;
+            flex-basis: 230px;
+            flex-shrink: 0;
+        `;
+
+        const controlsWrapperDiv = document.createElement('div');
+        controlsWrapperDiv.style.cssText = `
+            display: flex;
+            flex-grow: 1;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        `;
+
+        const textInput = document.createElement('input');
+        textInput.type = 'text';
+        textInput.id = `otk-${options.idSuffix}-text`;
+        textInput.style.cssText = `
+            flex: 1 1 70px;
+            min-width: 50px;
+            height: 25px;
+            box-sizing: border-box;
+            font-size: 12px;
+            text-align: right;
+        `;
+
+        const colorPicker = document.createElement('input');
+        colorPicker.type = 'color';
+        colorPicker.id = `otk-${options.idSuffix}-picker`;
+        colorPicker.style.cssText = `
+            flex-grow: 0;
+            flex-shrink: 0;
+            width: 30px;
+            height: 25px;
+            padding: 1px;
+            box-sizing: border-box;
+        `;
+
+        const defaultBtn = document.createElement('button');
+        defaultBtn.textContent = 'Default';
+        defaultBtn.style.cssText = `
+            flex-grow: 0;
+            flex-shrink: 0;
+            padding: 2px 6px;
+            height: 25px;
+            font-size: 11px;
+            box-sizing: border-box;
+            width: auto;
+        `;
+
+        group.appendChild(label);
+        controlsWrapperDiv.appendChild(textInput);
+        controlsWrapperDiv.appendChild(colorPicker);
+        controlsWrapperDiv.appendChild(defaultBtn);
+        group.appendChild(controlsWrapperDiv);
+
+        // Logic
+        const settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+        let initialValue = settings[options.storageKey] || options.defaultValue;
+        textInput.value = initialValue;
+
+        const isValidColor = (str) => /^#([0-9A-F]{3}){1,2}$/i.test(str);
+
+        if (isValidColor(initialValue)) {
+            colorPicker.value = initialValue;
+        } else {
+            colorPicker.value = '#000000'; // Default picker to black if value is "none"
+        }
+        colorPicker.style.visibility = 'visible'; // Always visible
+
+        const updateState = (newValue) => {
+            const valueToSave = newValue.trim().toLowerCase();
+            textInput.value = valueToSave;
+            if (isValidColor(valueToSave)) {
+                colorPicker.value = valueToSave;
+            }
+            // No need to toggle visibility anymore
+            saveThemeSetting(options.storageKey, valueToSave);
+            applyThemeSettings({ forceRerender: false });
+        };
+
+        textInput.addEventListener('change', (e) => {
+            const value = e.target.value.trim().toLowerCase();
+            if (value === 'none' || isValidColor(value)) {
+                updateState(value);
+            } else {
+                const savedSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+                textInput.value = savedSettings[options.storageKey] || options.defaultValue;
+            }
+        });
+
+        colorPicker.addEventListener('input', (e) => {
+            updateState(e.target.value);
+        });
+
+        defaultBtn.addEventListener('click', () => {
+            updateState(options.defaultValue);
+        });
+
+        return group;
     }
 
 
@@ -5761,7 +6450,6 @@ function applyThemeSettings(options = {}) {
             pendingThemeChanges = {};
             hideApplyDiscardButtons();
             applyThemeSettings();
-            forceViewerRerenderAfterThemeChange();
         });
 
         discardButton.addEventListener('click', () => {
@@ -6200,7 +6888,7 @@ function applyThemeSettings(options = {}) {
 
         // Helper function to create a checkbox option row
         function createCheckboxOptionRow(options) {
-            // options = { labelText, storageKey, defaultValue, idSuffix }
+            // options = { labelText, storageKey, defaultValue, idSuffix, requiresRerender }
             const group = document.createElement('div');
             group.style.cssText = `
                 display: flex;
@@ -6231,16 +6919,17 @@ function applyThemeSettings(options = {}) {
 
             const checkbox = document.createElement('input');
             checkbox.type = 'checkbox';
-            checkbox.id = `otk-${options.idSuffix}-checkbox`; // Ensure ID is unique and clear
+            checkbox.id = `otk-${options.idSuffix}-checkbox`;
             checkbox.style.cssText = `
-                height: 16px; /* Standard checkbox size */
-                width: 16px;  /* Standard checkbox size */
-                flex-shrink: 0; /* Prevent checkbox from shrinking */
+                height: 16px;
+                width: 16px;
+                flex-shrink: 0;
             `;
 
-            // Initialize checkbox state
-            const savedValue = localStorage.getItem(options.storageKey);
-            checkbox.checked = (savedValue !== null) ? (savedValue === 'true') : options.defaultValue;
+            // Initialize checkbox state from theme settings
+            const settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+            const savedValue = settings[options.storageKey];
+            checkbox.checked = (savedValue !== undefined) ? savedValue : options.defaultValue;
 
             checkbox.addEventListener('change', () => {
                 saveThemeSetting(options.storageKey, checkbox.checked, options.requiresRerender);
@@ -6361,6 +7050,8 @@ function applyThemeSettings(options = {}) {
                 if (hexInput) hexInput.value = initialValue;
                 mainInput.value = initialValue; // Color picker also needs full hex
             } else if (options.inputType === 'number') {
+                mainInput.value = initialValue;
+            } else if (options.inputType === 'text') {
                 mainInput.value = initialValue;
             }
 
@@ -6500,8 +7191,79 @@ function applyThemeSettings(options = {}) {
         themeOptionsContainer.appendChild(guiSectionHeading);
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Title Text:", storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'title-text' }));
+
+        const threadListDisplaySubHeading = createSectionHeading('Thread List Display');
+        themeOptionsContainer.appendChild(threadListDisplaySubHeading);
+
+        themeOptionsContainer.appendChild(createColorOrNoneOptionRow({ labelText: "Thread Box Outline:", storageKey: 'guiThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'gui-thread-box-outline' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Thread Titles Text:", storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Thread Times Text:", storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' }));
+
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Time Position:',
+            storageKey: 'otkThreadTimePosition',
+            options: ['After Title', 'Before Title'],
+            defaultValue: 'Before Title',
+            requiresRerender: false
+        }));
+
+        const dividerCheckboxRow = createCheckboxOptionRow({
+            labelText: "Enable Divider:",
+            storageKey: 'otkThreadTimeDividerEnabled',
+            defaultValue: true,
+            idSuffix: 'thread-time-divider-enable'
+        });
+        themeOptionsContainer.appendChild(dividerCheckboxRow);
+
+        const dividerSymbolRow = createThemeOptionRow({
+            labelText: "Divider Symbol:",
+            storageKey: 'otkThreadTimeDividerSymbol',
+            cssVariable: '--otk-thread-time-divider-symbol',
+            defaultValue: '|',
+            inputType: 'text',
+            idSuffix: 'thread-time-divider-symbol'
+        });
+        themeOptionsContainer.appendChild(dividerSymbolRow);
+
+        const dividerColorRow = createThemeOptionRow({
+            labelText: "Divider Color:",
+            storageKey: 'otkThreadTimeDividerColor',
+            cssVariable: '--otk-thread-time-divider-color',
+            defaultValue: '#ff8040',
+            inputType: 'color',
+            idSuffix: 'thread-time-divider-color'
+        });
+        themeOptionsContainer.appendChild(dividerColorRow);
+
+        const dividerCheckbox = dividerCheckboxRow.querySelector('input[type="checkbox"]');
+        const updateDividerOptionsVisibility = () => {
+            const isEnabled = dividerCheckbox.checked;
+            dividerSymbolRow.style.display = isEnabled ? 'flex' : 'none';
+            dividerColorRow.style.display = isEnabled ? 'flex' : 'none';
+        };
+
+        dividerCheckbox.addEventListener('change', updateDividerOptionsVisibility);
+
+        // Initial call to set visibility based on saved state
+        setTimeout(updateDividerOptionsVisibility, 0);
+
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Bracket Style:',
+            storageKey: 'otkThreadTimeBracketStyle',
+            options: ['[]', '()', 'none'],
+            defaultValue: '[]',
+            requiresRerender: false
+        }));
+
+        themeOptionsContainer.appendChild(createThemeOptionRow({
+            labelText: "Bracket Color:",
+            storageKey: 'otkThreadTimeBracketColor',
+            cssVariable: '--otk-thread-time-bracket-color',
+            defaultValue: '#aaa',
+            inputType: 'color',
+            idSuffix: 'thread-time-bracket-color'
+        }));
+
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Stats Text:", storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Stats Dash:", storageKey: 'statsDashColor', cssVariable: '--otk-stats-dash-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'stats-dash' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Text:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
@@ -6514,6 +7276,7 @@ function applyThemeSettings(options = {}) {
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Text:", storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Border:", storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-border' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Divider:", storageKey: 'clockDividerColor', cssVariable: '--otk-clock-divider-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-divider' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Cog Icon:", storageKey: 'clockCogColor', cssVariable: '--otk-clock-cog-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-cog' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Search Background:", storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Clock Search Text:", storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }));
 
@@ -6626,33 +7389,10 @@ function applyThemeSettings(options = {}) {
             });
             select.value = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || options.defaultValue;
             select.addEventListener('change', () => {
-                saveThemeSetting(options.storageKey, select.value, true);
-            });
-            controlsWrapperDiv.appendChild(select);
-            group.appendChild(label);
-            group.appendChild(controlsWrapperDiv);
-            return group;
-        }
-
-        function createDropdownRow(options) {
-            const group = document.createElement('div');
-            group.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
-            const label = document.createElement('label');
-            label.textContent = options.labelText;
-            label.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
-            const controlsWrapperDiv = document.createElement('div');
-            controlsWrapperDiv.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
-            const select = document.createElement('select');
-            select.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px;";
-            options.options.forEach(opt => {
-                const optionElement = document.createElement('option');
-                optionElement.value = opt;
-                optionElement.textContent = opt;
-                select.appendChild(optionElement);
-            });
-            select.value = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[options.storageKey] || options.defaultValue;
-            select.addEventListener('change', () => {
-                saveThemeSetting(options.storageKey, select.value, true);
+                saveThemeSetting(options.storageKey, select.value, options.requiresRerender || false);
+                 if (!options.requiresRerender) {
+                    applyThemeSettings({ forceRerender: false });
+                }
             });
             controlsWrapperDiv.appendChild(select);
             group.appendChild(label);
@@ -6664,20 +7404,124 @@ function applyThemeSettings(options = {}) {
             labelText: 'Background Size:',
             storageKey: 'guiBgSize',
             options: ['auto', 'cover', 'contain'],
-            defaultValue: 'cover'
+            defaultValue: 'cover',
+            requiresRerender: false
         }));
         themeOptionsContainer.appendChild(createDropdownRow({
             labelText: 'Background Repeat:',
             storageKey: 'guiBgRepeat',
             options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
-            defaultValue: 'no-repeat'
+            defaultValue: 'no-repeat',
+            requiresRerender: false
         }));
         themeOptionsContainer.appendChild(createDropdownRow({
             labelText: 'Background Position:',
             storageKey: 'guiBgPosition',
             options: ['center', 'top', 'bottom', 'left', 'right'],
-            defaultValue: 'center'
+            defaultValue: 'center',
+            requiresRerender: false
         }));
+
+        // --- Viewer Background Section ---
+        const viewerBackgroundSubHeading = document.createElement('h6');
+        viewerBackgroundSubHeading.textContent = "Viewer Background";
+        viewerBackgroundSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;";
+        themeOptionsContainer.appendChild(viewerBackgroundSubHeading);
+
+        const viewerBgImageUrlRow = document.createElement('div');
+        viewerBgImageUrlRow.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const viewerBgImageUrlLabel = document.createElement('label');
+        viewerBgImageUrlLabel.textContent = 'Background Image URL:';
+        viewerBgImageUrlLabel.htmlFor = 'otk-viewer-bg-image-url-input';
+        viewerBgImageUrlLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const viewerBgImageUrlControlsWrapper = document.createElement('div');
+        viewerBgImageUrlControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
+
+        const viewerBgImageUrlInput = document.createElement('input');
+        viewerBgImageUrlInput.type = 'text';
+        viewerBgImageUrlInput.id = 'otk-viewer-bg-image-url-input';
+        viewerBgImageUrlInput.placeholder = 'Enter image URL or browse';
+        viewerBgImageUrlInput.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align: left;";
+
+        const initialViewerBgUrl = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {}).viewerBackgroundImageUrl || '';
+        if (initialViewerBgUrl.startsWith('data:image')) {
+            viewerBgImageUrlInput.value = '(Local file is selected)';
+            viewerBgImageUrlInput.dataset.fullUrl = initialViewerBgUrl;
+        } else {
+            viewerBgImageUrlInput.value = initialViewerBgUrl;
+        }
+
+        viewerBgImageUrlInput.addEventListener('input', () => {
+            viewerBgImageUrlInput.dataset.fullUrl = '';
+        });
+
+        viewerBgImageUrlInput.addEventListener('change', () => {
+            const valueToSave = viewerBgImageUrlInput.dataset.fullUrl || viewerBgImageUrlInput.value;
+            saveThemeSetting('viewerBackgroundImageUrl', valueToSave, false);
+            applyThemeSettings({ forceRerender: false });
+        });
+
+        const viewerBrowseButton = document.createElement('button');
+        viewerBrowseButton.textContent = "Browse...";
+        viewerBrowseButton.style.cssText = "height: 25px; flex-shrink: 0; padding: 2px 6px; font-size: 11px;";
+
+        const viewerFileInput = document.createElement('input');
+        viewerFileInput.type = 'file';
+        viewerFileInput.accept = 'image/*';
+        viewerFileInput.style.display = 'none';
+
+        viewerBrowseButton.addEventListener('click', (e) => {
+            e.preventDefault();
+            viewerFileInput.click();
+        });
+
+        viewerFileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const dataUrl = e.target.result;
+                    viewerBgImageUrlInput.value = `(Local file: ${file.name})`;
+                    viewerBgImageUrlInput.dataset.fullUrl = dataUrl;
+                    viewerBgImageUrlInput.dispatchEvent(new Event('change'));
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+
+        viewerBgImageUrlControlsWrapper.appendChild(viewerBgImageUrlInput);
+        viewerBgImageUrlControlsWrapper.appendChild(viewerBrowseButton);
+        viewerBgImageUrlControlsWrapper.appendChild(viewerFileInput);
+
+        viewerBgImageUrlRow.appendChild(viewerBgImageUrlLabel);
+        viewerBgImageUrlRow.appendChild(viewerBgImageUrlControlsWrapper);
+
+        themeOptionsContainer.appendChild(viewerBgImageUrlRow);
+
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Background Size:',
+            storageKey: 'viewerBgSize',
+            options: ['auto', 'cover', 'contain'],
+            defaultValue: 'cover',
+            requiresRerender: false
+        }));
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Background Repeat:',
+            storageKey: 'viewerBgRepeat',
+            options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
+            defaultValue: 'no-repeat',
+            requiresRerender: false
+        }));
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Background Position:',
+            storageKey: 'viewerBgPosition',
+            options: ['center', 'top', 'bottom', 'left', 'right'],
+            defaultValue: 'center',
+            requiresRerender: false
+        }));
+
 
         // --- Viewer Section ---
         const viewerSectionHeading = createSectionHeading('Viewer');
@@ -6688,11 +7532,19 @@ function applyThemeSettings(options = {}) {
         // Add Message Layout Dropdown to Viewer section (moved to top)
 
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' }));
+        themeOptionsContainer.appendChild(createColorOrNoneOptionRow({ labelText: "Viewer Thread Box Outline:", storageKey: 'viewerThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'viewer-thread-box-outline' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "GUI Bottom Border:", storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'gui-bottom-border' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Divider:", storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-divider' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Text:", storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-font' }));
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "'Blocked Content' Font:", storageKey: 'blockedContentFontColor', cssVariable: '--otk-blocked-content-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'blocked-content-font' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Font Size (px):", storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Font Size (px):", storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: false }));
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'New Msgs Separator Align:',
+            storageKey: 'otkNewMessagesSeparatorAlignment',
+            options: ['Left', 'Center', 'Right'],
+            defaultValue: 'Left',
+            requiresRerender: false
+        }));
 
         // Anchor Highlight Colors
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Anchor Highlight Background:", storageKey: 'anchorHighlightBgColor', cssVariable: '--otk-anchor-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'anchor-bg', requiresRerender: true }));
@@ -7209,7 +8061,7 @@ function applyThemeSettings(options = {}) {
                 { storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' },
                 { storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'title-text' },
                 { storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' },
-                { storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' },
+                { storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'threadlist-time' },
                 { storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'actual-stats-text' },
                 { storageKey: 'statsDashColor', cssVariable: '--otk-stats-dash-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'stats-dash' },
                 { storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' },
@@ -7233,7 +8085,7 @@ function applyThemeSettings(options = {}) {
                 { storageKey: 'msgDepth2plusTextColor', cssVariable: '--otk-msg-depth2plus-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth2plus-text' },
                 { storageKey: 'msgDepth2plusHeaderTextColor', cssVariable: '--otk-msg-depth2plus-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth2plus-header-text' },
                 { storageKey: 'viewerQuote2plusHeaderBorderColor', cssVariable: '--otk-viewer-quote2plus-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote2plus-border' },
-                { storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' },
+                { storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'cog-icon' },
                 { storageKey: 'disableBgFontColor', cssVariable: '--otk-disable-bg-font-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'disable-bg-font' },
                 { storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' },
                 { storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' },
@@ -7242,7 +8094,7 @@ function applyThemeSettings(options = {}) {
                 { storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' },
                 { storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-divider' },
                 { storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-font' },
-                { storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '12px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: true },
+                { storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: false },
                 { storageKey: 'blockedContentFontColor', cssVariable: '--otk-blocked-content-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'blocked-content-font' },
 
                 // Anchor Highlight Colors
@@ -7275,6 +8127,7 @@ function applyThemeSettings(options = {}) {
                 { storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' },
                 { storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'clock-border' },
                 { storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' },
+                { storageKey: 'clockCogColor', cssVariable: '--otk-clock-cog-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'clock-cog' },
                 { storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }
             ];
         }
@@ -7421,166 +8274,451 @@ function applyThemeSettings(options = {}) {
         consoleLog("Options Window setup complete with drag functionality.");
     }
 
-    function renderNewFilterView(prefilledRule = '') {
-        const rightContent = document.getElementById('otk-filter-content');
-        if (!rightContent) return;
+function renderFilterEditorView(ruleToEdit = null) {
+    const rightContent = document.getElementById('otk-filter-content');
+    if (!rightContent) return;
 
-        rightContent.innerHTML = ''; // Clear content area
+    rightContent.innerHTML = ''; // Clear previous content
 
-        const ruleInput = document.createElement('textarea');
-        ruleInput.id = 'otk-filter-rule-input';
-        ruleInput.style.cssText = 'width: 100%; height: 100px; margin-bottom: 10px;';
-        ruleInput.value = prefilledRule;
-        rightContent.appendChild(ruleInput);
+    const allRules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
+    const isEditing = ruleToEdit ? allRules.some(r => r.id === ruleToEdit.id) : false;
 
-        const buttonContainer = document.createElement('div');
-        buttonContainer.style.cssText = 'display: flex; justify-content: flex-end; gap: 10px;';
-        rightContent.appendChild(buttonContainer);
+    const rule = ruleToEdit || {
+        id: Date.now(),
+        category: 'keyword',
+        action: 'filterOut',
+        matchContent: '',
+        replaceContent: '',
+        enabled: true
+    };
 
-        const createBtn = createTrackerButton('Create Filter');
-        const createAndCloseBtn = createTrackerButton('Create and Close');
+    const form = document.createElement('div');
+    form.style.cssText = 'display: flex; flex-direction: column; gap: 10px; height: 100%;';
 
-        function handleCreateRule(andClose) {
-            const ruleInput = document.getElementById('otk-filter-rule-input');
-            if (!ruleInput) return;
-            const rule = ruleInput.value.trim();
-            if (rule) {
-                let rules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
-                if (!rules.includes(rule)) {
-                    rules.push(rule);
-                    localStorage.setItem('otkFilterRules', JSON.stringify(rules));
-                    ruleInput.value = ''; // Clear input after successful creation
-                    if (andClose) {
-                        document.getElementById('otk-filter-window').style.display = 'none';
-                    } else {
-                        document.getElementById('otk-filter-content').innerHTML = 'Filter created!';
-                    }
-                } else {
-                    alert('This filter rule already exists.');
-                }
-            }
+    // Helper to create a labeled row
+    const createRow = (labelText, ...elements) => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display: flex; align-items: center; gap: 10px;';
+        const label = document.createElement('label');
+        label.textContent = labelText;
+        label.style.width = '120px';
+        label.style.flexShrink = '0';
+        row.appendChild(label);
+        elements.forEach(el => row.appendChild(el));
+        return row;
+    };
+
+    // Category Dropdown
+    const categorySelect = document.createElement('select');
+    categorySelect.style.flexGrow = '1';
+    const categories = [
+        { value: 'keyword', text: 'Keyword/Text' },
+        { value: 'embeddedLink', text: 'Embedded Link' },
+        { value: 'attachedMedia', text: 'Attached Media' },
+        { value: 'entireMessage', text: 'Entire Message' }
+    ];
+    categories.forEach(cat => {
+        const option = document.createElement('option');
+        option.value = cat.value;
+        option.textContent = cat.text;
+        categorySelect.appendChild(option);
+    });
+    categorySelect.value = rule.category;
+    form.appendChild(createRow('Category:', categorySelect));
+
+    // Action Dropdown
+    const actionSelect = document.createElement('select');
+    actionSelect.style.flexGrow = '1';
+    const actions = [
+        { value: 'filterOut', text: 'Filter out entire message' },
+        { value: 'remove', text: 'Remove matching content only' },
+        { value: 'replace', text: 'Replace matching content' }
+    ];
+    actions.forEach(act => {
+        const option = document.createElement('option');
+        option.value = act.value;
+        option.textContent = act.text;
+        actionSelect.appendChild(option);
+    });
+    actionSelect.value = rule.action;
+    form.appendChild(createRow('Action:', actionSelect));
+
+    // Match Content Input
+    const matchContentRow = createRow('Match Content:', document.createElement('textarea'));
+    const matchContentInput = matchContentRow.querySelector('textarea');
+    matchContentInput.placeholder = 'Content to match...';
+    matchContentInput.value = rule.matchContent;
+
+    // Make this row and its textarea grow to fill available space
+    matchContentRow.style.flexGrow = '1';
+    matchContentRow.style.alignItems = 'stretch';
+    matchContentInput.style.cssText = 'flex-grow: 1; width: 100%; box-sizing: border-box; resize: vertical; height: 100%;';
+    form.appendChild(matchContentRow);
+
+    // Replace Content Input (conditionally displayed)
+    const replaceContentRow = createRow('Replace With:', document.createElement('textarea'));
+    const replaceContentInput = replaceContentRow.querySelector('textarea');
+    replaceContentInput.placeholder = 'Replacement content...';
+    replaceContentInput.style.cssText = 'flex-grow: 1; width: 100%; box-sizing: border-box; resize: vertical; height: 60px;';
+    replaceContentInput.value = rule.replaceContent;
+    form.appendChild(replaceContentRow);
+
+    const toggleReplaceRow = () => {
+        replaceContentRow.style.display = actionSelect.value === 'replace' ? 'flex' : 'none';
+    };
+    actionSelect.addEventListener('change', toggleReplaceRow);
+    toggleReplaceRow(); // Initial check
+
+    const saveRuleLogic = () => {
+        const newRuleData = {
+            id: rule.id,
+            category: categorySelect.value,
+            action: actionSelect.value,
+            matchContent: matchContentInput.value.trim(),
+            replaceContent: replaceContentInput.value.trim(),
+            enabled: rule.enabled
+        };
+
+        if (!newRuleData.matchContent) {
+            alert('Match Content cannot be empty.');
+            return false;
         }
 
-        createBtn.addEventListener('click', () => handleCreateRule(false));
-        createAndCloseBtn.addEventListener('click', () => handleCreateRule(true));
+        let currentRules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
+        const ruleIndex = currentRules.findIndex(r => r.id === rule.id);
 
-        buttonContainer.appendChild(createBtn);
-        buttonContainer.appendChild(createAndCloseBtn);
+        if (ruleIndex > -1) {
+            currentRules[ruleIndex] = newRuleData;
+        } else {
+            currentRules.push(newRuleData);
+        }
+        localStorage.setItem(FILTER_RULES_V2_KEY, JSON.stringify(currentRules));
+        return true;
+    };
 
-        const cancelBtn = createTrackerButton('Cancel');
-        cancelBtn.addEventListener('click', () => {
-            rightContent.innerHTML = '';
-        });
-        buttonContainer.appendChild(cancelBtn);
-    }
-// Move this function outside of setupFilterWindow
+    // Buttons
+    const buttonContainer = document.createElement('div');
+    buttonContainer.style.cssText = 'display: flex; justify-content: flex-end; gap: 10px; margin-top: auto;';
+
+    const saveBtn = createTrackerButton(isEditing ? 'Save Changes' : 'Create Filter');
+    saveBtn.addEventListener('click', () => {
+        if (saveRuleLogic()) {
+            renderFilterList();
+        }
+    });
+
+    const cancelBtn = createTrackerButton('Cancel');
+    cancelBtn.addEventListener('click', () => {
+        renderFilterList();
+    });
+
+    const saveAndCloseBtn = createTrackerButton(isEditing ? 'Save and Close' : 'Create Filter and Close');
+    saveAndCloseBtn.addEventListener('click', () => {
+        if (saveRuleLogic()) {
+            document.getElementById('otk-filter-window').style.display = 'none';
+        }
+    });
+
+    buttonContainer.appendChild(cancelBtn);
+    buttonContainer.appendChild(saveBtn);
+    buttonContainer.appendChild(saveAndCloseBtn);
+    form.appendChild(buttonContainer);
+
+    rightContent.appendChild(form);
+}
 function renderFilterList() {
     const rightContent = document.getElementById('otk-filter-content');
     if (!rightContent) return;
-    rightContent.innerHTML = '';
+    rightContent.innerHTML = ''; // Clear previous content
 
     const header = document.createElement('div');
-    header.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;';
+    header.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-right: 15px;'; // Add padding for scrollbar
 
     const checkAllContainer = document.createElement('div');
-    const checkAllLabel = document.createElement('label');
-    checkAllLabel.textContent = 'Select All';
-    checkAllLabel.style.marginRight = '5px';
+    checkAllContainer.style.cssText = 'display: flex; align-items: center;';
     const checkAllBox = document.createElement('input');
     checkAllBox.type = 'checkbox';
-    checkAllContainer.appendChild(checkAllLabel);
+    checkAllBox.id = 'otk-filter-select-all';
+    const checkAllLabel = document.createElement('label');
+    checkAllLabel.textContent = 'Select All';
+    checkAllLabel.htmlFor = 'otk-filter-select-all';
+    checkAllLabel.style.marginLeft = '5px';
+
     checkAllContainer.appendChild(checkAllBox);
+    checkAllContainer.appendChild(checkAllLabel);
     header.appendChild(checkAllContainer);
+
+    const buttonGroup = document.createElement('div');
+    buttonGroup.style.cssText = 'display: flex; gap: 10px;';
+
+    const editSelectedBtn = createTrackerButton('Edit Selected');
+    editSelectedBtn.id = 'otk-edit-selected-filter-btn';
+    editSelectedBtn.style.display = 'none';
+    buttonGroup.appendChild(editSelectedBtn);
 
     const deleteSelectedBtn = createTrackerButton('Delete Selected');
     deleteSelectedBtn.id = 'otk-delete-selected-filters-btn';
     deleteSelectedBtn.style.display = 'none';
-    header.appendChild(deleteSelectedBtn);
+    buttonGroup.appendChild(deleteSelectedBtn);
+
+    header.appendChild(buttonGroup);
 
     rightContent.appendChild(header);
 
     const ruleListContainer = document.createElement('div');
+    ruleListContainer.id = 'otk-filter-rule-list-container';
     ruleListContainer.style.cssText = 'display: flex; flex-direction: column; max-height: 280px; overflow-y: auto; padding-right: 15px;';
     rightContent.appendChild(ruleListContainer);
 
-    const rules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
+    const rules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
     if (rules.length === 0) {
         ruleListContainer.textContent = 'No filter rules saved.';
         return;
     }
 
+    const categoryDisplayMap = {
+        keyword: 'Keyword',
+        embeddedLink: 'Link',
+        attachedMedia: 'Media',
+        entireMessage: 'Message'
+    };
+
+    const actionDisplayMap = {
+        filterOut: 'Filter Out',
+        remove: 'Remove',
+        replace: 'Replace'
+    };
+
     rules.forEach((rule, index) => {
         const ruleDiv = document.createElement('div');
-        ruleDiv.style.cssText = 'display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-top: 1px solid #444;';
-
-        const contentWrapper = document.createElement('div');
-        contentWrapper.style.display = 'flex';
-        contentWrapper.style.alignItems = 'center';
-
-        const parsed = parseFilterRule(rule);
-        let textContent = rule;
-        if (parsed.md5.length > 0 && parsed.text.length > 0) {
-            textContent = parsed.text.join(' ');
-        } else if (parsed.md5.length > 0) {
-            textContent = '';
-        }
-
-        const ruleText = document.createElement('span');
-        ruleText.textContent = textContent;
-        contentWrapper.appendChild(ruleText);
-
-        if (parsed.md5.length > 0 && otkMediaDB) {
-            parsed.md5.forEach(hash => {
-                const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
-                const store = transaction.objectStore('mediaStore');
-                const request = store.get(hash);
-                request.onsuccess = (event) => {
-                    const item = event.target.result;
-                    if (item && item.blob) {
-                        const mediaElement = item.ext.toLowerCase().includes('webm') ? document.createElement('video') : document.createElement('img');
-                        mediaElement.src = URL.createObjectURL(item.blob);
-                        if (item.ext.toLowerCase().includes('webm')) mediaElement.controls = true;
-                        mediaElement.style.maxWidth = '100px';
-                        mediaElement.style.maxHeight = '100px';
-                        mediaElement.style.marginLeft = '10px';
-                        contentWrapper.appendChild(mediaElement);
-                    }
-                };
-            });
-        }
-
-        ruleDiv.appendChild(contentWrapper);
+        ruleDiv.style.cssText = `
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            border-top: 1px solid #444;
+            background-color: ${rule.enabled ? '#3a3a3a' : '#2a2a2a'};
+        `;
 
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
-        checkbox.dataset.ruleIndex = index;
-        checkbox.style.marginLeft = '10px';
+        checkbox.dataset.ruleId = rule.id;
         ruleDiv.appendChild(checkbox);
+
+        const mainContentDiv = document.createElement('div');
+        mainContentDiv.style.cssText = 'display: flex; flex-direction: column; gap: 5px; overflow: hidden;';
+
+        const headerDiv = document.createElement('div');
+        headerDiv.style.cssText = 'display: flex; align-items: center; gap: 10px;';
+
+        const title = document.createElement('h5');
+        const categoryStr = categoryDisplayMap[rule.category] || rule.category;
+        const actionStr = actionDisplayMap[rule.action] || rule.action;
+        title.textContent = `Filter #${index + 1} (${categoryStr}, ${actionStr})`;
+        title.style.cssText = 'margin: 0; font-size: 14px; color: #f0f0f0;';
+
+        headerDiv.appendChild(title);
+        mainContentDiv.appendChild(headerDiv);
+
+        const matchContentDiv = document.createElement('div');
+        matchContentDiv.style.whiteSpace = 'nowrap';
+        matchContentDiv.style.overflow = 'hidden';
+        matchContentDiv.style.textOverflow = 'ellipsis';
+        matchContentDiv.title = rule.matchContent;
+
+        const strongEl = document.createElement('strong');
+        strongEl.textContent = 'Match: ';
+        matchContentDiv.appendChild(strongEl);
+
+        const codeSpan = document.createElement('span');
+        codeSpan.style.fontFamily = 'monospace';
+        codeSpan.style.padding = '2px 4px';
+        codeSpan.style.borderRadius = '3px';
+
+        let mediaHashForPopup = null;
+        let hoverTarget = null;
+
+        if (rule.category === 'attachedMedia') {
+            mediaHashForPopup = rule.matchContent.replace('md5:', '');
+            codeSpan.textContent = rule.matchContent;
+            hoverTarget = codeSpan;
+        } else if (rule.category === 'entireMessage') {
+            try {
+                const conditions = JSON.parse(rule.matchContent);
+                if (conditions.media) {
+                    mediaHashForPopup = conditions.media.replace('md5:', '');
+                    const mediaValue = conditions.media;
+                    const textBefore = rule.matchContent.substring(0, rule.matchContent.indexOf(mediaValue));
+                    const textAfter = rule.matchContent.substring(rule.matchContent.indexOf(mediaValue) + mediaValue.length);
+
+                    codeSpan.appendChild(document.createTextNode(textBefore));
+                    const hashSpan = document.createElement('span');
+                    hashSpan.className = 'otk-media-hash-preview';
+                    hashSpan.textContent = mediaValue;
+                    hashSpan.style.textDecoration = 'underline';
+                    hashSpan.style.cursor = 'pointer';
+                    codeSpan.appendChild(hashSpan);
+                    codeSpan.appendChild(document.createTextNode(textAfter));
+                    hoverTarget = hashSpan;
+                } else {
+                    codeSpan.textContent = rule.matchContent;
+                }
+            } catch (e) {
+                codeSpan.textContent = rule.matchContent;
+            }
+        } else {
+            codeSpan.textContent = rule.matchContent;
+        }
+
+        matchContentDiv.appendChild(codeSpan);
+        mainContentDiv.appendChild(matchContentDiv);
+
+        if (hoverTarget && mediaHashForPopup) {
+            let thumbnailPopup = null;
+            let blobUrl = null;
+
+            const hideThumbnail = () => {
+                if (thumbnailPopup) {
+                    thumbnailPopup.remove();
+                    thumbnailPopup = null;
+                }
+                if (blobUrl) {
+                    URL.revokeObjectURL(blobUrl);
+                    blobUrl = null;
+                }
+            };
+
+            hoverTarget.addEventListener('mouseenter', (e) => {
+                hideThumbnail();
+                if (!otkMediaDB) return;
+                const thumbKey = `${mediaHashForPopup}_thumb`;
+
+                const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+                const store = transaction.objectStore('mediaStore');
+                const request = store.get(thumbKey);
+
+                request.onsuccess = (event) => {
+                    const storedItem = event.target.result;
+                    thumbnailPopup = document.createElement('div');
+                    thumbnailPopup.id = 'otk-thumbnail-popup';
+                    thumbnailPopup.style.cssText = `
+                        position: fixed; z-index: 10005; background: #1a1a1a;
+                        border: 1px solid #555; border-radius: 3px; padding: 5px;
+                        pointer-events: none; max-width: 250px; max-height: 250px;
+                    `;
+                    if (storedItem && storedItem.blob) {
+                        blobUrl = URL.createObjectURL(storedItem.blob);
+                        const img = document.createElement('img');
+                        img.src = blobUrl;
+                        img.style.cssText = 'max-width: 100%; max-height: 100%; display: block;';
+                        thumbnailPopup.appendChild(img);
+                    } else {
+                        thumbnailPopup.textContent = 'Thumbnail not in cache';
+                        thumbnailPopup.style.color = '#ccc';
+                        thumbnailPopup.style.fontSize = '12px';
+                    }
+                    document.body.appendChild(thumbnailPopup);
+                    thumbnailPopup.style.left = `${e.clientX + 15}px`;
+                    thumbnailPopup.style.top = `${e.clientY + 15}px`;
+                };
+                request.onerror = (event) => consoleError("Error fetching thumbnail for popup:", event.target.error);
+            });
+
+            hoverTarget.addEventListener('mouseleave', hideThumbnail);
+        }
+
+        if (rule.action === 'replace') {
+            const replaceContentDiv = document.createElement('div');
+            replaceContentDiv.innerHTML = `<strong>Replace:</strong> <span style="font-family: monospace; padding: 2px 4px; border-radius: 3px;"></span>`;
+            replaceContentDiv.querySelector('span').textContent = rule.replaceContent;
+            replaceContentDiv.style.whiteSpace = 'nowrap';
+            replaceContentDiv.style.overflow = 'hidden';
+            replaceContentDiv.style.textOverflow = 'ellipsis';
+            replaceContentDiv.title = rule.replaceContent;
+            mainContentDiv.appendChild(replaceContentDiv);
+        }
+
+        ruleDiv.appendChild(mainContentDiv);
+
+        const toggleSwitch = document.createElement('label');
+        toggleSwitch.className = 'otk-switch';
+        const toggleInput = document.createElement('input');
+        toggleInput.type = 'checkbox';
+        toggleInput.checked = rule.enabled;
+        toggleInput.addEventListener('change', () => {
+            rule.enabled = toggleInput.checked;
+            const updatedRules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
+            const ruleIndex = updatedRules.findIndex(r => r.id === rule.id);
+            if (ruleIndex > -1) {
+                updatedRules[ruleIndex].enabled = rule.enabled;
+                localStorage.setItem(FILTER_RULES_V2_KEY, JSON.stringify(updatedRules));
+                ruleDiv.style.backgroundColor = rule.enabled ? '#3a3a3a' : '#2a2a2a';
+            }
+        });
+        const toggleSlider = document.createElement('span');
+        toggleSlider.className = 'otk-slider round';
+        toggleSwitch.appendChild(toggleInput);
+        toggleSwitch.appendChild(toggleSlider);
+        ruleDiv.appendChild(toggleSwitch);
+
         ruleListContainer.appendChild(ruleDiv);
     });
 
-    const checkboxes = Array.from(ruleListContainer.querySelectorAll('input[type="checkbox"]'));
-    const toggleDeleteButton = () => {
-        const anyChecked = checkboxes.some(cb => cb.checked);
-        deleteSelectedBtn.style.display = anyChecked ? 'inline-block' : 'none';
+    const checkboxes = Array.from(ruleListContainer.querySelectorAll('input[type="checkbox"][data-rule-id]'));
+
+    const updateBulkActionButtons = () => {
+        const checkedCount = checkboxes.filter(cb => cb.checked).length;
+        deleteSelectedBtn.style.display = checkedCount > 0 ? 'inline-block' : 'none';
+        editSelectedBtn.style.display = checkedCount === 1 ? 'inline-block' : 'none';
+
+        const allChecked = checkboxes.every(cb => cb.checked);
+        checkAllBox.checked = checkboxes.length > 0 && allChecked;
     };
 
-    checkboxes.forEach(cb => cb.addEventListener('change', toggleDeleteButton));
+    checkboxes.forEach(cb => cb.addEventListener('change', updateBulkActionButtons));
+
     checkAllBox.addEventListener('change', () => {
         checkboxes.forEach(cb => cb.checked = checkAllBox.checked);
-        toggleDeleteButton();
+        updateBulkActionButtons();
     });
 
     deleteSelectedBtn.addEventListener('click', () => {
-        let currentRules = JSON.parse(localStorage.getItem('otkFilterRules') || '[]');
-        const indicesToDelete = checkboxes
-            .filter(cb => cb.checked)
-            .map(cb => parseInt(cb.dataset.ruleIndex, 10));
-
-        const newRules = currentRules.filter((_, index) => !indicesToDelete.includes(index));
-        localStorage.setItem('otkFilterRules', JSON.stringify(newRules));
+        if (!confirm('Are you sure you want to delete the selected rules?')) return;
+        let currentRules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
+        const idsToDelete = new Set(checkboxes.filter(cb => cb.checked).map(cb => parseInt(cb.dataset.ruleId, 10)));
+        const newRules = currentRules.filter(rule => !idsToDelete.has(rule.id));
+        localStorage.setItem(FILTER_RULES_V2_KEY, JSON.stringify(newRules));
         renderFilterList();
     });
+
+    editSelectedBtn.addEventListener('click', () => {
+        const selectedCheckbox = checkboxes.find(cb => cb.checked);
+        if (selectedCheckbox) {
+            const ruleId = parseInt(selectedCheckbox.dataset.ruleId, 10);
+            const ruleToEdit = rules.find(r => r.id === ruleId);
+            if (ruleToEdit) {
+                renderFilterEditorView(ruleToEdit);
+            }
+        }
+    });
+
+    if (!document.getElementById('otk-switch-styles')) {
+        const style = document.createElement('style');
+        style.id = 'otk-switch-styles';
+        style.innerHTML = `
+            .otk-switch { position: relative; display: inline-block; width: 34px; height: 20px; }
+            .otk-switch input { opacity: 0; width: 0; height: 0; }
+            .otk-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; }
+            .otk-slider:before { position: absolute; content: ""; height: 12px; width: 12px; left: 4px; bottom: 4px; background-color: white; transition: .4s; }
+            input:checked + .otk-slider { background-color: #4CAF50; }
+            input:focus + .otk-slider { box-shadow: 0 0 1px #4CAF50; }
+            input:checked + .otk-slider:before { transform: translateX(14px); }
+            .otk-slider.round { border-radius: 20px; }
+            .otk-slider.round:before { border-radius: 50%; }
+        `;
+        document.head.appendChild(style);
+    }
 }
 
 function setupFilterWindow() {
@@ -7597,7 +8735,7 @@ function setupFilterWindow() {
         position: fixed;
         top: 120px;
         left: 120px;
-        width: 600px;
+        width: 900px;
         height: 400px;
         background-color: #2c2c2c;
         border: 1px solid #444;
@@ -7688,8 +8826,14 @@ function setupFilterWindow() {
     leftMenu.appendChild(filterListBtn);
 
     const newFilterBtn = createTrackerButton('New Filter');
-    newFilterBtn.addEventListener('click', () => renderNewFilterView());
+    newFilterBtn.addEventListener('click', () => renderFilterEditorView());
     leftMenu.appendChild(newFilterBtn);
+
+    const closeMenuBtn = createTrackerButton('Close');
+    closeMenuBtn.addEventListener('click', () => {
+        filterWindow.style.display = 'none';
+    });
+    leftMenu.appendChild(closeMenuBtn);
 
     document.body.appendChild(filterWindow);
     consoleLog("Filter Window setup complete.");
@@ -7697,8 +8841,117 @@ function setupFilterWindow() {
 
 
 
+function setupClockOptionsWindow() {
+    consoleLog("Setting up Clock Options Window...");
+
+    if (document.getElementById('otk-clock-options-window')) {
+        consoleLog("Clock Options window already exists.");
+        return;
+    }
+
+    const clockOptionsWindow = document.createElement('div');
+    clockOptionsWindow.id = 'otk-clock-options-window';
+    clockOptionsWindow.style.cssText = `
+        position: fixed;
+        top: 150px;
+        left: 150px;
+        width: 350px;
+        min-height: 150px;
+        max-height: 400px;
+        background-color: #2c2c2c;
+        border: 1px solid #444;
+        border-radius: 5px;
+        z-index: 10001; /* Above main options window */
+        display: none;
+        flex-direction: column;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+        color: var(--otk-options-text-color);
+    `;
+
+    const titleBar = document.createElement('div');
+    titleBar.id = 'otk-clock-options-title-bar';
+    titleBar.style.cssText = `
+        padding: 8px 12px;
+        background-color: #383838;
+        color: #f0f0f0;
+        font-weight: bold;
+        cursor: move;
+        border-bottom: 1px solid #444;
+        border-top-left-radius: 5px;
+        border-top-right-radius: 5px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    `;
+    titleBar.textContent = 'Clock Options';
+
+    const closeButton = document.createElement('span');
+    closeButton.id = 'otk-clock-options-close-btn';
+    closeButton.innerHTML = '&#x2715;';
+    closeButton.style.cssText = `
+        cursor: pointer;
+        font-size: 16px;
+        padding: 0 5px;
+    `;
+    closeButton.title = "Close Clock Settings";
+
+    closeButton.addEventListener('click', () => {
+        clockOptionsWindow.style.display = 'none';
+    });
+
+    titleBar.appendChild(closeButton);
+    clockOptionsWindow.appendChild(titleBar);
+
+    const contentArea = document.createElement('div');
+    contentArea.id = 'otk-clock-options-content';
+    contentArea.style.cssText = `
+        padding: 15px;
+        flex-grow: 1;
+        overflow-y: auto;
+    `;
+    clockOptionsWindow.appendChild(contentArea);
+
+    document.body.appendChild(clockOptionsWindow);
+
+    // Make window draggable
+    let isDragging = false;
+    let offsetX, offsetY;
+
+    titleBar.addEventListener('mousedown', (e) => {
+        if (e.target === closeButton) return;
+        isDragging = true;
+        offsetX = e.clientX - clockOptionsWindow.offsetLeft;
+        offsetY = e.clientY - clockOptionsWindow.offsetTop;
+        titleBar.style.userSelect = 'none';
+        document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (isDragging) {
+            let newLeft = e.clientX - offsetX;
+            let newTop = e.clientY - offsetY;
+            clockOptionsWindow.style.left = newLeft + 'px';
+            clockOptionsWindow.style.top = newTop + 'px';
+        }
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (isDragging) {
+            isDragging = false;
+            titleBar.style.userSelect = '';
+            document.body.style.userSelect = '';
+        }
+    });
+}
+
     // --- Initial Actions / Main Execution ---
     async function main() {
+        // Migration: Remove old filter rules key if it exists
+        if (localStorage.getItem('otkFilterRules')) {
+            localStorage.removeItem('otkFilterRules');
+            consoleLog('[Migration] Removed outdated otkFilterRules from localStorage.');
+        }
+
         // Clock data migration
         if (!localStorage.getItem('otkClocks')) {
             const oldTimezone = localStorage.getItem('otkClockTimezone');
@@ -7750,6 +9003,7 @@ function setupFilterWindow() {
         const styleElement = document.createElement('style');
         styleElement.textContent = `
             :root {
+                --otk-clock-cog-color: #FFD700;
                 --otk-clock-bg-color: #181818;
                 --otk-clock-text-color: #e6e6e6;
                 --otk-clock-border-color: #181818;
@@ -7765,7 +9019,7 @@ function setupFilterWindow() {
                 --otk-background-updates-stats-text-color: #FFD700; /* For the 'new' stats text */
                 --otk-viewer-bg-color: #ffd1a4;
                 --otk-gui-threadlist-title-color: #e0e0e0;
-                --otk-gui-threadlist-time-color: #aaa;
+                --otk-gui-threadlist-time-color: #FFD700;
                 --otk-viewer-header-border-color: #000000; /* Default theme's header underline for depth 0 - Now black */
                 --otk-viewer-quote1-header-border-color: #000000; /* Default theme's header underline for depth 1 - Now black */
                 /* New defaults based on example.html for the new design, now acting as global defaults */
@@ -7783,7 +9037,7 @@ function setupFilterWindow() {
 
                 --otk-viewer-message-font-size: 13px; /* Default font size for message text - remains common */
                 --otk-gui-bottom-border-color: #ff8040; /* Default for GUI bottom border - remains common */
-                --otk-cog-icon-color: #e6e6e6; /* Default for settings cog icon */
+                --otk-cog-icon-color: #FFD700; /* Default for settings cog icon */
                 --otk-disable-bg-font-color: #ff8040; /* Default for "Disable Background Updates" text */
                 --otk-countdown-timer-text-color: #ff8040; /* Default for countdown timer text */
                 --otk-viewer-quote2plus-header-border-color: #000000; /* Default for Depth 2+ message header underline - Now black */
@@ -7888,6 +9142,7 @@ function setupFilterWindow() {
 
         await applyMainTheme();
         setupOptionsWindow(); // Call to create the options window shell and event listeners
+        setupClockOptionsWindow(); // Create the new clock options window
         setupFilterWindow();
         applyThemeSettings(); // Apply any saved theme settings
         await fetchTimezones();
@@ -7907,32 +9162,6 @@ function setupFilterWindow() {
                 messagesByThreadId = await loadMessagesFromDB();
                 consoleLog("messagesByThreadId after load:", messagesByThreadId);
 
-                // Trim messages according to limit to reduce memory usage
-                const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-                const messageLimitEnabled = themeSettings.otkMessageLimitEnabled !== false;
-                if (messageLimitEnabled) {
-                    const messageLimitValue = parseInt(themeSettings.otkMessageLimitValue || '500', 10);
-                    let allMessages = [];
-                    for (const threadId in messagesByThreadId) {
-                        allMessages.push(...messagesByThreadId[threadId]);
-                    }
-
-                    if (allMessages.length > messageLimitValue) {
-                        allMessages.sort((a, b) => b.time - a.time); // Sort descending to get newest
-                        const limitedMessages = allMessages.slice(0, messageLimitValue);
-                        const limitedMessageIds = new Set(limitedMessages.map(m => m.id));
-
-                        const newMessagesByThreadId = {};
-                        for (const threadId in messagesByThreadId) {
-                            const threadMessages = messagesByThreadId[threadId].filter(m => limitedMessageIds.has(m.id));
-                            if (threadMessages.length > 0) {
-                                newMessagesByThreadId[threadId] = threadMessages;
-                            }
-                        }
-                        messagesByThreadId = newMessagesByThreadId;
-                        consoleLog(`[Memory Fix] Trimmed in-memory messages down to ${messageLimitValue}`);
-                    }
-                }
 
 
                 // Recalculate and display initial media stats
@@ -7970,6 +9199,8 @@ function setupFilterWindow() {
 
                 consoleLog("OTK Thread Tracker script initialized and running.");
 
+                setupTitleObserver();
+
             } catch (error) {
                 consoleError("Critical error during main initialization sequence:", error);
                 const errorDisplay = document.getElementById('otk-thread-title-display');
@@ -7981,6 +9212,7 @@ function setupFilterWindow() {
         }
 
         startAutoEmbedReloader();
+        startSuspensionChecker();
 
         // Kick off the script using the main async function
         main().finally(() => {
@@ -8004,43 +9236,49 @@ function setupFilterWindow() {
         setInterval(updateClockTimes, 1000);
 
         function handleActivity() {
-            if (scrollTimeout) {
-                clearTimeout(scrollTimeout);
-            }
+            lastActivityTimestamp = Date.now();
             if (isSuspended) {
                 consoleLog("[Activity] Activity detected, resuming background updates.");
                 isSuspended = false;
                 hideSuspendedScreen();
                 startBackgroundRefresh(); // Restart the refresh cycle
             }
+        }
+
+        function checkSuspension() {
+            if (isSuspended || isManualRefreshInProgress) {
+                return;
+            }
+
             const suspendAfterInactiveMinutesValue = localStorage.getItem('otkSuspendAfterInactiveMinutes') || '1';
             if (suspendAfterInactiveMinutesValue === 'Disabled') {
-                return; // Do not set a timeout if suspension is disabled
+                return;
             }
+
             const suspendAfterInactiveMinutes = parseInt(suspendAfterInactiveMinutesValue, 10);
-            scrollTimeout = setTimeout(() => {
+            const inactiveMinutes = (Date.now() - lastActivityTimestamp) / (1000 * 60);
+
+            if (inactiveMinutes >= suspendAfterInactiveMinutes) {
                 consoleLog(`[Activity] No activity for ${suspendAfterInactiveMinutes} minutes, suspending background updates.`);
                 isSuspended = true;
                 stopBackgroundRefresh();
                 showSuspendedScreen();
-            }, suspendAfterInactiveMinutes * 60 * 1000);
+            }
         }
 
-        window.addEventListener('scroll', handleActivity);
-        window.addEventListener('mousemove', handleActivity);
-        window.addEventListener('mousedown', handleActivity);
-        window.addEventListener('keydown', handleActivity);
-        window.addEventListener('touchstart', handleActivity);
-
-        document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'hidden') {
-                if (scrollTimeout) {
-                    clearTimeout(scrollTimeout);
-                }
-            } else {
-                handleActivity();
+        function startSuspensionChecker() {
+            if (suspensionCheckIntervalId) {
+                clearInterval(suspensionCheckIntervalId);
             }
-        });
+            suspensionCheckIntervalId = setInterval(checkSuspension, 5000); // Check every 5 seconds
+
+            window.addEventListener('scroll', handleActivity, { passive: true });
+            window.addEventListener('mousemove', handleActivity, { passive: true });
+            window.addEventListener('mousedown', handleActivity, { passive: true });
+            window.addEventListener('keydown', handleActivity, { passive: true });
+            window.addEventListener('touchstart', handleActivity, { passive: true });
+            document.addEventListener('visibilitychange', handleActivity);
+        }
 
         async function generateMemoryUsageReport() {
             showLoadingScreen("Generating memory usage report...");
@@ -8181,6 +9419,7 @@ function setupFilterWindow() {
                 }
 
                 renderClocks(); // Re-render to show changes
+                renderClockOptions(); // Re-render the options list
                 document.getElementById('otk-timezone-search-container').style.display = 'none'; // Hide search
                 searchInput.value = '';
                 searchResultsDiv.innerHTML = '';
