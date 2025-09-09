@@ -1,19 +1,107 @@
 // ==UserScript==
-// @grant        GM.getValue
-// @grant        GM.setValue
-
 // @name         Thread Tracker
 // @namespace    http://tampermonkey.net/
 // @version      2.8
 // @description  Tracks OTK threads on /b/, stores messages and media, shows top bar with colors and controls, removes inactive threads entirely
 // @match        https://boards.4chan.org/b/
 // @grant        GM_xmlhttpRequest
+// @grant        GM.getValue
+// @grant        GM.setValue
 // ==/UserScript==
 
-(function () {
+(function() {
     'use strict';
 
-let statAnimationFrameId = null;
+    // --- IIFE Scope Helper for Intersection Observer ---
+    function handleIntersection(entries, observerInstance) {
+        entries.forEach(entry => {
+            const wrapper = entry.target;
+            let iframe = wrapper.querySelector('iframe');
+
+            if (entry.isIntersecting) {
+                // Element is now visible
+                if (!iframe) {
+                    // If the iframe was removed, recreate it
+                    const newIframe = document.createElement('iframe');
+                    // Copy attributes from a template or stored config if necessary
+                    // For now, assuming basic recreation is enough
+                    newIframe.style.position = 'absolute';
+                    newIframe.style.top = '0';
+                    newIframe.style.left = '0';
+                    newIframe.style.width = '100%';
+                    newIframe.style.height = '100%';
+                    newIframe.setAttribute('frameborder', '0');
+                    newIframe.setAttribute('allowfullscreen', 'true');
+                    if (wrapper.classList.contains('otk-twitch-embed-wrapper')) {
+                        newIframe.setAttribute('scrolling', 'no');
+                    } else if (wrapper.classList.contains('otk-youtube-embed-wrapper')) {
+                        newIframe.setAttribute('allow', 'accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
+                    }
+                    newIframe.dataset.src = wrapper.dataset.embedUrl;
+                    wrapper.innerHTML = '';
+        if (window.twttr?.widgets?.load) {
+            twttr.widgets.load(wrapper);
+        } // Clear placeholder
+                    wrapper.appendChild(newIframe);
+                    iframe = newIframe;
+                }
+
+                if (iframe && iframe.dataset.src && (!iframe.src || iframe.src === 'about:blank')) {
+                    consoleLog('[LazyLoad] Iframe is intersecting, loading src:', iframe.dataset.src);
+                    iframe.src = iframe.dataset.src;
+                }
+                observerInstance.unobserve(wrapper);
+            } else {
+                // Element is no longer visible
+                if (wrapper.classList.contains('otk-tweet-embed-wrapper')) {
+                    return; // Do not unload tweet embeds
+                }
+
+                if (iframe && iframe.src && iframe.src !== 'about:blank') {
+                    consoleLog('[LazyLoad] Iframe is no longer intersecting, removing iframe for:', iframe.src);
+
+                    // For YouTube, try to pause the video before removing
+                    if (iframe.contentWindow && iframe.src.includes("youtube.com/embed")) {
+                        try {
+                            iframe.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', 'https://www.youtube.com');
+                        } catch (e) {
+                            consoleWarn('[LazyLoad] Error attempting to postMessage pause to YouTube:', e);
+                        }
+                    } else if (iframe.contentWindow && iframe.src.includes("twitch.tv")) {
+                        try {
+                            iframe.contentWindow.postMessage({"event": "video.pause"}, "*");
+                        } catch (e) {
+                            consoleWarn('[LazyLoad] Error attempting to postMessage pause to Twitch:', e);
+                        }
+                    }
+
+                    // Store the embed URL on the wrapper if it's not already there
+                    if (!wrapper.dataset.embedUrl) {
+                        wrapper.dataset.embedUrl = iframe.dataset.src;
+                    }
+
+                    // Remove the iframe and add a placeholder
+                    iframe.remove();
+                    const placeholder = document.createElement('div');
+                    placeholder.textContent = 'Embed hidden. Scroll to load.';
+                    placeholder.style.cssText = `
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        width: 100%;
+                        height: 100%;
+                        background-color: #181818;
+                        color: white;
+                        font-size: 14px;
+                    `;
+                    wrapper.appendChild(placeholder);
+                    observerInstance.observe(wrapper);
+                }
+            }
+        });
+    }
+
+    let statAnimationFrameId = null;
 let tabHidden = false;
 let statAnimationTimers = [];
 
@@ -1395,6 +1483,96 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
 
     // --- Core Logic: Rendering, Fetching, Updating ---
 
+    function findMessageById(messageId) {
+        messageId = Number(messageId);
+        for (const threadId in messagesByThreadId) {
+            if (messagesByThreadId.hasOwnProperty(threadId)) {
+                const foundMsg = messagesByThreadId[threadId].find(m => m.id === messageId);
+                if (foundMsg) {
+                    return foundMsg;
+                }
+            }
+        }
+        return null;
+    }
+
+function findMessageDepth(message, targetId, currentDepth = 0) {
+    if (String(message.id) === String(targetId)) {
+        return currentDepth;
+    }
+    if (currentDepth < MAX_QUOTE_DEPTH && message.text) {
+        const quoteRegex = />>(\d+)/g;
+        let match;
+        const uniqueQuoteIds = new Set();
+        while ((match = quoteRegex.exec(message.text)) !== null) {
+            uniqueQuoteIds.add(match[1]);
+        }
+        for (const quotedMessageId of uniqueQuoteIds) {
+            const quotedMessageObject = findMessageById(quotedMessageId);
+            if (quotedMessageObject) {
+                const foundDepth = findMessageDepth(quotedMessageObject, targetId, currentDepth + 1);
+                if (foundDepth !== null) {
+                    return foundDepth;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+function hasTruncatedQuotes(message, currentDepth = 0) {
+    if (currentDepth === MAX_QUOTE_DEPTH) {
+        return message.text && />>(\d+)/.test(message.text);
+    }
+    if (currentDepth < MAX_QUOTE_DEPTH) {
+        if (!message.text) return false;
+        const quoteRegex = />>(\d+)/g;
+        let match;
+        const uniqueQuoteIds = new Set();
+        while ((match = quoteRegex.exec(message.text)) !== null) {
+            uniqueQuoteIds.add(match[1]);
+        }
+        for (const quotedMessageId of uniqueQuoteIds) {
+            const quotedMessageObject = findMessageById(quotedMessageId);
+            if (quotedMessageObject && hasTruncatedQuotes(quotedMessageObject, currentDepth + 1)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function findNextUnloadedQuoteLink(topLevelElement) {
+    // 1. Find all message elements within the top-level container.
+    const allMessageElements = Array.from(topLevelElement.querySelectorAll('div[data-message-id]'));
+    const renderedMessageIds = new Set(allMessageElements.map(el => el.dataset.messageId));
+
+    // 2. Iterate through all rendered messages to find quote links.
+    for (const messageElement of allMessageElements) {
+        const messageId = messageElement.dataset.messageId;
+        const messageObject = findMessageById(messageId);
+
+        if (messageObject && messageObject.text) {
+            const quoteRegex = />>(\d+)/g;
+            let match;
+            while ((match = quoteRegex.exec(messageObject.text)) !== null) {
+                const quotedId = match[1];
+
+                // 3. Check if the found quote link points to a message that is NOT already rendered.
+                if (!renderedMessageIds.has(quotedId)) {
+                    // This is a "leaf" node. We've found the next link to load.
+                    return {
+                        id: quotedId,
+                        parentId: messageId, // The parent for insertion is the element containing the link.
+                    };
+                    }
+                }
+            }
+        }
+
+    // 4. If we loop through everything and find no unloaded links, return null.
+        return null;
+    }
 
 function isMessageFiltered(message, rules) {
     const messageText = (message.text || '').toLowerCase();
@@ -2473,7 +2651,7 @@ function _populateAttachmentDivWithMedia(
     actualBoardForLink, // Board string for URLs
     mediaLoadPromises,  // Array for async operations
     uniqueImageViewerHashes, // Set for tracking unique images shown
-    isTopLevelMessage,     // Boolean, for some media logic (e.g., video stats)
+    isTopLevelForStyling,     // Boolean, for some media logic (e.g., video stats)
     layoutStyle,           // 'new_design' or 'default', to condition New Design specific logic
     renderedFullSizeImageHashes, // Set for tracking full-size images
     viewerTopLevelAttachedVideoHashes, // Set for video stats
@@ -2519,7 +2697,7 @@ function _populateAttachmentDivWithMedia(
         let defaultToThumbnail;
 
         // Determine the viewer's max-height constraint
-        const maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? 400 : 350;
+        const maxHeight = (layoutStyle === 'new_design' || isTopLevelForStyling) ? 400 : 350;
 
         // --- SOLUTION START ---
         // New logic: Show full-size if image is small, panoramic, OR has a tiny thumbnail.
@@ -2559,7 +2737,7 @@ function _populateAttachmentDivWithMedia(
                 img.style.maxHeight = '';
             } else if (mode === 'full') {
                 img.style.maxWidth = '85%';
-                img.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '350px';
+                img.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelForStyling) ? '400px' : '350px';
                 img.style.width = 'auto';
                 img.style.height = 'auto';
             } else { // 'original'
@@ -2762,7 +2940,7 @@ function _populateAttachmentDivWithMedia(
         const videoElement = document.createElement('video');
         videoElement.controls = true;
         videoElement.style.maxWidth = '85%';
-        const defaultMaxHeight = isTopLevelMessage ? '400px' : '300px';
+        const defaultMaxHeight = isTopLevelForStyling ? '400px' : '300px';
         videoElement.style.maxHeight = defaultMaxHeight;
         videoElement.dataset.defaultMaxHeight = defaultMaxHeight;
         videoElement.style.borderRadius = '3px';
@@ -2878,7 +3056,7 @@ function _populateAttachmentDivWithMedia(
         observer.observe(videoElement, { attributes: true, attributeFilter: ['style', 'src'] });
         videoElement.addEventListener('loadeddata', updateVideoIconPosition);
 
-        if (message.attachment.filehash_db_key && isTopLevelMessage) {
+        if (message.attachment.filehash_db_key && isTopLevelForStyling) {
             viewerTopLevelAttachedVideoHashes.add(message.attachment.filehash_db_key);
         }
     }
@@ -2920,13 +3098,13 @@ function wrapInCollapsibleContainer(elementsToWrap) {
     return container;
 }
 
-function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, ancestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline) {
+function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelForStyling, currentDepth, threadColor, parentMessageId, ancestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline) {
     const textElement = document.createElement('div');
     textElement.style.whiteSpace = 'pre-wrap';
     textElement.style.overflowWrap = 'break-word';
     textElement.style.wordBreak = 'normal';
 
-    if (isTopLevelMessage) {
+    if (isTopLevelForStyling) {
         textElement.style.fontSize = 'var(--otk-msg-depth0-content-font-size)';
     } else if (currentDepth === 1) {
         textElement.style.fontSize = 'var(--otk-msg-depth1-content-font-size)';
@@ -2946,10 +3124,9 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
 
         lines.forEach((line, lineIndex) => {
             const trimmedLine = line.trim();
-            const isBlockQuote = trimmedLine.match(quoteRegex) && trimmedLine.match(quoteRegex)[0] === trimmedLine;
-            if (isBlockQuote && currentDepth >= MAX_QUOTE_DEPTH) {
-                return;
-            }
+            // const isBlockQuote = trimmedLine.match(quoteRegex) && trimmedLine.match(quoteRegex)[0] === trimmedLine;
+            // The isBlockQuote check was removed as it prevented quote links at max depth from being rendered as text.
+            // The logic now falls through to the inline quote handler which correctly processes them.
 
             let processedAsEmbed = false;
             let soleUrlEmbedMade = false;
@@ -3189,7 +3366,7 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
 
         _populateAttachmentDivWithMedia(
             attachmentDiv, message, actualBoardForLink, mediaLoadPromises,
-            uniqueImageViewerHashes, isTopLevelMessage, 'default',
+            uniqueImageViewerHashes, isTopLevelForStyling, 'default',
             renderedFullSizeImageHashes, viewerTopLevelAttachedVideoHashes, otkMediaDB
         );
     }
@@ -3197,7 +3374,7 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
     return [textElement, attachmentDiv];
 }
     // Signature now includes parentMessageId and ancestors
-    function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId = null, ancestors = new Set()) {
+function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId = null, ancestors = new Set(), visualDepth = null) {
         const filterRules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
 
         const shouldBeFilteredOut = isMessageFiltered(message, filterRules);
@@ -3212,7 +3389,6 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
         const isFiltered = shouldBeFilteredOut || doesAnyRuleMatch(message, filterRules);
 
         // const layoutStyle = localStorage.getItem('otkMessageLayoutStyle') || 'default';
-        consoleLog(`[DepthCheck] Rendering message: ${message.id}, parent: ${parentMessageId}, currentDepth: ${currentDepth}, MAX_QUOTE_DEPTH: ${MAX_QUOTE_DEPTH}, isTopLevel: ${isTopLevelMessage}`);
 
         // Stack overflow prevention: Check for circular references.
         if (ancestors.has(message.id)) {
@@ -3238,10 +3414,19 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
         } catch (e) {
             consoleError("Error parsing theme settings from localStorage:", e);
         }
+
+    let effectiveDepthForStyling = currentDepth;
+    let isTopLevelForStyling = isTopLevelMessage;
+
+    if (visualDepth !== null) {
+        effectiveDepthForStyling = visualDepth;
+        isTopLevelForStyling = (visualDepth === 0);
+    }
+
         let depthKeyPart;
-        if (isTopLevelMessage) { // Depth 0
+    if (isTopLevelForStyling) { // Depth 0
             depthKeyPart = '0';
-        } else if (currentDepth === 1) { // Depth 1
+    } else if (effectiveDepthForStyling === 1) { // Depth 1
             depthKeyPart = '1';
         } else { // Depth 2+
             depthKeyPart = '2plus';
@@ -3315,6 +3500,9 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
         { // layoutStyle === 'default' or unknown (original logic)
             const messageDiv = document.createElement('div');
             messageDiv.setAttribute('data-message-id', message.id);
+            if (visualDepth !== null) {
+                messageDiv.dataset.visualDepth = visualDepth;
+            }
             if (isTopLevelMessage) {
                 messageDiv.classList.add('otk-message-container-main');
             }
@@ -3328,14 +3516,14 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
             // let positionStyle = ''; // REMOVED - No longer needed for relative positioning
 
             let backgroundColorVar;
-            if (isTopLevelMessage) { // Depth 0
+            if (isTopLevelForStyling) { // Depth 0
                 backgroundColorVar = 'var(--otk-msg-depth0-bg-color)';
                 // marginLeft, marginTop, marginBottom remain defaults for top-level
             } else { // Quoted message (Depth 1+)
                 marginLeft = '0px'; // No specific indent margin for quote itself
                 marginTop = '10px';    // Specific top margin for quoted messages
                 marginBottom = '0px';  // Specific bottom margin for quoted messages
-                if (currentDepth === 1) {
+                if (effectiveDepthForStyling === 1) {
                     backgroundColorVar = 'var(--otk-msg-depth1-bg-color)';
                 } else { // Covers currentDepth === 2 and potential deeper fallbacks
                     backgroundColorVar = 'var(--otk-msg-depth2plus-bg-color)';
@@ -3346,7 +3534,7 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
         box-sizing: border-box;
         display: block;
         background-color: ${backgroundColorVar};
-        color: ${ isTopLevelMessage ? 'var(--otk-msg-depth0-text-color)' : (currentDepth === 1 ? 'var(--otk-msg-depth1-text-color)' : 'var(--otk-msg-depth2plus-text-color)') };
+        color: ${ isTopLevelForStyling ? 'var(--otk-msg-depth0-text-color)' : (effectiveDepthForStyling === 1 ? 'var(--otk-msg-depth1-text-color)' : 'var(--otk-msg-depth2plus-text-color)') };
         /* position: relative; REMOVED - No longer needed */
 
         margin-top: ${marginTop};
@@ -3390,7 +3578,7 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
 
             messageHeader.style.cssText = `
                 font-size: 12px;
-                color: ${ isTopLevelMessage ? 'var(--otk-msg-depth0-header-text-color)' : (currentDepth === 1 ? 'var(--otk-msg-depth1-header-text-color)' : 'var(--otk-msg-depth2plus-header-text-color)') };
+                color: ${ isTopLevelForStyling ? 'var(--otk-msg-depth0-header-text-color)' : (effectiveDepthForStyling === 1 ? 'var(--otk-msg-depth1-header-text-color)' : 'var(--otk-msg-depth2plus-header-text-color)') };
                 font-weight: bold;
                 margin-bottom: 8px; /* Default margin */
                 padding-bottom: ${headerPaddingBottomStyle}; /* Default padding for underline */
@@ -3404,7 +3592,7 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
             if (shouldDisableUnderline) {
                 messageHeader.style.borderBottom = 'none';
                 messageHeader.style.paddingBottom = '0px';
-                messageHeader.style.marginBottom = '0px'; // Standardized to 0px for all depths when underline hidden
+                messageHeader.style.marginBottom = '8px'; // Keep consistent margin even when underline is hidden
                 messageHeader.style.lineHeight = '1.1';   // Standardized
                 messageHeader.style.minHeight = '0';      // Standardized
             }
@@ -3466,6 +3654,7 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
                     timeTextSpan.style.textDecoration = 'line-through';
                 }
                 leftHeaderContent.appendChild(idSpan);
+
                 leftHeaderContent.appendChild(timeTextSpan);
 
                 const blockIcon = document.createElement('span');
@@ -3536,8 +3725,101 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
                     dateSpan.style.textDecoration = 'line-through';
                 }
 
+                const rightHeaderContent = document.createElement('span');
+                rightHeaderContent.style.display = 'flex';
+                rightHeaderContent.style.alignItems = 'center';
+
+                if (hasTruncatedQuotes(message)) { // Use the recursive check for initial display
+                    const plusIcon = document.createElement('span');
+                    plusIcon.classList.add('otk-plus-icon');
+                    plusIcon.id = `otk-plus-icon-${message.id}`;
+                    plusIcon.textContent = '+';
+                    plusIcon.style.color = threadColor;
+                    plusIcon.title = 'Load next reply in truncated chain';
+                    plusIcon.style.fontWeight = 'bold';
+                    plusIcon.style.fontSize = '18px';
+                    plusIcon.style.marginRight = '8px';
+                    plusIcon.style.cursor = 'pointer';
+
+                    plusIcon.addEventListener('click', async (e) => {
+                        e.stopPropagation();
+
+                        const clickedPlusIcon = e.currentTarget;
+                        const topLevelElement = clickedPlusIcon.closest('.otk-message-container-main');
+                        if (!topLevelElement) {
+                            consoleError("Could not find top-level container for the clicked plus icon.");
+                            return;
+                        }
+
+                        const truncatedInfo = findNextUnloadedQuoteLink(topLevelElement);
+
+                        if (!truncatedInfo) {
+                            consoleWarn(`Plus icon clicked for message ${message.id}, but no further truncated quotes could be found. Removing icon.`);
+                            clickedPlusIcon.remove();
+                            return;
+                        }
+
+                        const { id: messageToLoadId, parentId: parentOfTruncatedId } = truncatedInfo;
+
+                        let messageToLoad = findMessageById(messageToLoadId);
+                        if (!messageToLoad) {
+                            clickedPlusIcon.style.cursor = 'wait';
+                            clickedPlusIcon.style.color = '#aaa';
+                            try {
+                                await fetchThreadMessages(message.originalThreadId);
+                                messageToLoad = findMessageById(messageToLoadId);
+                            } catch (error) {
+                                consoleError(`Failed to fetch thread for click-to-load:`, error);
+                                return;
+                            } finally {
+                                clickedPlusIcon.style.cursor = 'pointer';
+                                clickedPlusIcon.style.color = threadColor;
+                            }
+                        }
+
+                        if (!messageToLoad) {
+                            consoleError(`Message ${messageToLoadId} not found even after fetching thread.`);
+                            return;
+                        }
+
+                        const insertionParent = topLevelElement.querySelector(`div[data-message-id='${parentOfTruncatedId}']`);
+                        if (!insertionParent) {
+                            consoleError(`Could not find insertion parent element with ID ${parentOfTruncatedId}`);
+                            return;
+                        }
+
+                        // We need the actual depth of the parent to correctly render the new child's own quotes.
+                        const parentMessageObject = findMessageById(parentOfTruncatedId);
+                        const parentActualDepth = findMessageDepth(message, parentOfTruncatedId);
+
+
+                        const parentVisualDepth = insertionParent.dataset.visualDepth;
+                        const newVisualDepth = (parentVisualDepth === undefined) ? 1 : parseInt(parentVisualDepth, 10) + 1;
+
+                        const newElement = createMessageElementDOM(
+                            messageToLoad, [], uniqueImageViewerHashes,
+                            messageToLoad.board || 'b', false, (parentActualDepth !== null ? parentActualDepth + 1 : 0),
+                            null, parentOfTruncatedId, new Set(), newVisualDepth
+                        );
+
+                        if (newElement) {
+                            insertionParent.appendChild(newElement);
+
+                            // Re-check if there are any more unloaded truncated quotes using the same DOM-based logic.
+                            const nextTruncatedInfo = findNextUnloadedQuoteLink(topLevelElement);
+                            if (!nextTruncatedInfo) {
+                                clickedPlusIcon.remove();
+                            }
+                        }
+                    });
+
+                    rightHeaderContent.appendChild(plusIcon);
+                }
+
+                rightHeaderContent.appendChild(dateSpan);
+
                 messageHeader.appendChild(leftHeaderContent);
-                messageHeader.appendChild(dateSpan);
+                messageHeader.appendChild(rightHeaderContent);
             } else { // Simplified header for quoted messages
                 messageHeader.style.justifyContent = 'flex-start'; // Align ID to the start
 
@@ -3636,7 +3918,7 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
                 });
             }
             messageDiv.appendChild(messageHeader);
-            const [textElement, attachmentDiv] = _populateMessageBody(processedMessage, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
+            const [textElement, attachmentDiv] = _populateMessageBody(processedMessage, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelForStyling, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
 
             // Click listener for anchoring
             const persistentInstanceId = `otk-msg-${parentMessageId || 'toplevel'}-${message.id}`;
@@ -3707,7 +3989,7 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
 
                 if (!hasUnfilteredContent && !hasQuotes) {
                     // Case 1: No unfiltered content and no quotes. Collapse the original message.
-                    const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
+                    const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelForStyling, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
                     const collapsibleContainer = wrapInCollapsibleContainer([originalTextElement, originalAttachmentDiv]);
                     messageDiv.appendChild(collapsibleContainer);
                 } else {
@@ -3739,7 +4021,7 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
                         eyeIcon.addEventListener('click', (e) => {
                             e.stopPropagation();
                             if (!originalBodyGenerated) {
-                                const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
+                                const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelForStyling, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
                                 if(originalTextElement) originalBodyContainer.append(originalTextElement);
                                 if (originalAttachmentDiv) originalBodyContainer.append(originalAttachmentDiv);
                                 originalBodyGenerated = true;
@@ -5417,6 +5699,21 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         bottomRowContainer.appendChild(btnFilter);
         bottomRowContainer.appendChild(btnMemoryReport);
 
+        const btnPip = createTrackerButton('Picture-in-Picture', 'otk-pip-btn');
+        btnPip.style.display = localStorage.getItem('otkPipModeEnabled') === 'true' ? 'inline-block' : 'none';
+        bottomRowContainer.appendChild(btnPip);
+
+        btnPip.addEventListener('click', () => {
+            document.body.classList.toggle('otk-pip-mode');
+
+            if (document.body.classList.contains('otk-pip-mode')) {
+                enablePipMode();
+            } else {
+                disablePipMode();
+            }
+        });
+
+
         // Append row containers to the main buttonContainer
         buttonContainer.appendChild(topRowContainer);
         buttonContainer.appendChild(bottomRowContainer);
@@ -6245,6 +6542,13 @@ function applyThemeSettings(options = {}) {
         } else {
             document.documentElement.style.setProperty('--otk-viewer-thread-box-outline', 'none');
         }
+
+        // PiP Background
+        applyPipBackgroundStyles(); // New centralized function
+        if (settings.pipBackgroundColor) {
+            document.documentElement.style.setProperty('--otk-pip-bg-color', settings.pipBackgroundColor);
+            updateColorInputs('pip-bg', settings.pipBackgroundColor);
+        }
     }
 
 
@@ -6366,6 +6670,126 @@ function applyThemeSettings(options = {}) {
         return group;
     }
 
+
+    function applyPipBackgroundStyles() {
+        const pipBackground = document.getElementById('otk-pip-background');
+        if (!pipBackground) return;
+
+        const settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+        pipBackground.style.backgroundColor = settings.pipBackgroundColor || '#1a1a1a';
+        if (settings.pipBackgroundImageUrl) {
+            pipBackground.style.backgroundImage = `url('${settings.pipBackgroundImageUrl}')`;
+            pipBackground.style.backgroundSize = settings.pipBgSize || 'cover';
+            pipBackground.style.backgroundRepeat = settings.pipBgRepeat || 'no-repeat';
+            pipBackground.style.backgroundPosition = settings.pipBgPosition || 'center';
+        } else {
+            pipBackground.style.backgroundImage = '';
+        }
+    }
+
+    function createPipResizer() {
+        let resizeHandle = document.getElementById('otk-resize-handle');
+        if (resizeHandle) return; // Already exists
+
+        resizeHandle = document.createElement('div');
+        resizeHandle.id = 'otk-resize-handle';
+        document.body.appendChild(resizeHandle);
+
+        let isResizing = false;
+        const viewer = document.getElementById('otk-viewer');
+        const pipBackground = document.getElementById('otk-pip-background');
+
+        const onMouseDown = (e) => {
+            isResizing = true;
+            document.body.classList.add('otk-resizing');
+        };
+
+        let latestX = 0;
+        let isRafPending = false;
+
+        const updateWidth = () => {
+            if (!viewer) return; // Guard against viewer being null
+            const newWidth = Math.max(200, Math.min(latestX, window.innerWidth - 200));
+            viewer.style.width = newWidth + 'px';
+            resizeHandle.style.left = newWidth + 'px';
+            if (pipBackground) {
+                pipBackground.style.left = newWidth + 'px';
+                pipBackground.style.width = (window.innerWidth - newWidth) + 'px';
+            }
+            isRafPending = false;
+        };
+
+        const onMouseMove = (e) => {
+            if (!isResizing) return;
+            latestX = e.clientX;
+            if (!isRafPending) {
+                isRafPending = true;
+                requestAnimationFrame(updateWidth);
+            }
+        };
+
+        const onMouseUp = () => {
+            isResizing = false;
+            document.body.classList.remove('otk-resizing');
+        };
+
+        resizeHandle.addEventListener('mousedown', onMouseDown);
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+
+        // Store listeners so they can be removed
+        resizeHandle.otkListeners = { onMouseDown, onMouseMove, onMouseUp };
+    }
+
+    function destroyPipResizer() {
+        const resizeHandle = document.getElementById('otk-resize-handle');
+        if (resizeHandle && resizeHandle.otkListeners) {
+            const { onMouseDown, onMouseMove, onMouseUp } = resizeHandle.otkListeners;
+            resizeHandle.removeEventListener('mousedown', onMouseDown);
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onMouseUp);
+            resizeHandle.remove();
+        }
+    }
+
+    function enablePipMode() {
+        const viewer = document.getElementById('otk-viewer');
+        if (!viewer) return;
+
+        viewer.style.width = '50vw';
+        viewer.style.right = 'auto';
+
+        let pipBackground = document.getElementById('otk-pip-background');
+        if (!pipBackground) {
+            pipBackground = document.createElement('div');
+            pipBackground.id = 'otk-pip-background';
+            pipBackground.style.position = 'fixed';
+            pipBackground.style.top = '86px';
+            pipBackground.style.left = '50vw';
+            pipBackground.style.width = '50vw';
+            pipBackground.style.height = 'calc(100% - 86px)';
+            pipBackground.style.zIndex = '9997';
+            document.body.appendChild(pipBackground);
+        }
+
+        applyPipBackgroundStyles();
+        createPipResizer();
+    }
+
+    function disablePipMode() {
+        const viewer = document.getElementById('otk-viewer');
+        if (viewer) {
+            viewer.style.width = '100vw';
+            viewer.style.right = '0';
+        }
+
+        const pipBackground = document.getElementById('otk-pip-background');
+        if (pipBackground) {
+            pipBackground.remove();
+        }
+
+        destroyPipResizer();
+    }
 
     function setupOptionsWindow() {
         consoleLog("Setting up Options Window...");
@@ -6819,6 +7243,38 @@ function applyThemeSettings(options = {}) {
         messageLimitGroup.appendChild(messageLimitLabel);
         messageLimitGroup.appendChild(messageLimitControlsWrapper);
         generalSettingsSection.appendChild(messageLimitGroup);
+
+        // --- Picture-in-Picture Toggle Option ---
+        const pipToggleGroup = document.createElement('div');
+        pipToggleGroup.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const pipToggleLabel = document.createElement('label');
+        pipToggleLabel.textContent = "Enable Picture-in-Picture Mode:";
+        pipToggleLabel.htmlFor = 'otk-pip-mode-checkbox';
+        pipToggleLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const pipToggleControlsWrapper = document.createElement('div');
+        pipToggleControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
+
+        const pipToggleCheckbox = document.createElement('input');
+        pipToggleCheckbox.type = 'checkbox';
+        pipToggleCheckbox.id = 'otk-pip-mode-checkbox';
+        pipToggleCheckbox.style.cssText = "height: 16px; width: 16px;";
+        pipToggleCheckbox.checked = localStorage.getItem('otkPipModeEnabled') === 'true';
+
+        pipToggleCheckbox.addEventListener('change', () => {
+            const isEnabled = pipToggleCheckbox.checked;
+            localStorage.setItem('otkPipModeEnabled', isEnabled);
+            const pipButton = document.getElementById('otk-pip-btn');
+            if (pipButton) {
+                pipButton.style.display = isEnabled ? 'inline-block' : 'none';
+            }
+        });
+
+        pipToggleControlsWrapper.appendChild(pipToggleCheckbox);
+        pipToggleGroup.appendChild(pipToggleLabel);
+        pipToggleGroup.appendChild(pipToggleControlsWrapper);
+        generalSettingsSection.appendChild(pipToggleGroup);
 
 
         // --- Theme/Appearance Section ---
@@ -7517,6 +7973,108 @@ function applyThemeSettings(options = {}) {
         themeOptionsContainer.appendChild(createDropdownRow({
             labelText: 'Background Position:',
             storageKey: 'viewerBgPosition',
+            options: ['center', 'top', 'bottom', 'left', 'right'],
+            defaultValue: 'center',
+            requiresRerender: false
+        }));
+
+        // --- PiP Background Section ---
+        const pipBackgroundSubHeading = document.createElement('h6');
+        pipBackgroundSubHeading.textContent = "PiP Background";
+        pipBackgroundSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;";
+        themeOptionsContainer.appendChild(pipBackgroundSubHeading);
+
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'pipBackgroundColor', cssVariable: '--otk-pip-bg-color', defaultValue: '#1a1a1a', inputType: 'color', idSuffix: 'pip-bg' }));
+
+        const pipBgImageUrlRow = document.createElement('div');
+        pipBgImageUrlRow.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
+
+        const pipBgImageUrlLabel = document.createElement('label');
+        pipBgImageUrlLabel.textContent = 'Background Image URL:';
+        pipBgImageUrlLabel.htmlFor = 'otk-pip-bg-image-url-input';
+        pipBgImageUrlLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
+
+        const pipBgImageUrlControlsWrapper = document.createElement('div');
+        pipBgImageUrlControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
+
+        const pipBgImageUrlInput = document.createElement('input');
+        pipBgImageUrlInput.type = 'text';
+        pipBgImageUrlInput.id = 'otk-pip-bg-image-url-input';
+        pipBgImageUrlInput.placeholder = 'Enter image URL or browse';
+        pipBgImageUrlInput.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align: left;";
+
+        const initialPipBgUrl = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {}).pipBackgroundImageUrl || '';
+        if (initialPipBgUrl.startsWith('data:image')) {
+            pipBgImageUrlInput.value = '(Local file is selected)';
+            pipBgImageUrlInput.dataset.fullUrl = initialPipBgUrl;
+        } else {
+            pipBgImageUrlInput.value = initialPipBgUrl;
+        }
+
+        pipBgImageUrlInput.addEventListener('input', () => {
+            pipBgImageUrlInput.dataset.fullUrl = '';
+        });
+
+        pipBgImageUrlInput.addEventListener('change', () => {
+            const valueToSave = pipBgImageUrlInput.dataset.fullUrl || pipBgImageUrlInput.value;
+            saveThemeSetting('pipBackgroundImageUrl', valueToSave, false);
+            applyThemeSettings({ forceRerender: false });
+        });
+
+        const pipBrowseButton = document.createElement('button');
+        pipBrowseButton.textContent = "Browse...";
+        pipBrowseButton.style.cssText = "height: 25px; flex-shrink: 0; padding: 2px 6px; font-size: 11px;";
+
+        const pipFileInput = document.createElement('input');
+        pipFileInput.type = 'file';
+        pipFileInput.accept = 'image/*';
+        pipFileInput.style.display = 'none';
+
+        pipBrowseButton.addEventListener('click', (e) => {
+            e.preventDefault();
+            pipFileInput.click();
+        });
+
+        pipFileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const dataUrl = e.target.result;
+                    pipBgImageUrlInput.value = `(Local file: ${file.name})`;
+                    pipBgImageUrlInput.dataset.fullUrl = dataUrl;
+                    pipBgImageUrlInput.dispatchEvent(new Event('change'));
+                };
+                reader.readAsDataURL(file);
+            }
+        });
+
+        pipBgImageUrlControlsWrapper.appendChild(pipBgImageUrlInput);
+        pipBgImageUrlControlsWrapper.appendChild(pipBrowseButton);
+        pipBgImageUrlControlsWrapper.appendChild(pipFileInput);
+
+        pipBgImageUrlRow.appendChild(pipBgImageUrlLabel);
+        pipBgImageUrlRow.appendChild(pipBgImageUrlControlsWrapper);
+
+        themeOptionsContainer.appendChild(pipBgImageUrlRow);
+
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Background Size:',
+            storageKey: 'pipBgSize',
+            options: ['auto', 'cover', 'contain'],
+            defaultValue: 'cover',
+            requiresRerender: false
+        }));
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Background Repeat:',
+            storageKey: 'pipBgRepeat',
+            options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
+            defaultValue: 'no-repeat',
+            requiresRerender: false
+        }));
+        themeOptionsContainer.appendChild(createDropdownRow({
+            labelText: 'Background Position:',
+            storageKey: 'pipBgPosition',
             options: ['center', 'top', 'bottom', 'left', 'right'],
             defaultValue: 'center',
             requiresRerender: false
@@ -9136,6 +9694,24 @@ function setupClockOptionsWindow() {
                     /* max-width and margins are now controlled by inline styles in createYouTubeEmbedElement */
                     /* This class can be used for other common styles for these embeds if needed */
                 }
+
+            /* --- Picture-in-Picture (PiP) Mode --- */
+            #otk-resize-handle {
+                position: fixed;
+                top: 86px; /* Align with bottom of GUI */
+                left: 50vw; /* Initial position, will be updated by JS */
+                width: 5px;
+                height: calc(100% - 86px);
+                background-color: #888;
+                cursor: col-resize;
+                z-index: 10000; /* Above viewer, below options windows */
+            }
+
+            /* Class added to body during resize drag to prevent text selection */
+            .otk-resizing {
+                user-select: none;
+                -webkit-user-select: none; /* For Safari */
+            }
         `;
         document.head.appendChild(styleElement);
         consoleLog("Injected CSS for anchored messages.");
