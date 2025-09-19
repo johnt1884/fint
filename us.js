@@ -122,8 +122,8 @@ document.addEventListener("visibilitychange", () => {
     const LAST_SEEN_IMAGES_KEY = 'otkLastSeenImagesCount';
     const LAST_SEEN_VIDEOS_KEY = 'otkLastSeenVideosCount';
     const VIEWER_OPEN_KEY = 'otkViewerOpen'; // For viewer open/closed state
-    const ANCHORED_MESSAGE_ID_KEY = 'otkAnchoredMessageId'; // For storing anchored message ID
-    const ANCHORED_MESSAGE_CLASS = 'otk-anchored-message'; // CSS class for highlighting anchored message
+    const PINNED_MESSAGE_ID_KEY = 'otkPinnedMessageId'; // For storing pinned message ID
+    const PINNED_MESSAGE_CLASS = 'otk-pinned-message'; // CSS class for highlighting pinned message
     const MAX_QUOTE_DEPTH = 2; // Maximum depth for rendering nested quotes
     const SEEN_EMBED_URL_IDS_KEY = 'otkSeenEmbedUrlIds'; // For tracking unique text embeds for stats
     const OTK_TRACKED_KEYWORDS_KEY = 'otkTrackedKeywords'; // For user-defined keywords
@@ -137,6 +137,8 @@ document.addEventListener("visibilitychange", () => {
     const FILTER_RULES_V2_KEY = 'otkFilterRulesV2';
 
     // --- Global variables ---
+    let threadTitleAnimationInterval = null;
+    let threadTitleAnimationIndex = 0;
     let originalTitle = document.title;
     let otkViewer = null;
     let cityData = [];
@@ -165,6 +167,7 @@ document.addEventListener("visibilitychange", () => {
     let blurredImages = new Set();
     let blockedThreads = new Set();
     let cachedNewMessages = [];
+    let multiQuoteSelections = new Set();
 
     // IndexedDB instance
     let otkMediaDB = null;
@@ -849,8 +852,8 @@ function createTweetEmbedElement(tweetId) {
             top: 0;
             left: 0;
             width: 100vw;
+            height: 89px; /* 85px for GUI + 4px for border */
             z-index: 9999;
-            border-bottom: 4px solid var(--otk-gui-bottom-border-color);
             background: var(--otk-gui-bg-color);
             box-sizing: border-box;
             box-shadow: 0 2px 5px rgba(0,0,0,0.2);
@@ -863,16 +866,29 @@ function createTweetEmbedElement(tweetId) {
             color: var(--otk-gui-text-color); /* This is now for general GUI text */
             font-family: Verdana, sans-serif;
             font-size: 14px;
-            padding: 5px 25px;
+            padding: 5px 28px;
             box-sizing: border-box;
             display: flex;
             align-items: stretch;
             user-select: none;
             position: relative;
             justify-content: space-between;
+            z-index: 1;
         `;
         otkGuiWrapper.appendChild(otkGui);
-        document.body.style.paddingTop = '86px';
+
+        const borderDiv = document.createElement('div');
+        borderDiv.style.cssText = `
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 4px;
+            background-color: var(--otk-gui-bottom-border-color);
+            z-index: 2;
+        `;
+        otkGuiWrapper.appendChild(borderDiv);
+        document.body.style.paddingTop = '89px';
         document.body.insertBefore(otkGuiWrapper, document.body.firstChild);
 
         // Thread display container (left)
@@ -1040,7 +1056,7 @@ function createTweetEmbedElement(tweetId) {
                 color: var(--otk-gui-text-color); /* This is now for general GUI text */
                 font-family: Verdana, sans-serif;
                 font-size: 14px;
-                padding: 5px 25px;
+                padding: 5px 28px;
                 box-sizing: border-box;
                 display: flex;
                 align-items: stretch;
@@ -1481,6 +1497,99 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
         consoleLog(`Toggled blur for ${filehash}. Now blurred: ${isBlurred}`);
     }
 
+function triggerQuickReply(postId, threadId) {
+    const selections = Array.from(multiQuoteSelections);
+    // The textToQuote logic has been removed to fix the bug.
+    const textToQuote = ''; // Always empty now.
+
+    consoleLog(`[OTK Injector] Creating script to trigger reply for post ID: ${postId}, Thread: ${threadId}, Multi-Quote Selections:`, selections);
+
+    try {
+        const script = document.createElement('script');
+        script.id = 'otk-qr-injector-script';
+        script.textContent = `
+            (function() {
+                try {
+                    const postId = ${postId};
+                    const threadId = ${threadId};
+                    const selections = ${JSON.stringify(selections)};
+                    // textToQuote is no longer passed or used in the injected script.
+                    let quotesToApply = new Set(selections);
+
+                    if (postId !== null) {
+                        quotesToApply.add(postId);
+                    }
+
+                    console.log('[Injected Script] Executing for post: ' + postId + ' in thread ' + threadId);
+                    console.log('[Injected Script] Quotes to apply:', Array.from(quotesToApply));
+
+                    if (window.QR && typeof window.QR.show === 'function') {
+                        window.QR.show(threadId);
+                        console.log('[Injected Script] window.QR.show(' + threadId + ') called.');
+                    } else {
+                        console.error('[Injected Script] window.QR.show is not a function.');
+                        return;
+                    }
+
+                    setTimeout(() => {
+                        console.log('[Injected Script] Timeout executing...');
+                        const qrDiv = document.getElementById('quickReply');
+                        if (qrDiv) {
+                            console.log('[Injected Script] Found #quickReply div.');
+                            qrDiv.style.zIndex = '100001';
+                            console.log('[Injected Script] Set #quickReply z-index to 100001.');
+
+                            const textarea = qrDiv.querySelector('textarea[name="com"]');
+                            if (textarea) {
+                                let finalQuoteText = '';
+
+                                if (quotesToApply.size > 0) {
+                                    // This is now the only logic path for generating quote text.
+                                    const sortedIds = Array.from(quotesToApply).sort((a, b) => a - b);
+                                    finalQuoteText = sortedIds.map(id => '>>' + id).join('\\n') + '\\n';
+                                    console.log('[Injected Script] Generated simple quote text.');
+                                }
+
+                                if (finalQuoteText) {
+                                    console.log('[Injected Script] Generated quote text:', finalQuoteText.replace(/\\n/g, '\\\\n'));
+                                    textarea.value = finalQuoteText + textarea.value;
+                                    console.log('[Injected Script] Manually prepended quotes. New value:', textarea.value);
+                                } else {
+                                    console.log('[Injected Script] No quotes to apply.');
+                                }
+                            } else {
+                                console.error('[Injected Script] Could not find QR textarea.');
+                            }
+                        } else {
+                            console.error('[Injected Script] Could not find #quickReply div after timeout.');
+                        }
+
+                        // Dispatch event to clear selections in the main script
+                        window.dispatchEvent(new CustomEvent('otkMultiQuoteApplied'));
+
+                    }, 100);
+
+                } catch (e) {
+                    console.error('[Injected Script] Error during execution:', e);
+                } finally {
+                    const self = document.getElementById('otk-qr-injector-script');
+                    if (self && self.parentNode) {
+                        self.parentNode.removeChild(self);
+                        console.log('[Injected Script] Self-removed from DOM.');
+                    }
+                }
+            })();
+        `;
+
+        document.body.appendChild(script);
+        consoleLog('[OTK Injector] Injected script into the DOM.');
+
+    } catch (e) {
+        consoleError('[OTK Injector] An unexpected error occurred in triggerQuickReply:', e);
+        alert(`An error occurred while trying to inject the reply script: ${e.message}`);
+    }
+}
+
     // --- Core Logic: Rendering, Fetching, Updating ---
 
     function findMessageById(messageId) {
@@ -1750,317 +1859,245 @@ function applyFiltersToMessageContent(message, rules) {
     return modifiedMessage;
 }
 
-    function renderThreadList() {
-        const threadDisplayContainer = document.getElementById('otk-thread-display-container');
-        if (!threadDisplayContainer) {
-            consoleError('Thread display container not found.');
-            return;
-        }
-
-        threadDisplayContainer.innerHTML = ''; // Clear previous list
-        // consoleLog('renderThreadList: Cleared thread display container.'); // Redundant if list is empty
-
-        if (activeThreads.length === 0) {
-            consoleLog('renderThreadList: No active threads to display.');
-            // Optionally display a message in the GUI like "No active OTK threads."
-            // threadDisplayContainer.textContent = "No active OTK threads.";
-            return;
-        }
-
+function createThreadListItemElement(thread, isForTooltip = false) {
     const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
     const timePosition = themeSettings.otkThreadTimePosition || 'After Title';
 
-        // Prepare display objects, ensuring messages exist for titles/times
-        const threadDisplayObjects = activeThreads.map(threadId => {
-            const messages = messagesByThreadId[threadId] || [];
-            let title = `Thread ${threadId}`; // Default title
-            let firstMessageTime = null;
-            let originalThreadUrl = `https://boards.4chan.org/b/thread/${threadId}`;
+    const threadItemDiv = document.createElement('div');
+    threadItemDiv.style.cssText = `
+        display: flex;
+        align-items: center;
+        padding: 4px;
+        border-radius: 3px;
+        height: 28px; /* Fixed height for animation calculations */
+        box-sizing: border-box;
+    `;
+
+    const colorBox = document.createElement('div');
+    colorBox.style.cssText = `
+        width: 12px;
+        height: 12px;
+        background-color: ${thread.color};
+        border-radius: 2px;
+        margin-right: 6px;
+        flex-shrink: 0;
+        border: var(--otk-gui-thread-box-outline, none);
+    `;
+    threadItemDiv.appendChild(colorBox);
+
+    const textContentDiv = document.createElement('div');
+    textContentDiv.style.display = 'flex';
+    textContentDiv.style.flexDirection = 'column';
+    textContentDiv.style.maxWidth = 'calc(100% - 18px)';
+
+    const titleLink = document.createElement('a');
+    titleLink.href = thread.url;
+    titleLink.target = '_blank';
+    titleLink.textContent = truncateTitleWithWordBoundary(thread.title, 65);
+    titleLink.title = thread.title;
+    titleLink.style.cssText = `
+        color: var(--otk-gui-threadlist-title-color);
+        text-decoration: none;
+        font-weight: bold;
+        font-size: 12px;
+        display: block;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    `;
+
+    const time = new Date(thread.firstMessageTime * 1000);
+    const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    const bracketStyle = themeSettings.otkThreadTimeBracketStyle || '[]';
+    const bracketColor = themeSettings.otkThreadTimeBracketColor || 'var(--otk-gui-threadlist-time-color)';
+    const timestampSpan = document.createElement('span');
+    timestampSpan.style.marginLeft = '5px';
+    if (bracketStyle !== 'none') {
+        const openBracket = document.createElement('span');
+        openBracket.textContent = bracketStyle[0];
+        openBracket.style.color = bracketColor;
+        timestampSpan.appendChild(openBracket);
+    }
+    const timeText = document.createElement('span');
+    timeText.textContent = timeStr;
+    timeText.style.color = 'var(--otk-gui-threadlist-time-color)';
+    timeText.style.fontSize = '12px';
+    timestampSpan.appendChild(timeText);
+    if (bracketStyle !== 'none') {
+        const closeBracket = document.createElement('span');
+        closeBracket.textContent = bracketStyle[1];
+        closeBracket.style.color = bracketColor;
+        timestampSpan.appendChild(closeBracket);
+    }
+
+    const titleTimeContainer = document.createElement('div');
+    titleTimeContainer.style.display = 'flex';
+    titleTimeContainer.style.alignItems = 'baseline';
+
+    const dividerEnabled = themeSettings.otkThreadTimeDividerEnabled || false;
+    const dividerSymbol = themeSettings.otkThreadTimeDividerSymbol || '|';
+    const dividerColor = themeSettings.otkThreadTimeDividerColor || '#ffffff';
+
+    if (timePosition === 'Before Title') titleTimeContainer.appendChild(timestampSpan);
+    if (dividerEnabled) {
+        const dividerSpan = document.createElement('span');
+        dividerSpan.textContent = dividerSymbol;
+        dividerSpan.style.color = dividerColor;
+        dividerSpan.style.fontSize = '10px';
+        dividerSpan.style.padding = '0 5px';
+        titleTimeContainer.appendChild(dividerSpan);
+    }
+    titleTimeContainer.appendChild(titleLink);
+    if (timePosition === 'After Title') titleTimeContainer.appendChild(timestampSpan);
+
+    const crayonIcon = document.createElement('span');
+    crayonIcon.innerHTML = '🖍️';
+    crayonIcon.style.cssText = `font-size: 12px; cursor: pointer; margin-left: 8px; visibility: hidden;`;
+    crayonIcon.title = "Reply to this thread";
+    crayonIcon.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        triggerQuickReply(null, thread.id);
+    });
+
+    const blockIcon = document.createElement('span');
+    blockIcon.innerHTML = '&#x2715;';
+    blockIcon.style.cssText = `font-size: 12px; color: #ff8080; cursor: pointer; margin-left: 5px; visibility: hidden;`;
+    blockIcon.title = "Block this thread";
+    blockIcon.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); blockedThreads.add(thread.id); localStorage.setItem(BLOCKED_THREADS_KEY, JSON.stringify(Array.from(blockedThreads))); activeThreads = activeThreads.filter(id => id !== thread.id); localStorage.setItem(THREADS_KEY, JSON.stringify(activeThreads)); if (confirm(`Thread ${thread.id} blocked. Also remove its messages from the viewer?`)) { delete messagesByThreadId[thread.id]; if (otkViewer && otkViewer.style.display === 'block') renderMessagesInViewer(); } renderThreadList(); updateDisplayedStatistics(false); });
+
+    // Common logic for both tooltip and main list items
+    titleTimeContainer.appendChild(crayonIcon);
+    titleTimeContainer.appendChild(blockIcon);
+    threadItemDiv.addEventListener('mouseenter', () => { crayonIcon.style.visibility = 'visible'; blockIcon.style.visibility = 'visible'; });
+    threadItemDiv.addEventListener('mouseleave', () => { crayonIcon.style.visibility = 'hidden'; blockIcon.style.visibility = 'hidden'; });
+
+    // Specific logic for non-tooltip items
+    if (!isForTooltip) {
+        titleLink.onmouseover = () => { titleLink.style.textDecoration = 'underline'; };
+        titleLink.onmouseout = () => { titleLink.style.textDecoration = 'none'; };
+        titleLink.onclick = (event) => {
+            event.preventDefault();
+            if (otkViewer && otkViewer.style.display === 'none') toggleViewer();
+            else if (otkViewer && otkViewer.style.display !== 'block') { otkViewer.style.display = 'block'; document.body.style.overflow = 'hidden'; renderMessagesInViewer(); }
+            setTimeout(() => {
+                const messagesContainer = document.getElementById('otk-messages-container');
+                if (messagesContainer) {
+                    const opMessageElement = messagesContainer.querySelector(`div[data-message-id="${thread.id}"]`);
+                    if (opMessageElement) opMessageElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            }, 100);
+        };
+    }
+
+    textContentDiv.appendChild(titleTimeContainer);
+    threadItemDiv.appendChild(textContentDiv);
+    return threadItemDiv;
+}
 
 
-            if (messages.length > 0 && messages[0]) {
-                title = messages[0].title ? toTitleCase(decodeEntities(messages[0].title)) : `Thread ${threadId}`;
-                firstMessageTime = messages[0].time;
-            } else {
-                consoleWarn(`Thread ${threadId} has no messages or messages[0] is undefined for title/time. Using default title.`);
-            }
+function renderThreadList() {
+    if (threadTitleAnimationInterval) {
+        clearInterval(threadTitleAnimationInterval);
+        threadTitleAnimationInterval = null;
+    }
+
+    const threadDisplayContainer = document.getElementById('otk-thread-display-container');
+    if (!threadDisplayContainer) return;
+
+    threadDisplayContainer.innerHTML = '';
+    threadDisplayContainer.style.height = '';
+    threadDisplayContainer.style.overflow = 'visible';
+    threadDisplayContainer.style.justifyContent = 'center';
+    threadDisplayContainer.style.padding = '';
+    threadDisplayContainer.style.boxSizing = '';
 
 
-            return {
-                id: threadId,
-                title: title,
-                firstMessageTime: firstMessageTime,
-                color: getThreadColor(threadId),
-                url: originalThreadUrl
-            };
-        }).filter(thread => thread.firstMessageTime !== null); // Only display threads with a valid time
+    if (activeThreads.length === 0) return;
 
-        // Sort by most recent first message time
-        threadDisplayObjects.sort((a, b) => b.firstMessageTime - a.firstMessageTime);
-        consoleLog(`renderThreadList: Prepared ${threadDisplayObjects.length} threads for display:`, threadDisplayObjects.map(t => `${t.id} (${t.title.substring(0,20)}...)`));
+    const threadDisplayObjects = activeThreads.map(threadId => {
+        const messages = messagesByThreadId[threadId] || [];
+        let title = `Thread ${threadId}`;
+        let firstMessageTime = null;
+        if (messages.length > 0 && messages[0]) {
+            title = messages[0].title ? toTitleCase(decodeEntities(messages[0].title)) : `Thread ${threadId}`;
+            firstMessageTime = messages[0].time;
+        }
+        return { id: threadId, title, firstMessageTime, color: getThreadColor(threadId), url: `https://boards.4chan.org/b/thread/${threadId}` };
+    }).filter(thread => thread.firstMessageTime !== null);
 
+    threadDisplayObjects.sort((a, b) => b.firstMessageTime - a.firstMessageTime);
+
+    const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+    const animationSpeed = parseFloat(themeSettings.otkThreadTitleAnimationSpeed || '0');
+
+    if (animationSpeed > 0 && threadDisplayObjects.length > 3) {
+        const itemHeight = 28;
+        threadDisplayContainer.style.height = `${itemHeight * 3}px`;
+        threadDisplayContainer.style.overflow = 'hidden';
+        threadDisplayContainer.style.justifyContent = 'flex-start';
+        threadDisplayContainer.style.boxSizing = 'border-box';
+        threadDisplayContainer.style.padding = '0';
+
+        const scroller = document.createElement('div');
+        scroller.style.transition = 'transform 0.5s ease-in-out';
+        scroller.style.position = 'relative';
+        scroller.style.top = '-4px';
+        threadDisplayContainer.appendChild(scroller);
+
+        const itemsToRender = [...threadDisplayObjects, ...threadDisplayObjects.slice(0, 3)];
+        itemsToRender.forEach(thread => scroller.appendChild(createThreadListItemElement(thread, false)));
+
+        let isResetting = false;
+        threadTitleAnimationIndex = 0;
+        const intervalDuration = 4000 / animationSpeed;
+
+        const startAnimation = () => {
+            if (threadTitleAnimationInterval) clearInterval(threadTitleAnimationInterval);
+            threadTitleAnimationInterval = setInterval(() => {
+                if (isResetting) return;
+
+                threadTitleAnimationIndex++;
+                scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+
+                if (threadTitleAnimationIndex >= threadDisplayObjects.length) {
+                    isResetting = true;
+                    setTimeout(() => {
+                        scroller.style.transition = 'none';
+                        threadTitleAnimationIndex = 0;
+                        scroller.style.transform = 'translateY(0)';
+                        void scroller.offsetWidth; // Force reflow
+                        scroller.style.transition = 'transform 0.5s ease-in-out';
+                        isResetting = false;
+                    }, 500);
+                }
+            }, intervalDuration);
+        };
+
+        const stopAnimation = () => {
+            clearInterval(threadTitleAnimationInterval);
+        };
+
+        threadDisplayContainer.addEventListener('mouseenter', stopAnimation);
+        threadDisplayContainer.addEventListener('mouseleave', startAnimation);
+
+        startAnimation();
+    } else {
         const threadsToDisplayInList = threadDisplayObjects.slice(0, 3);
-
         threadsToDisplayInList.forEach((thread, index) => {
-            const threadItemDiv = document.createElement('div');
-            let marginBottom = index < (threadsToDisplayInList.length -1) ? '0px' : '3px';
-            threadItemDiv.style.cssText = `
-                display: flex;
-                align-items: center;
-                padding: 4px;
-                border-radius: 3px;
-                margin-bottom: ${marginBottom};
-            `;
-
-            const colorBox = document.createElement('div');
-            colorBox.style.cssText = `
-                width: 12px;
-                height: 12px;
-                background-color: ${thread.color};
-                border-radius: 2px;
-                margin-right: 6px;
-                flex-shrink: 0;
-                border: var(--otk-gui-thread-box-outline, none);
-            `;
-            threadItemDiv.appendChild(colorBox);
-
-            const textContentDiv = document.createElement('div');
-            textContentDiv.style.display = 'flex';
-            textContentDiv.style.flexDirection = 'column';
-            textContentDiv.style.maxWidth = 'calc(100% - 18px)'; // Prevent overflow from colorBox
-
-            const titleLink = document.createElement('a');
-            titleLink.href = thread.url;
-            titleLink.target = '_blank';
-            const fullTitle = thread.title;
-            titleLink.textContent = truncateTitleWithWordBoundary(fullTitle, 65); // Max length adjusted
-            titleLink.title = fullTitle;
-            let titleLinkStyle = `
-                color: var(--otk-gui-threadlist-title-color);
-                text-decoration: none;
-                font-weight: bold;
-                font-size: 12px;
-                margin-bottom: 2px;
-                display: block;
-                /* width: 100%; */ /* Removed to allow natural width up to container */
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            `;
-
-            const time = new Date(thread.firstMessageTime * 1000);
-            const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-
-            const bracketStyle = themeSettings.otkThreadTimeBracketStyle || '[]';
-            const bracketColor = themeSettings.otkThreadTimeBracketColor || 'var(--otk-gui-threadlist-time-color)';
-
-            const timestampSpan = document.createElement('span');
-            timestampSpan.style.marginLeft = '5px';
-
-            if (bracketStyle !== 'none') {
-                const openBracket = document.createElement('span');
-                openBracket.textContent = bracketStyle[0];
-                openBracket.style.color = bracketColor;
-                timestampSpan.appendChild(openBracket);
-            }
-
-            const timeText = document.createElement('span');
-            timeText.textContent = timeStr;
-            timeText.style.color = 'var(--otk-gui-threadlist-time-color)';
-            timeText.style.fontSize = '12px'; // Match title font size
-            timestampSpan.appendChild(timeText);
-
-            if (bracketStyle !== 'none') {
-                const closeBracket = document.createElement('span');
-                closeBracket.textContent = bracketStyle[1];
-                closeBracket.style.color = bracketColor;
-                timestampSpan.appendChild(closeBracket);
-            }
-
-            titleLink.style.cssText = titleLinkStyle;
-
-            titleLink.onmouseover = () => { titleLink.style.textDecoration = 'underline'; };
-            titleLink.onmouseout = () => { titleLink.style.textDecoration = 'none'; };
-
-            // Click to open messages in viewer
-            titleLink.onclick = (event) => {
-                event.preventDefault(); // Prevent default link navigation
-                consoleLog(`Thread title clicked: ${thread.id} - ${thread.title}. Ensuring viewer is open and scrolling to message.`);
-
-                if (otkViewer && otkViewer.style.display === 'none') {
-                    // toggleViewer will call renderMessagesInViewer
-                    toggleViewer();
-                } else if (otkViewer) {
-                    // If viewer is already open, ensure content is rendered (might be redundant if toggleViewer always renders)
-                    // and then scroll. If renderMessagesInViewer is heavy, only call if needed.
-                    // For now, let's assume it's okay to call renderMessagesInViewer again to ensure freshness,
-                    // or that toggleViewer's render is sufficient if it was just opened.
-                    // A more optimized way would be to check if content for this thread ID is visible.
-                    if (otkViewer.style.display !== 'block') { // A failsafe if toggleViewer wasn't called
-                        otkViewer.style.display = 'block';
-                        document.body.style.overflow = 'hidden';
-                         renderMessagesInViewer(); // Render if it wasn't made visible by toggleViewer
-                    }
-                }
-
-                // Attempt to scroll to the message after a brief delay to allow rendering
-                setTimeout(() => {
-                    const messagesContainer = document.getElementById('otk-messages-container');
-                    if (messagesContainer) {
-                        // Find the OP message for this thread.
-                        // We need a reliable way to identify an OP. Assuming OP's message ID is the thread ID.
-                        const opMessageElement = messagesContainer.querySelector(`div[data-message-id="${thread.id}"]`);
-                        // A more robust check might be needed if multiple messages could have data-message-id="${thread.id}"
-                        // (e.g. if a post quotes the OP)
-                        // For now, this assumes the first such element is the one we want, or it's unique enough.
-
-                        if (opMessageElement) {
-                            consoleLog(`Scrolling to message element for thread OP ${thread.id}.`);
-                            opMessageElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                            // Highlight briefly? (Optional future enhancement)
-                            // opMessageElement.style.outline = '2px solid red';
-                            // setTimeout(() => { opMessageElement.style.outline = ''; }, 2000);
-                        } else {
-                            consoleWarn(`Could not find message element for thread OP ${thread.id} to scroll to.`);
-                            // If not found, scroll to top as a fallback, or do nothing.
-                            // messagesContainer.scrollTop = 0;
-                        }
-                    }
-                }, 100); // Delay to allow render. May need adjustment.
-            };
-
-            const titleTimeContainer = document.createElement('div');
-            titleTimeContainer.style.display = 'flex';
-            titleTimeContainer.style.alignItems = 'baseline';
-
-            const dividerEnabled = themeSettings.otkThreadTimeDividerEnabled || false;
-            const dividerSymbol = themeSettings.otkThreadTimeDividerSymbol || '|';
-            const dividerColor = themeSettings.otkThreadTimeDividerColor || '#ffffff';
-
-            if (timePosition === 'Before Title') {
-                titleTimeContainer.appendChild(timestampSpan);
-            }
-
-            if (dividerEnabled) {
-                const dividerSpan = document.createElement('span');
-                dividerSpan.textContent = ` ${dividerSymbol} `;
-                dividerSpan.style.color = dividerColor;
-                dividerSpan.style.fontSize = '10px';
-                dividerSpan.style.margin = '0 3px';
-                titleTimeContainer.appendChild(dividerSpan);
-            }
-
-            titleTimeContainer.appendChild(titleLink);
-
-            if (timePosition === 'After Title') {
-                titleTimeContainer.appendChild(timestampSpan);
-            }
-
-            const crayonIcon = document.createElement('span');
-            crayonIcon.innerHTML = '🖍️';
-            crayonIcon.style.cssText = `
-                font-size: 12px;
-                cursor: pointer;
-                margin-left: 8px;
-                visibility: hidden;
-            `;
-            crayonIcon.title = "Reply to this thread";
-            titleTimeContainer.appendChild(crayonIcon);
-
-            crayonIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                e.preventDefault();
-
-                const threadUrl = thread.url;
-                const popup = window.open(threadUrl, '_blank', 'width=460,height=425,resizable,scrollbars');
-
-                if (popup) {
-                    popup.addEventListener('load', () => {
-                        const script = popup.document.createElement('script');
-                        script.textContent = `
-                            const links = Array.from(document.querySelectorAll('a'));
-                            const replyLink = links.find(a => a.textContent.trim() === 'Post a Reply');
-                            if (replyLink) {
-                                replyLink.click();
-                            } else {
-                                console.log("Could not find 'Post a Reply' link.");
-                            }
-                        `;
-                        popup.document.body.appendChild(script);
-                    }, true);
-                } else {
-                    consoleError("Could not open popup window. Please check your browser's popup blocker settings.");
-                }
-            });
-
-            const blockIcon = document.createElement('span');
-            blockIcon.innerHTML = '&#x2715;'; // A simple 'X' icon
-            blockIcon.style.cssText = `
-                font-size: 12px;
-                color: #ff8080;
-                cursor: pointer;
-                margin-left: 5px;
-                visibility: hidden;
-            `;
-            blockIcon.title = "Block this thread";
-            titleTimeContainer.appendChild(blockIcon);
-
-            threadItemDiv.addEventListener('mouseenter', () => {
-                crayonIcon.style.visibility = 'visible';
-                blockIcon.style.visibility = 'visible';
-            });
-            threadItemDiv.addEventListener('mouseleave', () => {
-                crayonIcon.style.visibility = 'hidden';
-                blockIcon.style.visibility = 'hidden';
-            });
-
-            blockIcon.addEventListener('click', (e) => {
-                e.stopPropagation();
-                e.preventDefault();
-
-                blockedThreads.add(thread.id);
-                localStorage.setItem(BLOCKED_THREADS_KEY, JSON.stringify(Array.from(blockedThreads)));
-
-                activeThreads = activeThreads.filter(id => id !== thread.id);
-                localStorage.setItem(THREADS_KEY, JSON.stringify(activeThreads));
-
-                if (confirm(`Thread ${thread.id} blocked. Also remove its messages from the viewer?`)) {
-                    delete messagesByThreadId[thread.id];
-                    // Re-render viewer if it's open
-                    if (otkViewer && otkViewer.style.display === 'block') {
-                        renderMessagesInViewer();
-                    }
-                }
-
-                renderThreadList();
-        updateDisplayedStatistics(false);
-            });
-
-            textContentDiv.appendChild(titleTimeContainer);
-            threadItemDiv.appendChild(textContentDiv);
+            const threadItemDiv = createThreadListItemElement(thread, false);
+            threadItemDiv.style.marginBottom = index < (threadsToDisplayInList.length - 1) ? '0px' : '3px';
             threadDisplayContainer.appendChild(threadItemDiv);
         });
-
 
         if (threadDisplayObjects.length > 3) {
             const numberOfAdditionalThreads = threadDisplayObjects.length - 3;
             const hoverContainer = document.createElement('div');
-            hoverContainer.style.cssText = `
-                display: inline-block;
-                position: relative;
-            `;
+            hoverContainer.style.cssText = `display: inline-block; position: relative;`;
             const moreIndicator = document.createElement('div');
             moreIndicator.id = 'otk-more-threads-indicator';
             moreIndicator.textContent = `(+${numberOfAdditionalThreads})`;
-            moreIndicator.style.cssText = `
-                font-size: 12px;
-                color: #ccc;
-                font-style: italic;
-                cursor: pointer;
-                padding: 3px 6px;
-                margin-left: 8px;
-                display: inline;
-            `;
+            moreIndicator.style.cssText = `font-size: 12px; color: #ccc; font-style: italic; cursor: pointer; padding: 3px 6px; margin-left: 8px; display: inline;`;
             hoverContainer.appendChild(moreIndicator);
 
             if (threadsToDisplayInList.length > 0) {
@@ -2069,12 +2106,11 @@ function applyFiltersToMessageContent(message, rules) {
                 if (textContentDiv && textContentDiv.firstChild) {
                     const titleTimeContainer = textContentDiv.firstChild;
                     const titleLink = titleTimeContainer.querySelector('a');
+                    const timePosition = themeSettings.otkThreadTimePosition || 'After Title';
 
                     if (timePosition === 'Before Title') {
-                        // When time is before the title, append after the title link.
                         titleLink.parentNode.insertBefore(hoverContainer, titleLink.nextSibling);
                     } else {
-                        // When time is after the title, append to the end of the container.
                         titleTimeContainer.appendChild(hoverContainer);
                     }
                 }
@@ -2084,179 +2120,37 @@ function applyFiltersToMessageContent(message, rules) {
                 threadDisplayContainer.appendChild(hoverContainer);
             }
 
-
             let tooltip = null;
             let tooltipTimeout;
-
             hoverContainer.addEventListener('mouseenter', () => {
-                consoleLog('hoverContainer mouseenter: showing tooltip');
-                moreIndicator.style.textDecoration = 'underline';
-                if (tooltip) {
-                    consoleLog('Removing existing tooltip before creating new one');
-                    tooltip.remove();
-                }
-
+                clearTimeout(tooltipTimeout);
+                if (tooltip) tooltip.remove();
                 tooltip = document.createElement('div');
                 tooltip.id = 'otk-more-threads-tooltip';
-                tooltip.style.cssText = `
-                    position: absolute;
-                    background-color: #343434; /* New background */
-                    border: 1px solid #555;    /* New border */
-                    border-radius: 4px;
-                    padding: 8px;
-                    z-index: 100001; /* Higher than GUI bar */
-                    color: #e6e6e6; /* New font color */
-                    font-size: 12px;
-                    max-width: 340px; /* Accommodate new icons */
-                    box-shadow: 0 3px 8px rgba(0,0,0,0.6);
-                    pointer-events: auto;
-                    display: block;
-                    opacity: 1;
-                    /* border: 1px solid red; */ /* For debugging visibility */
-                `;
-
+                tooltip.style.cssText = `position: absolute; background-color: #343434; border: 1px solid #555; border-radius: 4px; padding: 8px; z-index: 100001;`;
                 const additionalThreads = threadDisplayObjects.slice(3);
                 additionalThreads.forEach(thread => {
-                    const tooltipItemDiv = document.createElement('div');
-                    tooltipItemDiv.style.cssText = `
-                        display: flex;
-                        align-items: center;
-                        justify-content: space-between;
-                        padding: 2px 0;
-                    `;
-
-                    const tooltipLink = document.createElement('a');
-                    tooltipLink.href = thread.url;
-                    tooltipLink.target = '_blank';
-                    tooltipLink.textContent = truncateTitleWithWordBoundary(thread.title, 65);
-                    tooltipLink.title = thread.title;
-                    tooltipLink.style.cssText = `
-                        display: inline-block;
-                        color: #cccccc;
-                        text-decoration: none;
-                        white-space: nowrap;
-                        overflow: hidden;
-                        text-overflow: ellipsis;
-                        flex-grow: 1;
-                    `;
-                    tooltipLink.onmouseover = () => { tooltipLink.style.color = '#e6e6e6'; tooltipLink.style.textDecoration = 'underline';};
-                    tooltipLink.onmouseout = () => { tooltipLink.style.color = '#cccccc'; tooltipLink.style.textDecoration = 'none';};
-
-                    tooltipItemDiv.appendChild(tooltipLink);
-
-                    const iconsWrapper = document.createElement('div');
-                    iconsWrapper.style.cssText = 'display: flex; align-items: center;';
-
-                    const crayonIcon = document.createElement('span');
-                    crayonIcon.innerHTML = '🖍️';
-                    crayonIcon.style.cssText = `font-size: 12px; cursor: pointer; margin-left: 8px; visibility: hidden;`;
-                    crayonIcon.title = "Reply to this thread";
-
-                    crayonIcon.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        e.preventDefault();
-                        const threadUrl = thread.url;
-                        const popup = window.open(threadUrl, '_blank', 'width=460,height=425,resizable,scrollbars');
-                        if (popup) {
-                            popup.addEventListener('load', () => {
-                                const script = popup.document.createElement('script');
-                                script.textContent = `const links = Array.from(document.querySelectorAll('a')); const replyLink = links.find(a => a.textContent.trim() === 'Post a Reply'); if (replyLink) { replyLink.click(); }`;
-                                popup.document.body.appendChild(script);
-                            }, true);
-                        }
-                    });
-
-                    const blockIcon = document.createElement('span');
-                    blockIcon.innerHTML = '&#x2715;';
-                    blockIcon.style.cssText = `font-size: 12px; color: #ff8080; cursor: pointer; margin-left: 5px; visibility: hidden;`;
-                    blockIcon.title = "Block this thread";
-
-                    blockIcon.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        e.preventDefault();
-                        blockedThreads.add(thread.id);
-                        localStorage.setItem(BLOCKED_THREADS_KEY, JSON.stringify(Array.from(blockedThreads)));
-                        activeThreads = activeThreads.filter(id => id !== thread.id);
-                        localStorage.setItem(THREADS_KEY, JSON.stringify(activeThreads));
-                        if (confirm(`Thread ${thread.id} blocked. Also remove its messages from the viewer?`)) {
-                            delete messagesByThreadId[thread.id];
-                            if (otkViewer && otkViewer.style.display === 'block') {
-                                renderMessagesInViewer();
-                            }
-                        }
-                        renderThreadList();
-                        updateDisplayedStatistics(false);
-                    });
-
-                    iconsWrapper.appendChild(crayonIcon);
-                    iconsWrapper.appendChild(blockIcon);
-                    tooltipItemDiv.appendChild(iconsWrapper);
-
-                    tooltipItemDiv.addEventListener('mouseenter', () => {
-                        crayonIcon.style.visibility = 'visible';
-                        blockIcon.style.visibility = 'visible';
-                    });
-                    tooltipItemDiv.addEventListener('mouseleave', () => {
-                        crayonIcon.style.visibility = 'hidden';
-                        blockIcon.style.visibility = 'hidden';
-                    });
-
-                    tooltip.appendChild(tooltipItemDiv);
+                    tooltip.appendChild(createThreadListItemElement(thread, true));
                 });
-
                 document.body.appendChild(tooltip);
-                consoleLog('Tooltip appended to body');
-
                 const indicatorRect = moreIndicator.getBoundingClientRect();
-                const tooltipRect = tooltip.getBoundingClientRect();
-
-                let leftPos = indicatorRect.left;
-                let topPos = indicatorRect.bottom + window.scrollY + 3; // Slightly more offset
-
-                if (leftPos + tooltipRect.width > window.innerWidth - 10) { // 10px buffer
-                    leftPos = window.innerWidth - tooltipRect.width - 10;
-                }
-                if (topPos + tooltipRect.height > window.innerHeight + window.scrollY - 10) {
-                    consoleLog('Adjusting tooltip position to above indicator due to bottom overflow');
-                    topPos = indicatorRect.top + window.scrollY - tooltipRect.height - 3;
-                }
-                 if (leftPos < 10) leftPos = 10; // Prevent going off left edge
-
-
-                tooltip.style.left = `${leftPos}px`;
-                tooltip.style.top = `${topPos}px`;
-                consoleLog('Tooltip final position:', {left: leftPos, top: topPos});
-
-                tooltip.addEventListener('mouseenter', () => {
-                    consoleLog('Tooltip mouseenter: clearing hide timeout');
-                    if (tooltipTimeout) clearTimeout(tooltipTimeout);
-                });
-
+                tooltip.style.left = `${indicatorRect.left}px`;
+                tooltip.style.top = `${indicatorRect.bottom + window.scrollY + 3}px`;
+                tooltip.addEventListener('mouseenter', () => clearTimeout(tooltipTimeout));
                 tooltip.addEventListener('mouseleave', () => {
-                     consoleLog('Tooltip mouseleave: setting hide timeout');
                     tooltipTimeout = setTimeout(() => {
-                        if (tooltip && !tooltip.matches(':hover') && !moreIndicator.matches(':hover')) {
-                            consoleLog('Hiding tooltip after timeout (left tooltip)');
-                            tooltip.remove();
-                            tooltip = null;
-                        }
+                        if (tooltip && !tooltip.matches(':hover')) tooltip.remove();
                     }, 300);
                 });
             });
-
             hoverContainer.addEventListener('mouseleave', () => {
-                consoleLog('hoverContainer mouseleave: setting hide timeout');
-                moreIndicator.style.textDecoration = 'none';
                 tooltipTimeout = setTimeout(() => {
-                    if (tooltip && !tooltip.matches(':hover') && !moreIndicator.matches(':hover')) {
-                        consoleLog('Hiding tooltip after timeout (left hoverContainer)');
-                        tooltip.remove();
-                        tooltip = null;
-                    }
+                    if (tooltip && !tooltip.matches(':hover')) tooltip.remove();
                 }, 300);
             });
         }
     }
+}
 
     // Helper function to format timestamp for message headers
     function formatTimestampForHeader(unixTime) {
@@ -2384,7 +2278,7 @@ function applyFiltersToMessageContent(message, rules) {
             right: 0;
             bottom: 0;
             overflow-y: auto; /* This container scrolls */
-            padding: 10px 25px; /* 10px top/bottom, 25px left/right for content and scrollbar */
+            padding: 10px 23px; /* 10px top/bottom, 23px left/right for content and scrollbar */
             box-sizing: border-box;
             /* width and height are now controlled by absolute positioning */
         `;
@@ -2458,41 +2352,41 @@ consoleLog(`[StatsDebug] Unique image hashes for viewer: ${uniqueImageViewerHash
     consoleLog(`[StatsDebug] Viewer counts updated: Images=${viewerActiveImageCount}, Videos (top-level attached + top-level embed)=${viewerActiveVideoCount}`);
 updateDisplayedStatistics(false); // Update stats after all media processing is attempted.
 
-            let anchorScrolled = false;
-            const storedAnchoredInstanceId = localStorage.getItem(ANCHORED_MESSAGE_ID_KEY);
-            consoleLog("storedAnchoredInstanceId from localStorage:", storedAnchoredInstanceId);
+            let pinScrolled = false;
+            const storedPinnedInstanceId = localStorage.getItem(PINNED_MESSAGE_ID_KEY);
+            consoleLog("storedPinnedInstanceId from localStorage:", storedPinnedInstanceId);
 
             setTimeout(() => {
-                if (storedAnchoredInstanceId) {
-                    const anchoredElement = document.getElementById(storedAnchoredInstanceId);
-                    consoleLog("anchoredElement from getElementById:", anchoredElement);
+                if (storedPinnedInstanceId) {
+                    const pinnedElement = document.getElementById(storedPinnedInstanceId);
+                    consoleLog("pinnedElement from getElementById:", pinnedElement);
 
-                    if (anchoredElement && messagesContainer.contains(anchoredElement)) {
+                    if (pinnedElement && messagesContainer.contains(pinnedElement)) {
                         try {
-                            anchoredElement.scrollIntoView({ behavior: 'auto', block: 'center' });
-                            anchorScrolled = true;
-                            consoleLog(`Scrolled to anchored message instance: ${storedAnchoredInstanceId}`);
-                            if (!anchoredElement.classList.contains(ANCHORED_MESSAGE_CLASS)) {
-                                anchoredElement.classList.add(ANCHORED_MESSAGE_CLASS);
+                            pinnedElement.scrollIntoView({ behavior: 'auto', block: 'center' });
+                            pinScrolled = true;
+                            consoleLog(`Scrolled to pinned message instance: ${storedPinnedInstanceId}`);
+                            if (!pinnedElement.classList.contains(PINNED_MESSAGE_CLASS)) {
+                                pinnedElement.classList.add(PINNED_MESSAGE_CLASS);
                             }
                         } catch (e) {
-                            consoleError("Error scrolling to anchored message:", e);
+                            consoleError("Error scrolling to pinned message:", e);
                         }
                     } else {
-                        consoleWarn(`Anchored message instance ${storedAnchoredInstanceId} not found. Clearing anchor.`);
-                        localStorage.removeItem(ANCHORED_MESSAGE_ID_KEY);
+                        consoleWarn(`Pinned message instance ${storedPinnedInstanceId} not found. Clearing pin.`);
+                        localStorage.removeItem(PINNED_MESSAGE_ID_KEY);
                     }
                 }
             }, 500);
 
-            if (!anchorScrolled) {
+            if (!pinScrolled) {
                 if (isToggleOpen && lastViewerScrollTop > 0) {
                     messagesContainer.scrollTop = lastViewerScrollTop;
                     consoleLog(`Restored scroll position to: ${lastViewerScrollTop}`);
-                } else if (!storedAnchoredInstanceId) {
+                } else if (!storedPinnedInstanceId) {
                     setTimeout(() => {
                         messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                        consoleLog(`No anchored message, scrolling to bottom.`);
+                        consoleLog(`No pinned message, scrolling to bottom.`);
                     }, 550);
                 }
             }
@@ -2644,6 +2538,117 @@ updateDisplayedStatistics(false); // Update stats after all media processing is 
     }
 
 
+// Helper function to create a single media control icon
+let activeMediaMenu = null;
+
+function _createMediaPopupMenu(options) {
+    const { event, isImage, downloadHandler, resizeHandler, blurHandler, blockHandler } = options;
+
+    if (activeMediaMenu) {
+        activeMediaMenu.remove();
+        activeMediaMenu = null;
+    }
+
+    const menu = document.createElement('div');
+    menu.style.cssText = `
+        position: fixed;
+        z-index: 10005;
+        background-color: #333;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 5px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    `;
+
+    const createMenuItem = (text, handler) => {
+        const item = document.createElement('div');
+        item.textContent = text;
+        item.style.cssText = `
+            padding: 5px 10px;
+            color: #eee;
+            cursor: pointer;
+            border-radius: 3px;
+        `;
+        item.addEventListener('mouseenter', () => item.style.backgroundColor = '#555');
+        item.addEventListener('mouseleave', () => item.style.backgroundColor = '');
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            handler();
+            closeActiveMediaMenu();
+        });
+        return item;
+    };
+
+    menu.appendChild(createMenuItem('Download', downloadHandler));
+    menu.appendChild(createMenuItem('Toggle Full Size', resizeHandler));
+    if (isImage) {
+        menu.appendChild(createMenuItem('Toggle Blur', blurHandler));
+    }
+    menu.appendChild(createMenuItem('Block', blockHandler));
+
+    document.body.appendChild(menu);
+    menu.style.left = `${event.clientX}px`;
+    menu.style.top = `${event.clientY}px`;
+
+    activeMediaMenu = menu;
+}
+
+function closeActiveMediaMenu() {
+    if (activeMediaMenu) {
+        activeMediaMenu.remove();
+        activeMediaMenu = null;
+    }
+}
+
+document.addEventListener('click', (e) => {
+    if (activeMediaMenu && !activeMediaMenu.contains(e.target)) {
+        closeActiveMediaMenu();
+    }
+});
+
+function _createMediaControlIcon(title, svgPath, onClick) {
+    const icon = document.createElement('div');
+    icon.className = 'media-control-icon';
+    icon.title = title;
+    icon.style.cssText = `
+        width: 24px;
+        height: 24px;
+        background-color: var(--otk-blur-icon-bg-color); /* Using blur as a template, can be customized */
+        border-radius: 4px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10;
+    `;
+
+    const iconForeground = document.createElement('div');
+    iconForeground.style.cssText = `
+        width: 16px;
+        height: 16px;
+        background-color: var(--otk-blur-icon-color); /* Using blur as a template */
+        -webkit-mask-image: url('${svgPath}');
+        mask-image: url('${svgPath}');
+        -webkit-mask-size: contain;
+        mask-size: contain;
+        -webkit-mask-repeat: no-repeat;
+        mask-repeat: no-repeat;
+        -webkit-mask-position: center;
+        mask-position: center;
+    `;
+    icon.appendChild(iconForeground);
+
+    icon.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        onClick(e);
+    });
+
+    return icon;
+}
+
 // Helper function to populate attachmentDiv with media (images/videos)
 function _populateAttachmentDivWithMedia(
     attachmentDiv, // The div to append media to
@@ -2651,14 +2656,14 @@ function _populateAttachmentDivWithMedia(
     actualBoardForLink, // Board string for URLs
     mediaLoadPromises,  // Array for async operations
     uniqueImageViewerHashes, // Set for tracking unique images shown
-    isTopLevelForStyling,     // Boolean, for some media logic (e.g., video stats)
+    isTopLevelMessage,     // Boolean, for some media logic (e.g., video stats)
     layoutStyle,           // 'new_design' or 'default', to condition New Design specific logic
     renderedFullSizeImageHashes, // Set for tracking full-size images
     viewerTopLevelAttachedVideoHashes, // Set for video stats
-    otkMediaDB // IndexedDB instance
+    otkMediaDB, // IndexedDB instance
+    effectiveDepthForStyling,
+    filenameContainer
 ) {
-    let resizeIcon;
-
     const loadImageFromCache = (imgElement, isThumb) => {
         const storeId = isThumb ? message.attachment.localThumbStoreId : message.attachment.localStoreId;
         if (storeId && otkMediaDB) {
@@ -2688,377 +2693,223 @@ function _populateAttachmentDivWithMedia(
     }
     const extLower = message.attachment.ext.toLowerCase();
     const filehash = message.attachment.filehash_db_key || `${message.attachment.tim}${extLower}`;
+    const isImage = ['.jpg', '.jpeg', '.png', '.gif'].includes(extLower);
+    const isVideo = extLower.endsWith('webm') || extLower.endsWith('mp4');
 
-    if (['.jpg', '.jpeg', '.png', '.gif'].includes(extLower)) {
-        // --- IMAGE LOGIC ---
-        const fullsizeWidth = message.attachment.w;
-        const fullsizeHeight = message.attachment.h;
+    if (isImage || isVideo) {
+        const attachmentContainer = document.createElement('div');
+        attachmentContainer.style.display = 'inline-block';
 
-        let defaultToThumbnail;
+        const mediaWrapper = document.createElement('div');
+        mediaWrapper.classList.add(isImage ? 'image-wrapper' : 'video-wrapper');
+        mediaWrapper.style.position = 'relative';
+        mediaWrapper.style.display = 'inline-block';
+        mediaWrapper.style.userSelect = 'none';
 
-        // Determine the viewer's max-height constraint
-        const maxHeight = (layoutStyle === 'new_design' || isTopLevelForStyling) ? 400 : 350;
+        let mediaElement;
+        let setImageProperties;
 
-        // --- SOLUTION START ---
-        // New logic: Show full-size if image is small, panoramic, OR has a tiny thumbnail.
-        const tnW = message.attachment.tn_w;
-        const aspectRatio = fullsizeWidth / fullsizeHeight;
-        if ((fullsizeWidth <= 800 && fullsizeHeight <= 600) || aspectRatio > 3 || tnW < 75) {
-            defaultToThumbnail = false; // Show the larger version
-        } else {
-            defaultToThumbnail = true; // Show the thumbnail for other large images
-        }
-        // --- SOLUTION END ---
+        if (isImage) {
+            const img = document.createElement('img');
+            img.dataset.filehash = filehash;
+            img.dataset.thumbWidth = message.attachment.tn_w;
+            img.dataset.thumbHeight = message.attachment.tn_h;
+            img.style.cursor = 'pointer';
+            img.style.display = 'block';
+            img.style.borderRadius = '3px';
+            img.style.transform = 'translateZ(0)';
+            img.style.backfaceVisibility = 'hidden';
+            img.style.userSelect = 'none';
+            mediaElement = img;
 
-        const img = document.createElement('img');
-        img.dataset.filehash = filehash;
-        img.dataset.thumbWidth = message.attachment.tn_w;
-        img.dataset.thumbHeight = message.attachment.tn_h;
-        img.style.cursor = 'pointer';
-        img.style.display = 'block';
-        img.style.borderRadius = '3px';
-        img.style.transform = 'translateZ(0)';
-        img.style.backfaceVisibility = 'hidden';
-        img.style.userSelect = 'none';
+            const fullsizeWidth = message.attachment.w;
+            const fullsizeHeight = message.attachment.h;
+            const tnW = message.attachment.tn_w;
+            const aspectRatio = fullsizeWidth / fullsizeHeight;
+            const defaultToThumbnail = !((fullsizeWidth <= 800 && fullsizeHeight <= 600) || aspectRatio > 3 || tnW < 75);
+            
+            setImageProperties = (mode) => {
+                img.dataset.mode = mode;
+                let isThumb = (mode === 'thumb');
+                const hasCache = isThumb ? message.attachment.localThumbStoreId : message.attachment.localStoreId;
 
-        const hasLocalFull = message.attachment.localStoreId;
-        const hasLocalThumb = message.attachment.localThumbStoreId;
+                if (isThumb) {
+                    img.style.width = message.attachment.tn_w + 'px';
+                    img.style.height = message.attachment.tn_h + 'px';
+                    img.style.maxWidth = '';
+                    img.style.maxHeight = '';
+                } else if (mode === 'full') {
+                    img.style.maxWidth = '85%';
+                    img.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelMessage) ? '400px' : '350px';
+                    img.style.width = 'auto';
+                    img.style.height = 'auto';
+                } else {
+                    img.style.maxWidth = '100%';
+                    img.style.maxHeight = 'none';
+                    img.style.width = 'auto';
+                    img.style.height = 'auto';
+                }
 
-        const setImageProperties = (mode) => {
-            img.dataset.mode = mode;
-            let isThumb = (mode === 'thumb');
-            const hasCache = isThumb ? hasLocalThumb : hasLocalFull;
+                if (mediaLoadMode === 'cache_only') {
+                    if (hasCache) loadImageFromCache(img, isThumb);
+                    else img.src = '';
+                } else {
+                    img.src = isThumb
+                        ? `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}s.jpg`
+                        : `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
+                }
+            };
 
-            // Set image dimensions
-            if (isThumb) {
-                img.style.width = message.attachment.tn_w + 'px';
-                img.style.height = message.attachment.tn_h + 'px';
-                img.style.maxWidth = '';
-                img.style.maxHeight = '';
-            } else if (mode === 'full') {
-                img.style.maxWidth = '85%';
-                img.style.maxHeight = (layoutStyle === 'new_design' || isTopLevelForStyling) ? '400px' : '350px';
-                img.style.width = 'auto';
-                img.style.height = 'auto';
-            } else { // 'original'
-                img.style.maxWidth = '100%';
-                img.style.maxHeight = 'none';
-                img.style.width = 'auto';
-                img.style.height = 'auto';
+            mediaLoadPromises.push(new Promise(resolve => {
+                img.onload = () => { img.style.display = 'block'; resolve(); };
+                img.onerror = () => { loadImageFromCache(img, img.dataset.mode === 'thumb'); resolve(); };
+            }));
+
+            setImageProperties(defaultToThumbnail ? 'thumb' : 'full');
+            uniqueImageViewerHashes.add(filehash);
+
+            img.addEventListener('click', () => {
+                const currentMode = img.dataset.mode;
+                if (currentMode === 'thumb') setImageProperties('full');
+                else setImageProperties('thumb');
+            });
+            img.addEventListener('setImageProperties', (e) => {
+                setImageProperties(e.detail.mode);
+            });
+
+            if (blurredImages.has(filehash)) {
+                const blurAmount = (localStorage.getItem(IMAGE_BLUR_AMOUNT_KEY) || 60) / 5;
+                img.style.filter = `blur(${blurAmount}px)`;
             }
+        } else { // isVideo
+            const video = document.createElement('video');
+            video.controls = true;
+            video.style.maxWidth = '85%';
+            const defaultMaxHeight = isTopLevelMessage ? '400px' : '300px';
+            video.style.maxHeight = defaultMaxHeight;
+            video.dataset.defaultMaxHeight = defaultMaxHeight;
+            video.style.borderRadius = '3px';
+            video.style.display = 'block';
+            mediaElement = video;
 
-            // Set image source based on mode and cache availability
+            const loadFromCache = () => {
+                if (message.attachment.localStoreId && otkMediaDB) {
+                    const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+                    const store = transaction.objectStore('mediaStore');
+                    const request = store.get(message.attachment.localStoreId);
+                    request.onsuccess = (event) => {
+                        const storedItem = event.target.result;
+                        if (storedItem && storedItem.blob) {
+                            const dataURL = URL.createObjectURL(storedItem.blob);
+                            createdBlobUrls.add(dataURL);
+                            video.src = dataURL;
+                        }
+                    };
+                }
+            };
+
+            video.onerror = () => loadFromCache();
+
             if (mediaLoadMode === 'cache_only') {
-                if (hasCache) {
-                    loadImageFromCache(img, isThumb);
-                } else {
-                    consoleWarn(`Image ${message.attachment.filename} (${mode}) not in cache, and mode is cache-only. Not loading from web.`);
-                    // Optionally set a placeholder 'broken image' src
-                    img.src = ''; // Or a placeholder image data URL
-                }
-            } else { // 'source_first' mode
-                const webImageUrl = isThumb
-                    ? `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}s.jpg`
-                    : `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
-                img.src = webImageUrl;
-                // The onerror handler will attempt to load from cache if the web request fails.
+                if (message.attachment.localStoreId) loadFromCache();
+            } else {
+                video.src = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`;
             }
+
+            if (message.attachment.filehash_db_key && isTopLevelMessage) {
+                viewerTopLevelAttachedVideoHashes.add(message.attachment.filehash_db_key);
+            }
+        }
+
+        mediaWrapper.appendChild(mediaElement);
+        attachmentContainer.appendChild(mediaWrapper); // Append media wrapper to the new container
+        attachmentDiv.appendChild(attachmentContainer);
+
+        const vSpan = document.createElement('span');
+        vSpan.textContent = '☰';
+        vSpan.style.cssText = "cursor: pointer; color: var(--otk-media-menu-icon-color, #ff8040); font-weight: bold;";
+        
+        const downloadHandler = () => {
+            const url = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: url,
+                responseType: 'blob',
+                onload: function(response) {
+                    const blob = response.response;
+                    const objectUrl = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = objectUrl;
+                    link.download = message.attachment.filename;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    URL.revokeObjectURL(objectUrl);
+                },
+                onerror: function(error) {
+                    consoleError("Error downloading file:", error);
+                    alert("Failed to download file. See console for details.");
+                }
+            });
         };
 
-        mediaLoadPromises.push(new Promise(resolve => {
-            img.onload = () => {
-                img.style.display = 'block';
-                resolve();
-            };
-            img.onerror = () => {
-                loadImageFromCache(img, img.dataset.mode === 'thumb');
-                resolve();
-            };
-        }));
-
-        setImageProperties(defaultToThumbnail ? 'thumb' : 'full');
-        uniqueImageViewerHashes.add(filehash);
-
-        img.addEventListener('click', () => {
-            const tnW = parseInt(img.dataset.thumbWidth, 10) || 0;
-            const tnH = parseInt(img.dataset.thumbHeight, 10) || 0;
-            const isTinyThumbnail = tnW < 30 || tnH < 30;
-            const currentMode = img.dataset.mode;
-
-            if (isTinyThumbnail) {
-                if (currentMode === 'full') {
+        const resizeHandler = () => {
+            if (isImage) {
+                const img = mediaElement;
+                const currentMode = img.dataset.mode;
+                const tnW = parseInt(img.dataset.thumbWidth, 10) || 0;
+                const defaultToThumbnail = !((message.attachment.w <= 800 && message.attachment.h <= 600) || (message.attachment.w / message.attachment.h > 3) || tnW < 75);
+                if (currentMode === 'original') {
+                    const previousMode = img.dataset.previousMode || (defaultToThumbnail ? 'thumb' : 'full');
+                    setImageProperties(previousMode);
+                } else {
+                    img.dataset.previousMode = currentMode;
                     setImageProperties('original');
-                } else {
-                    setImageProperties('full');
                 }
-            } else {
-                if (currentMode === 'thumb') {
-                    setImageProperties('full');
+            } else if (isVideo) {
+                if (mediaElement.style.maxHeight === 'none') {
+                    mediaElement.style.maxHeight = mediaElement.dataset.defaultMaxHeight;
                 } else {
-                    setImageProperties('thumb');
+                    mediaElement.style.maxHeight = 'none';
                 }
-            }
-        });
-
-        const imageWrapper = document.createElement('div');
-        imageWrapper.classList.add('image-wrapper');
-        imageWrapper.style.position = 'relative';
-        imageWrapper.style.display = 'inline-block';
-        imageWrapper.style.userSelect = 'none';
-
-        const blurIcon = document.createElement('div');
-        blurIcon.classList.add('blur-icon');
-        blurIcon.style.cssText = `
-            position: absolute;
-            top: 5px;
-            left: 5px;
-            width: 24px;
-            height: 24px;
-            background-color: var(--otk-blur-icon-bg-color);
-            border-radius: 4px;
-            cursor: pointer;
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 10;
-        `;
-        blurIcon.title = 'Toggle blur for this image';
-
-        const blurIconForeground = document.createElement('div');
-        blurIconForeground.style.cssText = `
-            width: 16px;
-            height: 16px;
-            background-color: var(--otk-blur-icon-color);
-            -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px"><path d="m644-428-58-59q9-47-27-88t-93-32l-58-58q17-8 34.5-12t37.5-4q75 0 127.5 52.5T660-500q0 20-4 37.5T644-428Zm128 126-58-56q38-29 67.5-63.5T832-500q-50-101-143.5-160.5T480-720q-29 0-57 4t-55 12l-62-62q41-17 84-25.5t90-8.5q151 0 269 83.5T920-500q-23 59-60.5 109.5T772-302Zm20 246L624-222q-35 11-70.5 16.5T480-200q-151 0-269-83.5T40-500q21-53 53-98.5t73-81.5L56-792l56-56 736 736-56 56ZM222-624q-29 26-53 57t-41 67q50 101 143.5 160.5T480-280q20 0 39-2.5t39-5.5l-36-38q-11 3-21 4.5t-21 1.5q-75 0-127.5-52.5T300-500q0-11 1.5-21t4.5-21l-84-82Zm319 93Zm-151 75Z"/></svg>');
-            mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px"><path d="m644-428-58-59q9-47-27-88t-93-32l-58-58q17-8 34.5-12t37.5-4q75 0 127.5 52.5T660-500q0 20-4 37.5T644-428Zm128 126-58-56q38-29 67.5-63.5T832-500q-50-101-143.5-160.5T480-720q-29 0-57 4t-55 12l-62-62q41-17 84-25.5t90-8.5q151 0 269 83.5T920-500q-23 59-60.5 109.5T772-302Zm20 246L624-222q-35 11-70.5 16.5T480-200q-151 0-269-83.5T40-500q21-53 53-98.5t73-81.5L56-792l56-56 736 736-56 56ZM222-624q-29 26-53 57t-41 67q50 101 143.5 160.5T480-280q20 0 39-2.5t39-5.5l-36-38q-11 3-21 4.5t-21 1.5q-75 0-127.5-52.5T300-500q0-11 1.5-21t4.5-21l-84-82Zm319 93Zm-151 75Z"/></svg>');
-            -webkit-mask-size: contain;
-            mask-size: contain;
-            -webkit-mask-repeat: no-repeat;
-            mask-repeat: no-repeat;
-            -webkit-mask-position: center;
-            mask-position: center;
-        `;
-        blurIcon.appendChild(blurIconForeground);
-
-        blurIcon.addEventListener('click', (e) => {
-            e.stopPropagation();
-            e.preventDefault();
-            toggleImageBlur(filehash);
-        });
-
-        resizeIcon = document.createElement('div');
-        resizeIcon.classList.add('resize-icon');
-        resizeIcon.style.cssText = `
-            position: absolute;
-            top: 5px;
-            width: 24px;
-            height: 24px;
-            background-color: var(--otk-resize-icon-bg-color);
-            border-radius: 4px;
-            cursor: pointer;
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 10;
-        `;
-        resizeIcon.title = 'Toggle full size';
-
-        const resizeIconForeground = document.createElement('div');
-        resizeIconForeground.style.cssText = `
-            width: 16px;
-            height: 16px;
-            background-color: var(--otk-resize-icon-color);
-            -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 4 20 4 20 8"></polyline><line x1="20" y1="4" x2="14" y2="10"></line><polyline points="8 20 4 20 4 16"></polyline><line x1="4" y1="20" x2="10" y2="14"></line></svg>');
-            mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 4 20 4 20 8"></polyline><line x1="20" y1="4" x2="14" y2="10"></line><polyline points="8 20 4 20 4 16"></polyline><line x1="4" y1="20" x2="10" y2="14"></line></svg>');
-            -webkit-mask-size: contain;
-            mask-size: contain;
-            -webkit-mask-repeat: no-repeat;
-            mask-repeat: no-repeat;
-            -webkit-mask-position: center;
-            mask-position: center;
-        `;
-        resizeIcon.appendChild(resizeIconForeground);
-
-        resizeIcon.addEventListener('click', (e) => {
-            e.stopPropagation();
-            e.preventDefault();
-            const currentMode = img.dataset.mode;
-            if (currentMode === 'original') {
-                const previousMode = img.dataset.previousMode || (defaultToThumbnail ? 'thumb' : 'full');
-                setImageProperties(previousMode);
-            } else {
-                img.dataset.previousMode = currentMode;
-                setImageProperties('original');
-            }
-        });
-
-        imageWrapper.addEventListener('mouseenter', () => {
-            blurIcon.style.display = 'flex';
-            resizeIcon.style.display = 'flex';
-        });
-        imageWrapper.addEventListener('mouseleave', () => {
-            blurIcon.style.display = 'none';
-            resizeIcon.style.display = 'none';
-        });
-
-        const blurAmount = (localStorage.getItem(IMAGE_BLUR_AMOUNT_KEY) || 60) / 5;
-        if (blurredImages.has(filehash)) {
-            img.style.filter = `blur(${blurAmount}px)`;
-        }
-
-        imageWrapper.appendChild(img);
-        imageWrapper.appendChild(blurIcon);
-        imageWrapper.appendChild(resizeIcon);
-        attachmentDiv.appendChild(imageWrapper);
-
-        const observer = new MutationObserver(updateIconPositions);
-
-        function updateIconPositions() {
-            observer.disconnect();
-            if (!resizeIcon || !img.isConnected) return;
-            const iconWidth = 24;
-            const offset = 5;
-            const imageWidth = img.offsetWidth;
-            if (imageWidth > 0) {
-                resizeIcon.style.top = offset + 'px';
-                resizeIcon.style.left = (imageWidth - iconWidth - offset) + 'px';
-                resizeIcon.style.right = 'auto';
-            }
-            observer.observe(img, { attributes: true, attributeFilter: ['style', 'src'] });
-        }
-
-        observer.observe(img, { attributes: true, attributeFilter: ['style', 'src'] });
-        img.addEventListener('load', updateIconPositions);
-
-    } else if (extLower.endsWith('webm') || extLower.endsWith('mp4')) {
-        const videoWrapper = document.createElement('div');
-        videoWrapper.classList.add('video-wrapper');
-        videoWrapper.style.position = 'relative';
-        videoWrapper.style.display = 'inline-block';
-        videoWrapper.style.userSelect = 'none';
-
-        const videoElement = document.createElement('video');
-        videoElement.controls = true;
-        videoElement.style.maxWidth = '85%';
-        const defaultMaxHeight = isTopLevelForStyling ? '400px' : '300px';
-        videoElement.style.maxHeight = defaultMaxHeight;
-        videoElement.dataset.defaultMaxHeight = defaultMaxHeight;
-        videoElement.style.borderRadius = '3px';
-        videoElement.style.display = 'block';
-
-        const loadFromCache = () => {
-            if (message.attachment.localStoreId && otkMediaDB) {
-                const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
-                const store = transaction.objectStore('mediaStore');
-                const request = store.get(message.attachment.localStoreId);
-                request.onsuccess = (event) => {
-                    const storedItem = event.target.result;
-                    if (storedItem && storedItem.blob) {
-                        const dataURL = URL.createObjectURL(storedItem.blob);
-                        createdBlobUrls.add(dataURL);
-                        videoElement.src = dataURL;
-                    } else {
-                        consoleWarn(`Video ${message.attachment.filename} not found in cache despite having a localStoreId.`);
-                    }
-                };
-                request.onerror = (event) => {
-                    consoleError("Error reading video from cache:", event.target.error);
-                };
-            } else {
-                 consoleWarn(`Video ${message.attachment.filename} has no localStoreId for cache lookup.`);
             }
         };
 
-        videoElement.onerror = () => {
-            consoleWarn(`Failed to load video from web source. Falling back to cache for ${message.attachment.filename}.`);
-            loadFromCache();
+        const blurHandler = () => {
+            if (isImage) {
+                toggleImageBlur(filehash);
+            }
         };
 
-        if (mediaLoadMode === 'cache_only') {
-            if (message.attachment.localStoreId) {
-                loadFromCache();
-            } else {
-                consoleWarn(`Video ${message.attachment.filename} not in cache, and mode is cache-only. Not loading from web.`);
-                // Optional: You could set a placeholder 'broken video' src here
+        const blockHandler = () => {
+            const newRule = {
+                id: Date.now(),
+                action: 'filterOut',
+                enabled: true,
+                category: 'attachedMedia',
+                matchContent: `md5:${filehash}`,
+                replaceContent: ''
+            };
+            const filterWindow = document.getElementById('otk-filter-window');
+            if (filterWindow) {
+                filterWindow.style.display = 'flex';
+                renderFilterEditorView(newRule);
             }
-        } else { // 'source_first' mode
-            const webVideoSrc = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`;
-            videoElement.src = webVideoSrc;
-        }
+        };
 
-        const resizeIcon = document.createElement('div');
-        resizeIcon.classList.add('resize-icon');
-        resizeIcon.style.cssText = `
-            position: absolute;
-            top: 5px;
-            width: 24px;
-            height: 24px;
-            background-color: var(--otk-resize-icon-bg-color);
-            border-radius: 4px;
-            cursor: pointer;
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 10;
-        `;
-        resizeIcon.title = 'Toggle full size';
-        const resizeIconForeground = document.createElement('div');
-        resizeIconForeground.style.cssText = `
-            width: 16px;
-            height: 16px;
-            background-color: var(--otk-resize-icon-color);
-            -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 4 20 4 20 8"></polyline><line x1="20" y1="4" x2="14" y2="10"></line><polyline points="8 20 4 20 4 16"></polyline><line x1="4" y1="20" x2="10" y2="14"></line></svg>');
-            mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 4 20 4 20 8"></polyline><line x1="20" y1="4" x2="14" y2="10"></line><polyline points="8 20 4 20 4 16"></polyline><line x1="4" y1="20" x2="10" y2="14"></line></svg>');
-            -webkit-mask-size: contain;
-            mask-size: contain;
-            -webkit-mask-repeat: no-repeat;
-            mask-repeat: no-repeat;
-            -webkit-mask-position: center;
-            mask-position: center;
-        `;
-        resizeIcon.appendChild(resizeIconForeground);
-
-        resizeIcon.addEventListener('click', (e) => {
+        vSpan.addEventListener('click', (e) => {
             e.stopPropagation();
-            e.preventDefault();
-            if (videoElement.style.maxHeight === 'none') {
-                videoElement.style.maxHeight = videoElement.dataset.defaultMaxHeight;
-            } else {
-                videoElement.style.maxHeight = 'none';
-            }
+            _createMediaPopupMenu({
+                event: e,
+                isImage: isImage,
+                downloadHandler,
+                resizeHandler,
+                blurHandler,
+                blockHandler
+            });
         });
 
-        videoWrapper.addEventListener('mouseenter', () => {
-            resizeIcon.style.display = 'flex';
-        });
-        videoWrapper.addEventListener('mouseleave', () => {
-            resizeIcon.style.display = 'none';
-        });
-
-        videoWrapper.appendChild(videoElement);
-        videoWrapper.appendChild(resizeIcon);
-        attachmentDiv.appendChild(videoWrapper);
-
-        const observer = new MutationObserver(updateVideoIconPosition);
-        function updateVideoIconPosition() {
-            observer.disconnect();
-            if (!resizeIcon || !videoElement.isConnected) return;
-            const iconWidth = 24;
-            const offset = 5;
-            const videoWidth = videoElement.offsetWidth;
-            if (videoWidth > 0) {
-                resizeIcon.style.top = offset + 'px';
-                resizeIcon.style.left = (videoWidth - iconWidth - offset) + 'px';
-                resizeIcon.style.right = 'auto';
-            }
-            observer.observe(videoElement, { attributes: true, attributeFilter: ['style', 'src'] });
-        }
-        observer.observe(videoElement, { attributes: true, attributeFilter: ['style', 'src'] });
-        videoElement.addEventListener('loadeddata', updateVideoIconPosition);
-
-        if (message.attachment.filehash_db_key && isTopLevelForStyling) {
-            viewerTopLevelAttachedVideoHashes.add(message.attachment.filehash_db_key);
-        }
+        filenameContainer.prepend(vSpan);
     }
 }
 
@@ -3098,19 +2949,11 @@ function wrapInCollapsibleContainer(elementsToWrap) {
     return container;
 }
 
-function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelForStyling, currentDepth, threadColor, parentMessageId, ancestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline) {
+function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, ancestors, allThemeSettings, shouldDisableUnderline, effectiveDepthForStyling) {
     const textElement = document.createElement('div');
     textElement.style.whiteSpace = 'pre-wrap';
     textElement.style.overflowWrap = 'break-word';
     textElement.style.wordBreak = 'normal';
-
-    if (isTopLevelForStyling) {
-        textElement.style.fontSize = 'var(--otk-msg-depth0-content-font-size)';
-    } else if (currentDepth === 1) {
-        textElement.style.fontSize = 'var(--otk-msg-depth1-content-font-size)';
-    } else {
-        textElement.style.fontSize = 'var(--otk-msg-depth2plus-content-font-size)';
-    }
 
     if (shouldDisableUnderline) {
         textElement.style.marginTop = '0px';
@@ -3274,7 +3117,8 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
                         const matchedText = earliestMatch[0];
                         if (earliestMatchIsQuoteLink) {
                             if (currentDepth >= MAX_QUOTE_DEPTH) {
-                                textElement.appendChild(document.createTextNode(matchedText));
+                                const newText = matchedText.replace(/>>(\d+)/, '↪ $1');
+                                textElement.appendChild(document.createTextNode(newText));
                             } else {
                                 const quotedMessageId = earliestMatch[1];
                                 let quotedMessageObject = null;
@@ -3288,13 +3132,13 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
                                     }
                                 }
                                 if (quotedMessageObject) {
-                                    const quotedElement = createMessageElementDOM(quotedMessageObject, mediaLoadPromises, uniqueImageViewerHashes, quotedMessageObject.board || boardForLink, false, currentDepth + 1, null, message.id, ancestors);
+                                    const quotedElement = createMessageElementDOM(quotedMessageObject, mediaLoadPromises, uniqueImageViewerHashes, quotedMessageObject.board || boardForLink, false, currentDepth + 1, null, message.id, ancestors, effectiveDepthForStyling + 1);
                                     if (quotedElement) {
                                         textElement.appendChild(quotedElement);
                                     }
                                 } else {
                                     const notFoundSpan = document.createElement('span');
-                                    notFoundSpan.textContent = `>>${quotedMessageId} (Not Found)`;
+                                    notFoundSpan.textContent = `↪ ${quotedMessageId} (Not Found)`;
                                     notFoundSpan.style.color = '#88ccee';
                                     notFoundSpan.style.textDecoration = 'underline';
                                     textElement.appendChild(notFoundSpan);
@@ -3355,26 +3199,145 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
         attachmentDiv = document.createElement('div');
         attachmentDiv.style.marginTop = '10px';
 
-        if (shouldDisplayFilenames) {
-            const filenameLink = document.createElement('a');
-            filenameLink.textContent = `${message.attachment.filename} (${message.attachment.ext.substring(1)})`;
-            filenameLink.href = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
-            filenameLink.target = "_blank";
-            filenameLink.style.cssText = "color: #60a5fa; display: block; margin-bottom: 5px; text-decoration: underline;";
-            attachmentDiv.appendChild(filenameLink);
-        }
+        const filenameContainer = document.createElement('div');
+        filenameContainer.style.cssText = "display: flex; align-items: center; gap: 5px; margin-top: 5px;";
 
         _populateAttachmentDivWithMedia(
             attachmentDiv, message, actualBoardForLink, mediaLoadPromises,
-            uniqueImageViewerHashes, isTopLevelForStyling, 'default',
-            renderedFullSizeImageHashes, viewerTopLevelAttachedVideoHashes, otkMediaDB
+            uniqueImageViewerHashes, isTopLevelMessage, 'default',
+            renderedFullSizeImageHashes, viewerTopLevelAttachedVideoHashes, otkMediaDB,
+            effectiveDepthForStyling,
+            filenameContainer
         );
+
+        const filenameLink = document.createElement('a');
+        filenameLink.textContent = `${message.attachment.filename} (${message.attachment.ext.substring(1)})`;
+        filenameLink.href = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
+        filenameLink.target = "_blank";
+        filenameLink.style.cssText = "color: #60a5fa;";
+        filenameContainer.appendChild(filenameLink);
+
+        attachmentDiv.appendChild(filenameContainer);
     }
 
     return [textElement, attachmentDiv];
 }
     // Signature now includes parentMessageId and ancestors
+function _createMessageHeaderIcons(message, messageDiv, isFiltered, headerContainer) {
+    const multiQuoteWrapper = document.createElement('div');
+    multiQuoteWrapper.className = 'otk-multiquote-checkbox-wrapper';
+    const multiQuoteCheckbox = document.createElement('input');
+    multiQuoteCheckbox.type = 'checkbox';
+    multiQuoteCheckbox.className = 'otk-multiquote-checkbox';
+    multiQuoteCheckbox.dataset.messageId = message.id;
+    multiQuoteCheckbox.checked = multiQuoteSelections.has(message.id);
+    if (multiQuoteCheckbox.checked) {
+        multiQuoteWrapper.classList.add('selected');
+    }
+
+    multiQuoteCheckbox.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (e.target.checked) {
+            multiQuoteSelections.add(message.id);
+            multiQuoteWrapper.classList.add('selected');
+        } else {
+            multiQuoteSelections.delete(message.id);
+            multiQuoteWrapper.classList.remove('selected');
+        }
+        consoleLog('Multi-quote selections:', multiQuoteSelections);
+    });
+
+    multiQuoteWrapper.appendChild(multiQuoteCheckbox);
+    headerContainer.appendChild(multiQuoteWrapper);
+
+    headerContainer.addEventListener('mouseenter', () => {
+        if (!multiQuoteWrapper.classList.contains('selected')) {
+            multiQuoteWrapper.classList.add('visible');
+        }
+    });
+    headerContainer.addEventListener('mouseleave', () => {
+        if (!multiQuoteWrapper.classList.contains('selected')) {
+            multiQuoteWrapper.classList.remove('visible');
+        }
+    });
+
+    const pinIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    pinIcon.setAttribute('class', 'otk-pin-icon');
+    pinIcon.setAttribute('title', 'Pin this message');
+    pinIcon.setAttribute('viewBox', '0 0 16 16');
+    const pinPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    pinPath.setAttribute('d', 'M4.146.146A.5.5 0 0 1 4.5 0h7a.5.5 0 0 1 .5.5c0 .68-.342 1.174-.646 1.479-.126.125-.25.224-.354.298v4.431l.078.048c.203.127.476.314.751.555C12.36 7.775 13 8.527 13 9.5a.5.5 0 0 1-.5.5h-4v4.5c0 .276-.224 1.5-.5 1.5s-.5-1.224-.5-1.5V10h-4a.5.5 0 0 1-.5-.5c0-.973.64-1.725 1.17-2.189A6 6 0 0 1 5 6.708V2.277a3 3 0 0 1-.354-.298C4.342 1.674 4 1.179 4 .5a.5.5 0 0 1 .146-.354m1.58 1.408-.002-.001zm-.002-.001.002.001A.5.5 0 0 1 6 2v5a.5.5 0 0 1-.276.447h-.002l-.012.007-.054.03a5 5 0 0 0-.827.58c-.318.278-.585.596-.725.936h7.792c-.14-.34-.407-.658-.725-.936a5 5 0 0 0-.881-.61l-.012-.006h-.002A.5.5 0 0 1 10 7V2a.5.5 0 0 1 .295-.458 1.8 1.8 0 0 0 .351-.271c.08-.08.155-.17.214-.271H5.14q.091.15.214.271a1.8 1.8 0 0 0 .37.282');
+    pinPath.setAttribute('fill', 'currentColor');
+    pinIcon.appendChild(pinPath);
+    headerContainer.appendChild(pinIcon);
+
+    const blockIcon = document.createElement('span');
+    blockIcon.classList.add('block-icon');
+    blockIcon.innerHTML = '&#128711;';
+    blockIcon.style.cssText = 'margin-left: 8px; cursor: pointer; font-size: 16px;';
+
+    if (isFiltered) {
+        blockIcon.style.color = 'red';
+        blockIcon.title = 'This message is blocked by your filters.';
+    } else {
+        blockIcon.style.visibility = 'hidden';
+        blockIcon.title = 'Create filter for this message';
+        headerContainer.addEventListener('mouseenter', () => {
+            blockIcon.style.visibility = 'visible';
+            if (pinIcon) pinIcon.style.visibility = 'visible';
+        });
+        headerContainer.addEventListener('mouseleave', () => {
+            blockIcon.style.visibility = 'hidden';
+            if (pinIcon && !messageDiv.classList.contains(PINNED_MESSAGE_CLASS)) {
+                pinIcon.style.visibility = 'hidden';
+            }
+        });
+    }
+    headerContainer.appendChild(blockIcon);
+
+    blockIcon.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const hasText = message.text && message.text.replace(/>>\d+(\s\(You\))?/g, '').trim().length > 0;
+        const hasAttachment = message.attachment && message.attachment.filehash_db_key;
+        const newRule = {
+            id: Date.now(),
+            action: 'filterOut',
+            enabled: true,
+            category: 'keyword',
+            matchContent: '',
+            replaceContent: ''
+        };
+        if (hasText && hasAttachment) {
+            newRule.category = 'entireMessage';
+            try {
+                newRule.matchContent = JSON.stringify({
+                    text: message.text.replace(/>>\d+(\s\(You\))?/g, '').trim(),
+                    media: `md5:${message.attachment.filehash_db_key}`
+                }, null, 2);
+            } catch (err) {
+                consoleError("Failed to stringify composite filter", err);
+                newRule.category = 'attachedMedia';
+                newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
+            }
+        } else if (hasText) {
+            newRule.category = 'keyword';
+            newRule.matchContent = message.text.replace(/>>\d+(\s\(You\))?/g, '').trim();
+        } else if (hasAttachment) {
+            newRule.category = 'attachedMedia';
+            newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
+        }
+        const filterWindow = document.getElementById('otk-filter-window');
+        if (filterWindow) {
+            filterWindow.style.display = 'flex';
+            renderFilterEditorView(newRule);
+        }
+    });
+
+    return pinIcon;
+}
+
 function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId = null, ancestors = new Set(), visualDepth = null) {
+        let pinIcon;
         const filterRules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
 
         const shouldBeFilteredOut = isMessageFiltered(message, filterRules);
@@ -3416,41 +3379,22 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
         }
 
     let effectiveDepthForStyling = currentDepth;
-    let isTopLevelForStyling = isTopLevelMessage;
-
     if (visualDepth !== null) {
         effectiveDepthForStyling = visualDepth;
-        isTopLevelForStyling = (visualDepth === 0);
     }
+    const isEvenDepth = effectiveDepthForStyling % 2 === 0;
 
-        let depthKeyPart;
-    if (isTopLevelForStyling) { // Depth 0
-            depthKeyPart = '0';
-    } else if (effectiveDepthForStyling === 1) { // Depth 1
-            depthKeyPart = '1';
-        } else { // Depth 2+
-            depthKeyPart = '2plus';
-        }
+    const parity = isEvenDepth ? 'Odd' : 'Even';
+    const contentFontSizeVar = `var(--otk-msg-depth-${parity.toLowerCase()}-content-font-size)`;
+    const backgroundColorVar = `var(--otk-msg-depth-${parity.toLowerCase()}-bg-color)`;
+    const textColorVar = `var(--otk-msg-depth-${parity.toLowerCase()}-text-color)`;
+    const headerTextColorVar = `var(--otk-msg-depth-${parity.toLowerCase()}-header-text-color)`;
+    const headerBorderVar = `var(--otk-viewer-header-border-color-${parity.toLowerCase()})`;
 
-        const disableUnderlineKey = `otkMsgDepth${depthKeyPart}DisableHeaderUnderline`;
-        const displayFilenamesKey = `otkMsgDepth${depthKeyPart}DisplayMediaFilename`;
+    const shouldDisableUnderline = !isTopLevelMessage;
 
-        // Default for disableUnderline is false (meaning, underline is ON by default)
-        let shouldDisableUnderline;
-        if (allThemeSettings.hasOwnProperty(disableUnderlineKey)) {
-            shouldDisableUnderline = allThemeSettings[disableUnderlineKey];
-        } else {
-            // New default logic: Hide for depth 1 and 2+
-            shouldDisableUnderline = (depthKeyPart === '1' || depthKeyPart === '2plus');
-        }
-
-        // Default for displayFilenames is true (meaning, filenames are SHOWN by default)
-        let shouldDisplayFilenames;
-        if (allThemeSettings.hasOwnProperty(displayFilenamesKey)) {
-            shouldDisplayFilenames = allThemeSettings[displayFilenamesKey];
-        } else {
-            shouldDisplayFilenames = false; // New default: OFF for all depths
-        }
+        const showFilenameKey = isEvenDepth ? 'showOddMessageFilename' : 'showEvenMessageFilename';
+        const shouldDisplayFilenames = allThemeSettings[showFilenameKey] === true; // Defaults to false if not set
 
         // --- Define all media patterns once at the top of the function ---
         const youtubePatterns = [
@@ -3506,36 +3450,25 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
             if (isTopLevelMessage) {
                 messageDiv.classList.add('otk-message-container-main');
             }
+            messageDiv.classList.add(isEvenDepth ? 'otk-message-depth-odd' : 'otk-message-depth-even');
 
-            let backgroundColor;
             let marginLeft = '0';
             let paddingLeft = '10px'; // Default to 10px
             let marginTop = '15px'; // Default top margin
             let marginBottom = '15px'; // Default bottom margin
-            const messageTextColor = '#e6e6e6'; // This will be replaced by depth-specific text color vars
-            // let positionStyle = ''; // REMOVED - No longer needed for relative positioning
 
-            let backgroundColorVar;
-            if (isTopLevelForStyling) { // Depth 0
-                backgroundColorVar = 'var(--otk-msg-depth0-bg-color)';
-                // marginLeft, marginTop, marginBottom remain defaults for top-level
-            } else { // Quoted message (Depth 1+)
-                marginLeft = '0px'; // No specific indent margin for quote itself
-                marginTop = '10px';    // Specific top margin for quoted messages
-                marginBottom = '0px';  // Specific bottom margin for quoted messages
-                if (effectiveDepthForStyling === 1) {
-                    backgroundColorVar = 'var(--otk-msg-depth1-bg-color)';
-                } else { // Covers currentDepth === 2 and potential deeper fallbacks
-                    backgroundColorVar = 'var(--otk-msg-depth2plus-bg-color)';
-                }
+            if (!isTopLevelMessage) { // Quoted messages
+                marginLeft = '0px';
+                marginTop = '10px';
+                marginBottom = '0px';
             }
 
     messageDiv.style.cssText = `
         box-sizing: border-box;
         display: block;
         background-color: ${backgroundColorVar};
-        color: ${ isTopLevelForStyling ? 'var(--otk-msg-depth0-text-color)' : (effectiveDepthForStyling === 1 ? 'var(--otk-msg-depth1-text-color)' : 'var(--otk-msg-depth2plus-text-color)') };
-        /* position: relative; REMOVED - No longer needed */
+        color: ${textColorVar};
+        font-size: ${contentFontSizeVar};
 
         margin-top: ${marginTop};
         margin-bottom: ${marginBottom};
@@ -3543,9 +3476,8 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
         padding-top: 10px;
         padding-bottom: 10px;
         padding-left: ${paddingLeft};
-        padding-right: 10px; /* Standardized to 10px */
+        padding-right: 10px;
 
-        /* border-left: ; REMOVED - Replaced by new rectangle element */
         border-radius: 5px;
         box-shadow: 0 1px 3px rgba(0,0,0,0.1);
 
@@ -3559,31 +3491,14 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
 
             const messageHeader = document.createElement('div');
 
-            // Determine headerBorderColor using CSS variables
-            let headerBorderVar;
-            if (isTopLevelMessage) { // Depth 0
-                headerBorderVar = 'var(--otk-viewer-header-border-color)';
-            } else if (currentDepth === 1) { // Depth 1 quote
-                headerBorderVar = 'var(--otk-viewer-quote1-header-border-color)';
-            } else { // Depth 2+ quotes
-                headerBorderVar = 'var(--otk-viewer-quote2plus-header-border-color)';
-            }
-
-            let headerBorderBottomStyle = `1px solid ${headerBorderVar}`;
-            let headerPaddingBottomStyle = '5px';
-            // let headerDisplayStlye = 'flex'; // Default display style for the header - will be set directly
-
-            // if (shouldDisableUnderline) { // This logic will be handled after initial style.cssText set
-            // }
-
             messageHeader.style.cssText = `
                 font-size: 12px;
-                color: ${ isTopLevelForStyling ? 'var(--otk-msg-depth0-header-text-color)' : (effectiveDepthForStyling === 1 ? 'var(--otk-msg-depth1-header-text-color)' : 'var(--otk-msg-depth2plus-header-text-color)') };
+                color: ${headerTextColorVar};
                 font-weight: bold;
-                margin-bottom: 8px; /* Default margin */
-                padding-bottom: ${headerPaddingBottomStyle}; /* Default padding for underline */
-                border-bottom: 1px solid ${headerBorderVar}; /* Default border for underline */
-                display: flex; /* Default display */
+                margin-bottom: 8px;
+                padding-bottom: 5px;
+                border-bottom: 1px solid ${headerBorderVar};
+                display: flex;
                 align-items: center;
                 width: 100%;
             `;
@@ -3592,7 +3507,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
             if (shouldDisableUnderline) {
                 messageHeader.style.borderBottom = 'none';
                 messageHeader.style.paddingBottom = '0px';
-                messageHeader.style.marginBottom = '8px'; // Keep consistent margin even when underline is hidden
+                messageHeader.style.marginBottom = '4px'; // Reduced margin for quoted messages
                 messageHeader.style.lineHeight = '1.1';   // Standardized
                 messageHeader.style.minHeight = '0';      // Standardized
             }
@@ -3630,22 +3545,8 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                 }
                 idSpan.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    const threadUrl = `https://boards.4chan.org/b/thread/${message.originalThreadId}`;
-                    const popup = window.open(threadUrl, '_blank', 'width=460,height=425,resizable,scrollbars');
-                    if (popup) {
-                        popup.addEventListener('load', () => {
-                            const script = popup.document.createElement('script');
-                            script.textContent = `
-                                const messageId = "${message.id}";
-                                const selector = \`#pi\${messageId} > span.postNum.desktop > a:nth-child(2)\`;
-                                const link = document.querySelector(selector);
-                                if (link) {
-                                    link.click();
-                                }
-                            `;
-                            popup.document.body.appendChild(script);
-                        }, true);
-                    }
+                    e.preventDefault();
+                    triggerQuickReply(message.id, message.originalThreadId);
                 });
 
                 const timeTextSpan = document.createElement('span');
@@ -3654,70 +3555,9 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                     timeTextSpan.style.textDecoration = 'line-through';
                 }
                 leftHeaderContent.appendChild(idSpan);
-
                 leftHeaderContent.appendChild(timeTextSpan);
 
-                const blockIcon = document.createElement('span');
-                blockIcon.innerHTML = '&#128711;'; // Block icon
-                blockIcon.style.cssText = 'margin-left: 10px; cursor: pointer;';
-
-                if (isFiltered) {
-                    blockIcon.style.color = 'red';
-                    blockIcon.title = 'This message is blocked by your filters.';
-                } else {
-                    blockIcon.style.visibility = 'hidden';
-                    blockIcon.title = 'Create filter for this message';
-                leftHeaderContent.addEventListener('mouseenter', () => {
-                        blockIcon.style.visibility = 'visible';
-                    });
-                leftHeaderContent.addEventListener('mouseleave', () => {
-                        blockIcon.style.visibility = 'hidden';
-                    });
-                }
-                leftHeaderContent.appendChild(blockIcon);
-
-                blockIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-
-                    const hasText = message.text && message.text.replace(/>>\d+(\s\(You\))?/g, '').trim().length > 0;
-                    const hasAttachment = message.attachment && message.attachment.filehash_db_key;
-
-                    const newRule = {
-                        id: Date.now(),
-                        action: 'filterOut',
-                        enabled: true,
-                        category: 'keyword', // default
-                        matchContent: '',
-                        replaceContent: ''
-                    };
-
-                    if (hasText && hasAttachment) {
-                        newRule.category = 'entireMessage';
-                        try {
-                            newRule.matchContent = JSON.stringify({
-                                text: message.text.replace(/>>\d+(\s\(You\))?/g, '').trim(),
-                                media: `md5:${message.attachment.filehash_db_key}`
-                            }, null, 2);
-                        } catch (err) {
-                            consoleError("Failed to stringify composite filter", err);
-                            // Fallback to simpler filter if stringify fails
-                            newRule.category = 'attachedMedia';
-                            newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
-                        }
-                    } else if (hasText) {
-                        newRule.category = 'keyword';
-                        newRule.matchContent = message.text.replace(/>>\d+(\s\(You\))?/g, '').trim();
-                    } else if (hasAttachment) {
-                        newRule.category = 'attachedMedia';
-                        newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
-                    }
-
-                    const filterWindow = document.getElementById('otk-filter-window');
-                    if (filterWindow) {
-                        filterWindow.style.display = 'flex';
-                        renderFilterEditorView(newRule);
-                    }
-                });
+                pinIcon = _createMessageHeaderIcons(message, messageDiv, isFiltered, leftHeaderContent);
 
                 const dateSpan = document.createElement('span');
                 dateSpan.textContent = timestampParts.date;
@@ -3734,12 +3574,20 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                     plusIcon.classList.add('otk-plus-icon');
                     plusIcon.id = `otk-plus-icon-${message.id}`;
                     plusIcon.textContent = '+';
-                    plusIcon.style.color = threadColor;
+                    plusIcon.style.color = '#000000';
                     plusIcon.title = 'Load next reply in truncated chain';
                     plusIcon.style.fontWeight = 'bold';
                     plusIcon.style.fontSize = '18px';
+                    plusIcon.style.lineHeight = '24px';
                     plusIcon.style.marginRight = '8px';
                     plusIcon.style.cursor = 'pointer';
+                    plusIcon.style.width = '24px';
+                    plusIcon.style.height = '24px';
+                    plusIcon.style.display = 'flex';
+                    plusIcon.style.alignItems = 'center';
+                    plusIcon.style.justifyContent = 'center';
+                    plusIcon.style.borderRadius = '4px';
+                    plusIcon.style.backgroundColor = 'var(--otk-plus-icon-bg-color)';
 
                     plusIcon.addEventListener('click', async (e) => {
                         e.stopPropagation();
@@ -3828,159 +3676,61 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                 headerContentWrapper.style.alignItems = 'center';
 
                 const idSpan = document.createElement('span');
-                idSpan.textContent = ` >>${message.id}`; // Changed prefix for quoted messages
+                idSpan.textContent = `#${message.id}`;
                 idSpan.style.cursor = 'pointer';
                 if (isFiltered) {
                     idSpan.style.textDecoration = 'line-through';
                 }
                 idSpan.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    const threadUrl = `https://boards.4chan.org/b/thread/${message.originalThreadId}`;
-                    const popup = window.open(threadUrl, '_blank', 'width=460,height=425,resizable,scrollbars,popup=true');
-                    if (popup) {
-                        popup.addEventListener('load', () => {
-                            const script = popup.document.createElement('script');
-                            script.textContent = `
-                                const messageId = "${message.id}";
-                                const selector = \`#pi\${messageId} > span.postNum.desktop > a:nth-child(2)\`;
-                                const link = document.querySelector(selector);
-                                if (link) {
-                                    link.click();
-                                }
-                            `;
-                            popup.document.body.appendChild(script);
-                        }, true);
-                    }
+                    e.preventDefault();
+                    triggerQuickReply(message.id, message.originalThreadId);
                 });
                 headerContentWrapper.appendChild(idSpan);
 
-                const blockIcon = document.createElement('span');
-                blockIcon.innerHTML = '&#128711;'; // Block icon
-                blockIcon.style.cssText = 'margin-left: 10px; cursor: pointer;';
-
-                if (isFiltered) {
-                    blockIcon.style.color = 'red';
-                    blockIcon.title = 'This message is blocked by your filters.';
-                } else {
-                    blockIcon.style.visibility = 'hidden';
-                    blockIcon.title = 'Create filter for this message';
-                    headerContentWrapper.addEventListener('mouseenter', () => {
-                        blockIcon.style.visibility = 'visible';
-                    });
-                    headerContentWrapper.addEventListener('mouseleave', () => {
-                        blockIcon.style.visibility = 'hidden';
-                    });
-                }
-                headerContentWrapper.appendChild(blockIcon);
+                pinIcon = _createMessageHeaderIcons(message, messageDiv, isFiltered, headerContentWrapper);
                 messageHeader.appendChild(headerContentWrapper);
-
-                blockIcon.addEventListener('click', (e) => {
-                    e.stopPropagation();
-
-                    const hasText = message.text && message.text.replace(/>>\d+(\s\(You\))?/g, '').trim().length > 0;
-                    const hasAttachment = message.attachment && message.attachment.filehash_db_key;
-
-                    const newRule = {
-                        id: Date.now(),
-                        action: 'filterOut',
-                        enabled: true,
-                        category: 'keyword', // default
-                        matchContent: '',
-                        replaceContent: ''
-                    };
-
-                    if (hasText && hasAttachment) {
-                        newRule.category = 'entireMessage';
-                         try {
-                            newRule.matchContent = JSON.stringify({
-                                text: message.text.replace(/>>\d+(\s\(You\))?/g, '').trim(),
-                                media: `md5:${message.attachment.filehash_db_key}`
-                            }, null, 2);
-                        } catch (err) {
-                            consoleError("Failed to stringify composite filter", err);
-                            // Fallback to simpler filter if stringify fails
-                            newRule.category = 'attachedMedia';
-                            newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
-                        }
-                    } else if (hasText) {
-                        newRule.category = 'keyword';
-                        newRule.matchContent = message.text.replace(/>>\d+(\s\(You\))?/g, '').trim();
-                    } else if (hasAttachment) {
-                        newRule.category = 'attachedMedia';
-                        newRule.matchContent = `md5:${message.attachment.filehash_db_key}`;
-                    }
-
-                    const filterWindow = document.getElementById('otk-filter-window');
-                    if (filterWindow) {
-                        filterWindow.style.display = 'flex';
-                        renderFilterEditorView(newRule);
-                    }
-                });
             }
             messageDiv.appendChild(messageHeader);
-            const [textElement, attachmentDiv] = _populateMessageBody(processedMessage, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelForStyling, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
+            const [textElement, attachmentDiv] = _populateMessageBody(processedMessage, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisableUnderline, effectiveDepthForStyling);
 
             // Click listener for anchoring
             const persistentInstanceId = `otk-msg-${parentMessageId || 'toplevel'}-${message.id}`;
             messageDiv.id = persistentInstanceId;
             messageDiv.setAttribute('data-original-message-id', message.id);
 
-            messageDiv.addEventListener('click', (event) => {
-                const target = event.target;
-                let preventAnchor = false;
-
-                // Standard interactive elements that should not trigger anchoring
-                if (target.matches('a, img, video, iframe, input, button, select, textarea') ||
-                    target.closest('a, img, video, iframe, input, button, select, textarea') ||
-                    target.isContentEditable) {
-                    preventAnchor = true;
-                }
-
-                // Specific wrapper classes for embeds that should not trigger anchoring
-                if (!preventAnchor) {
-                    const specificWrappers = [
-                        '.thumbnail-link',
-                        '.otk-youtube-embed-wrapper',
-                        '.otk-twitch-embed-wrapper',
-                        '.otk-streamable-embed-wrapper'
-                    ];
-                    if (specificWrappers.some(cls => target.matches(cls) || target.closest(cls))) {
-                        preventAnchor = true;
-                    }
-                }
-
-                if (preventAnchor) {
-                    return; // Do not anchor
-                }
-
-                if (!isTopLevelMessage) {
+            if (pinIcon) {
+                pinIcon.addEventListener('click', (event) => {
                     event.stopPropagation();
-                }
 
-                const isThisMessageAlreadyAnchored = messageDiv.classList.contains(ANCHORED_MESSAGE_CLASS);
+                    const isThisMessageAlreadyPinned = messageDiv.classList.contains(PINNED_MESSAGE_CLASS);
 
-                // Un-highlight all currently anchored messages
-                document.querySelectorAll(`.${ANCHORED_MESSAGE_CLASS}`).forEach(el => {
-                    el.classList.remove(ANCHORED_MESSAGE_CLASS);
+                    // Un-highlight all currently pinned messages
+                    document.querySelectorAll(`.${PINNED_MESSAGE_CLASS}`).forEach(el => {
+                        el.classList.remove(PINNED_MESSAGE_CLASS);
+                    });
+
+                    if (isThisMessageAlreadyPinned) {
+                    // If the clicked message was the pin, un-pin it
+                    localStorage.removeItem(PINNED_MESSAGE_ID_KEY);
+                    consoleLog(`Un-pinned message instance: ${persistentInstanceId}`);
+                    } else {
+                    // Otherwise, pin this new message
+                        messageDiv.classList.add(PINNED_MESSAGE_CLASS);
+                    localStorage.setItem(PINNED_MESSAGE_ID_KEY, persistentInstanceId);
+                    consoleLog(`Pinned new message instance: ${persistentInstanceId}`);
+                    }
                 });
-
-                if (isThisMessageAlreadyAnchored) {
-                    // If the clicked message was the anchor, un-anchor it
-                    localStorage.removeItem(ANCHORED_MESSAGE_ID_KEY);
-                    consoleLog(`Un-anchored message instance: ${persistentInstanceId}`);
-                } else {
-                    // Otherwise, anchor this new message
-                    messageDiv.classList.add(ANCHORED_MESSAGE_CLASS);
-                    localStorage.setItem(ANCHORED_MESSAGE_ID_KEY, persistentInstanceId);
-                    consoleLog(`Anchored new message instance: ${persistentInstanceId}`);
-                }
-            });
+            }
 
             // Initial highlight check when the element is first created
-            const initiallyStoredAnchoredId = localStorage.getItem(ANCHORED_MESSAGE_ID_KEY);
-            consoleLog("initiallyStoredAnchoredId", initiallyStoredAnchoredId, "persistentInstanceId", persistentInstanceId);
-            if (persistentInstanceId === initiallyStoredAnchoredId) {
-                messageDiv.classList.add(ANCHORED_MESSAGE_CLASS);
+            const initiallyStoredPinnedId = localStorage.getItem(PINNED_MESSAGE_ID_KEY);
+            console.log("initiallyStoredPinnedId", initiallyStoredPinnedId, "persistentInstanceId", persistentInstanceId);
+            if (persistentInstanceId === initiallyStoredPinnedId) {
+                messageDiv.classList.add(PINNED_MESSAGE_CLASS);
+                if (pinIcon) {
+                    pinIcon.style.visibility = 'visible';
+                }
             }
 
             if (isFiltered) {
@@ -3989,7 +3739,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
 
                 if (!hasUnfilteredContent && !hasQuotes) {
                     // Case 1: No unfiltered content and no quotes. Collapse the original message.
-                    const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelForStyling, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
+                    const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
                     const collapsibleContainer = wrapInCollapsibleContainer([originalTextElement, originalAttachmentDiv]);
                     messageDiv.appendChild(collapsibleContainer);
                 } else {
@@ -4021,7 +3771,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                         eyeIcon.addEventListener('click', (e) => {
                             e.stopPropagation();
                             if (!originalBodyGenerated) {
-                                const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelForStyling, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
+                                const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
                                 if(originalTextElement) originalBodyContainer.append(originalTextElement);
                                 if (originalAttachmentDiv) originalBodyContainer.append(originalAttachmentDiv);
                                 originalBodyGenerated = true;
@@ -4197,7 +3947,8 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                     originalThreadId: threadId, // Store the original thread ID for color lookup
                     text: '', // Will be populated after decoding
                     title: opPost.sub ? toTitleCase(decodeEntities(opPost.sub)) : `Thread ${threadId}`, // Assuming decodeEntities here handles what it needs for title
-                    attachment: null
+                    attachment: null,
+                    com: post.com // Store the raw comment HTML for better quote parsing
                 };
 
                 if (post.com) {
@@ -5081,17 +4832,17 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             // Explicitly re-render the viewer if it was open, using the fresh data.
             if (viewerWasOpen) {
                 consoleLog('[Clear] Re-rendering viewer with fresh data after clear.');
-                await renderMessagesInViewer({ isToggleOpen: false }); // isToggleOpen: false typically scrolls to bottom or default.
+            await renderMessagesInViewer({ isToggleOpen: false });
             }
-            // window.dispatchEvent(new CustomEvent('otkClearViewerDisplay')); // Removed as direct render is now handled.
             consoleLog('[Clear] Clear and Refresh data processing complete.');
+
+        renderThreadList(); // Update GUI bar with (now minimal) live threads
+        updateDisplayedStatistics(); // Update stats based on cleared and re-fetched data
         } catch (error) {
             consoleError('[Clear] Error during clear and refresh:', error);
         } finally {
             isManualRefreshInProgress = false;
             consoleLog('[Clear] Manual refresh flag reset.');
-            renderThreadList(); // Update GUI bar with (now minimal) live threads
-            updateDisplayedStatistics(); // Update stats based on cleared and re-fetched data
         }
     }
 
@@ -5823,16 +5574,54 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         contentArea.innerHTML = ''; // Clear previous content
 
         const clocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+        let draggedClockId = null;
+
+        const clockListContainer = document.createElement('div');
+        contentArea.appendChild(clockListContainer);
 
         clocks.forEach((clock, index) => {
             const clockRow = document.createElement('div');
+            clockRow.draggable = true;
+            clockRow.dataset.clockId = clock.id;
             clockRow.style.cssText = `
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
                 padding: 8px 0;
                 border-bottom: 1px solid #444;
+                cursor: grab;
             `;
+
+            clockRow.addEventListener('dragstart', (e) => {
+                draggedClockId = clock.id;
+                e.dataTransfer.effectAllowed = 'move';
+                e.target.style.opacity = '0.5';
+            });
+
+            clockRow.addEventListener('dragend', (e) => {
+                e.target.style.opacity = '1';
+                const allRows = [...clockListContainer.querySelectorAll('div[draggable="true"]')];
+                allRows.forEach(row => {
+                    row.style.borderTop = '';
+                    row.style.borderBottom = '';
+                });
+            });
+
+            clockRow.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                const allRows = [...clockListContainer.querySelectorAll('div[draggable="true"]')];
+                allRows.forEach(row => {
+                    row.style.borderTop = '';
+                    row.style.borderBottom = '';
+                });
+                const rect = clockRow.getBoundingClientRect();
+                const halfwayY = rect.top + rect.height / 2;
+                if (e.clientY < halfwayY) {
+                    clockRow.style.borderTop = '2px solid #ff8040';
+                } else {
+                    clockRow.style.borderBottom = '2px solid #ff8040';
+                }
+            });
 
             const clockName = document.createElement('span');
             clockName.textContent = clock.displayPlace || clock.timezone;
@@ -5869,7 +5658,38 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             }
 
             clockRow.appendChild(buttonsWrapper);
-            contentArea.appendChild(clockRow);
+            clockListContainer.appendChild(clockRow);
+        });
+
+        clockListContainer.addEventListener('drop', (e) => {
+            e.preventDefault();
+            const targetRow = e.target.closest('div[draggable="true"]');
+            if (!targetRow || draggedClockId === null) return;
+
+            let currentClocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
+            const draggedIndex = currentClocks.findIndex(c => c.id === draggedClockId);
+            const targetIndex = currentClocks.findIndex(c => c.id === parseInt(targetRow.dataset.clockId));
+
+            if (draggedIndex === -1 || targetIndex === -1) return;
+
+            const rect = targetRow.getBoundingClientRect();
+            const halfwayY = rect.top + rect.height / 2;
+            const insertBefore = e.clientY < halfwayY;
+
+            const [draggedClock] = currentClocks.splice(draggedIndex, 1);
+            let newIndex;
+            if (insertBefore) {
+                newIndex = currentClocks.findIndex(c => c.id === parseInt(targetRow.dataset.clockId));
+            } else {
+                newIndex = currentClocks.findIndex(c => c.id === parseInt(targetRow.dataset.clockId)) + 1;
+            }
+
+            currentClocks.splice(newIndex, 0, draggedClock);
+
+            localStorage.setItem('otkClocks', JSON.stringify(currentClocks));
+            renderClockOptions();
+            renderClocks();
+            draggedClockId = null;
         });
 
         const footerWrapper = document.createElement('div');
@@ -5901,8 +5721,29 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             document.getElementById('otk-clock-options-window').style.display = 'none';
         });
 
+        const cogPositionWrapper = document.createElement('div');
+        cogPositionWrapper.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-top: 10px;';
+        const cogPositionLabel = document.createElement('label');
+        cogPositionLabel.textContent = 'Cog Position:';
+        const cogPositionSelect = document.createElement('select');
+        const options = ['Before Clocks', 'After Clocks'];
+        options.forEach(opt => {
+            const optionEl = document.createElement('option');
+            optionEl.value = opt.toLowerCase().replace(' ', '-');
+            optionEl.textContent = opt;
+            cogPositionSelect.appendChild(optionEl);
+        });
+        cogPositionSelect.value = localStorage.getItem('otkClockCogPosition') || 'after-clocks';
+        cogPositionSelect.addEventListener('change', () => {
+            localStorage.setItem('otkClockCogPosition', cogPositionSelect.value);
+            renderClocks();
+        });
+        cogPositionWrapper.appendChild(cogPositionLabel);
+        cogPositionWrapper.appendChild(cogPositionSelect);
+
         footerWrapper.appendChild(addClockBtn);
         footerWrapper.appendChild(closeBtn);
+        contentArea.appendChild(cogPositionWrapper);
         contentArea.appendChild(footerWrapper);
     }
 
@@ -5940,7 +5781,7 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         const cogIcon = document.createElement('span');
         cogIcon.id = 'otk-clock-cog';
         cogIcon.innerHTML = '&#x2699;';
-        cogIcon.style.cssText = 'font-size: 16px; margin-left: 10px; cursor: pointer; display: inline-block; color: var(--otk-clock-cog-color);';
+        cogIcon.style.cssText = 'font-size: 16px; margin: 0 10px; cursor: pointer; display: inline-block; color: var(--otk-clock-cog-color);';
         cogIcon.title = "Edit Clocks";
         cogIcon.addEventListener('click', () => {
             const clockOptionsWindow = document.getElementById('otk-clock-options-window');
@@ -5952,7 +5793,13 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
                 }
             }
         });
-        clockContainer.appendChild(cogIcon);
+
+        const cogPosition = localStorage.getItem('otkClockCogPosition') || 'after-clocks';
+        if (cogPosition === 'before-clocks') {
+            clockContainer.insertBefore(cogIcon, clockContainer.firstChild);
+        } else {
+            clockContainer.appendChild(cogIcon);
+        }
 
         updateClockTimes();
     }
@@ -6157,7 +6004,8 @@ function saveThemeSetting(key, value, requiresRerender = false) {
         'otkThreadTimeDividerSymbol',
         'otkThreadTimeDividerColor',
         'otkThreadTimeBracketStyle',
-        'otkThreadTimeBracketColor'
+        'otkThreadTimeBracketColor',
+        'otkThreadTitleAnimationSpeed'
     ];
 
     if (requiresRerender) {
@@ -6281,47 +6129,30 @@ function applyThemeSettings(options = {}) {
             updateColorInputs('viewer-quote2plus-border', settings.viewerQuote2plusHeaderBorderColor);
         }
 
-        // Message Background Colors, Message Body Text Colors, Message Header Text Colors
-        ['Bg', 'Text', 'HeaderTextColor'].forEach(type => {
-            ['0', '1', '2plus'].forEach(depth => {
-                const keyBase = `msgDepth${depth}${type === 'HeaderTextColor' ? 'HeaderTextColor' : type}`; // e.g. msgDepth0BgColor, msgDepth0TextColor, msgDepth0HeaderTextColor
-                const cssVarBase = `--otk-msg-depth${depth}-${type === 'Bg' ? 'bg' : (type === 'Text' ? 'text' : 'header-text')}-color`; // e.g. --otk-msg-depth0-bg-color
-                const idSuffixBase = `msg-depth${depth}-${type === 'Bg' ? 'bg' : (type === 'Text' ? 'text' : 'header-text')}`; // e.g. msg-depth0-bg
+        // Message Background Colors, etc. for Even/Odd depths
+        ['Even', 'Odd'].forEach(parity => {
+            const parityLower = parity.toLowerCase();
+            const settingsToApply = [
+                { key: `msgDepth${parity}ContentFontSize`, cssVar: `--otk-msg-depth-${parityLower}-content-font-size`, idSuffix: `msg-depth-${parityLower}-content-fontsize`, type: 'font' },
+                { key: `msgDepth${parity}BgColor`, cssVar: `--otk-msg-depth-${parityLower}-bg-color`, idSuffix: `msg-depth-${parityLower}-bg`, type: 'color' },
+                { key: `msgDepth${parity}TextColor`, cssVar: `--otk-msg-depth-${parityLower}-text-color`, idSuffix: `msg-depth-${parityLower}-text`, type: 'color' },
+                { key: `msgDepth${parity}HeaderTextColor`, cssVar: `--otk-msg-depth-${parityLower}-header-text-color`, idSuffix: `msg-depth-${parityLower}-header-text`, type: 'color' },
+                { key: `viewerHeaderBorderColor${parity}`, cssVar: `--otk-viewer-header-border-color-${parityLower}`, idSuffix: `viewer-header-border-${parityLower}`, type: 'color' }
+            ];
 
-                // Correcting key and idSuffix for "HeaderTextColor" to match createThemeOptionRow structure
-                let correctedKey = keyBase;
-                let correctedIdSuffix = idSuffixBase;
-                if (type === 'HeaderTextColor') {
-                     correctedKey = `msgDepth${depth}HeaderTextColor`; // This was already correct
-                     correctedIdSuffix = `msg-depth${depth}-header-text`; // This was already correct
-                } else {
-                    correctedKey = `msgDepth${depth}${type}Color`; // e.g. msgDepth0BgColor
-                    correctedIdSuffix = `msg-depth${depth}-${type.toLowerCase()}`; // e.g. msg-depth0-bg
-                }
-
-
-                if (settings[correctedKey]) {
-                    document.documentElement.style.setProperty(cssVarBase, settings[correctedKey]);
-                    updateColorInputs(correctedIdSuffix, settings[correctedKey]);
+            settingsToApply.forEach(setting => {
+                 if (settings[setting.key]) {
+                    document.documentElement.style.setProperty(setting.cssVar, settings[setting.key]);
+                    if (setting.type === 'color') {
+                        updateColorInputs(setting.idSuffix, settings[setting.key]);
+                    } else if (setting.type === 'font') {
+                        const inputElement = document.getElementById(`otk-${setting.idSuffix}`);
+                        if (inputElement) {
+                            inputElement.value = settings[setting.key].replace('px', '');
+                        }
+                    }
                 }
             });
-        });
-
-
-        // New Depth-Specific Content Font Sizes
-        ['Depth 0', 'Depth 1', 'Depth 2+'].forEach((label, index) => {
-            const depthKeyPart = index === 2 ? '2plus' : index.toString();
-            const storageKey = `msgDepth${depthKeyPart}ContentFontSize`;
-            const cssVar = `--otk-msg-depth${depthKeyPart}-content-font-size`;
-            const inputId = `otk-msg-depth${depthKeyPart}-content-fontsize`;
-
-            if (settings[storageKey]) {
-                document.documentElement.style.setProperty(cssVar, settings[storageKey]);
-                const inputElement = document.getElementById(inputId);
-                if (inputElement) {
-                    inputElement.value = settings[storageKey].replace('px', '');
-                }
-            }
         });
 
 
@@ -6364,14 +6195,20 @@ function applyThemeSettings(options = {}) {
             updateColorInputs('new-msg-font', settings.newMessagesFontColor);
         }
 
-        // Anchor Highlight Colors
-        if (settings.anchorHighlightBgColor) {
-            document.documentElement.style.setProperty('--otk-anchor-highlight-bg-color', settings.anchorHighlightBgColor);
-            updateColorInputs('anchor-bg', settings.anchorHighlightBgColor);
+        // Pin Highlight Colors
+        if (settings.pinHighlightBgColor) {
+            document.documentElement.style.setProperty('--otk-pin-highlight-bg-color', settings.pinHighlightBgColor);
+            updateColorInputs('pin-bg', settings.pinHighlightBgColor);
         }
-        if (settings.anchorHighlightBorderColor) {
-            document.documentElement.style.setProperty('--otk-anchor-highlight-border-color', settings.anchorHighlightBorderColor);
-            updateColorInputs('anchor-border', settings.anchorHighlightBorderColor);
+        if (settings.pinHighlightBorderColor) {
+            document.documentElement.style.setProperty('--otk-pin-highlight-border-color', settings.pinHighlightBorderColor);
+            updateColorInputs('pin-border', settings.pinHighlightBorderColor);
+        }
+
+        // '+' Icon Background
+        if (settings.plusIconBgColor) {
+            document.documentElement.style.setProperty('--otk-plus-icon-bg-color', settings.plusIconBgColor);
+            updateColorInputs('plus-icon-bg-color', settings.plusIconBgColor);
         }
 
         // Icon Colors
@@ -6390,6 +6227,10 @@ function applyThemeSettings(options = {}) {
         if (settings.blurIconBgColor) {
             document.documentElement.style.setProperty('--otk-blur-icon-bg-color', settings.blurIconBgColor);
             updateColorInputs('blur-icon-bg', settings.blurIconBgColor);
+        }
+        if (settings.mediaIconDividerColor) {
+            document.documentElement.style.setProperty('--otk-media-icon-divider-color', settings.mediaIconDividerColor);
+            updateColorInputs('media-icon-divider', settings.mediaIconDividerColor);
         }
 
     // Clock Colors
@@ -6458,27 +6299,6 @@ function applyThemeSettings(options = {}) {
             document.documentElement.style.setProperty('--otk-loading-progress-bar-text-color', settings.loadingProgressBarTextColor);
             updateColorInputs('loading-progress-text', settings.loadingProgressBarTextColor);
         }
-
-        // Update checkboxes for new boolean settings
-        const newBooleanSettings = [
-            { key: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth0-disable-header-underline' },
-            { key: 'otkMsgDepth0DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth0-display-media-filename' },
-            { key: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth1-disable-header-underline' },
-            { key: 'otkMsgDepth1DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth1-display-media-filename' },
-            { key: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth2plus-disable-header-underline' },
-            { key: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth2plus-display-media-filename' }
-        ];
-
-        newBooleanSettings.forEach(opt => {
-            const checkbox = document.getElementById(`otk-${opt.idSuffix}-checkbox`);
-            if (checkbox) {
-                if (settings.hasOwnProperty(opt.key)) {
-                    checkbox.checked = settings[opt.key];
-                } else {
-                    checkbox.checked = opt.defaultValue;
-                }
-            }
-        });
 
         // Directly update loading screen styles
         const loadingOverlayElement = document.getElementById('otk-loading-overlay');
@@ -6549,6 +6369,22 @@ function applyThemeSettings(options = {}) {
             document.documentElement.style.setProperty('--otk-pip-bg-color', settings.pipBackgroundColor);
             updateColorInputs('pip-bg', settings.pipBackgroundColor);
         }
+
+        // QR Theming
+        const qrColorConfigs = [
+            { key: 'qrBgColor', cssVar: '--otk-qr-bg-color', idSuffix: 'qr-bg' },
+            { key: 'qrBorderColor', cssVar: '--otk-qr-border-color', idSuffix: 'qr-border' },
+            { key: 'qrHeaderBgColor', cssVar: '--otk-qr-header-bg-color', idSuffix: 'qr-header-bg' },
+            { key: 'qrHeaderTextColor', cssVar: '--otk-qr-header-text-color', idSuffix: 'qr-header-text' },
+            { key: 'qrTextareaBgColor', cssVar: '--otk-qr-textarea-bg-color', idSuffix: 'qr-textarea-bg' },
+            { key: 'qrTextareaTextColor', cssVar: '--otk-qr-textarea-text-color', idSuffix: 'qr-textarea-text' },
+        ];
+        qrColorConfigs.forEach(config => {
+            if (settings[config.key]) {
+                document.documentElement.style.setProperty(config.cssVar, settings[config.key]);
+                updateColorInputs(config.idSuffix, settings[config.key]);
+            }
+        });
     }
 
 
@@ -6874,12 +6710,14 @@ function applyThemeSettings(options = {}) {
             pendingThemeChanges = {};
             hideApplyDiscardButtons();
             applyThemeSettings();
+            renderThreadList();
         });
 
         discardButton.addEventListener('click', () => {
             pendingThemeChanges = {};
             hideApplyDiscardButtons();
             applyThemeSettings(); // Re-apply original settings to reset inputs
+            renderThreadList();
         });
 
         const contentArea = document.createElement('div');
@@ -7471,6 +7309,7 @@ function applyThemeSettings(options = {}) {
                 }
                 if (options.min !== undefined) mainInput.min = options.min;
                 if (options.max !== undefined) mainInput.max = options.max;
+                if (options.step !== undefined) mainInput.step = options.step;
             }
 
             const defaultBtn = document.createElement('button');
@@ -7718,6 +7557,20 @@ function applyThemeSettings(options = {}) {
             defaultValue: '#aaa',
             inputType: 'color',
             idSuffix: 'thread-time-bracket-color'
+        }));
+
+        themeOptionsContainer.appendChild(createThemeOptionRow({
+            labelText: "Thread Title Animation Speed:",
+            storageKey: 'otkThreadTitleAnimationSpeed',
+            cssVariable: '--otk-thread-title-animation-speed',
+            defaultValue: '1',
+            inputType: 'number',
+            unit: null,
+            min: 0,
+            max: 10,
+            step: 0.5,
+            idSuffix: 'thread-title-animation-speed',
+            requiresRerender: false
         }));
 
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Stats Text:", storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' }));
@@ -8105,8 +7958,11 @@ function applyThemeSettings(options = {}) {
         }));
 
         // Anchor Highlight Colors
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Anchor Highlight Background:", storageKey: 'anchorHighlightBgColor', cssVariable: '--otk-anchor-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'anchor-bg', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Anchor Highlight Border:", storageKey: 'anchorHighlightBorderColor', cssVariable: '--otk-anchor-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'anchor-border', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Highlight Background:", storageKey: 'pinHighlightBgColor', cssVariable: '--otk-pin-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'pin-bg', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Highlight Border:", storageKey: 'pinHighlightBorderColor', cssVariable: '--otk-pin-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'pin-border', requiresRerender: true }));
+
+        // '+' Icon Background
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "'+' Icon Background:", storageKey: 'plusIconBgColor', cssVariable: '--otk-plus-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'plus-icon-bg-color', requiresRerender: false }));
 
         // Icon Colors
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Blur Icon Color:", storageKey: 'blurIconColor', cssVariable: '--otk-blur-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'blur-icon' }));
@@ -8285,47 +8141,52 @@ function applyThemeSettings(options = {}) {
 
         // themeOptionsContainer.appendChild(createDivider()); // Removed divider
 
+        // --- Quick Reply Theming Section ---
+        const qrThemingHeading = createSectionHeading('Quick Reply Window');
+        qrThemingHeading.style.marginTop = "22px";
+        qrThemingHeading.style.marginBottom = "18px";
+        themeOptionsContainer.appendChild(qrThemingHeading);
+
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'qrBgColor', cssVariable: '--otk-qr-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'qr-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Border:", storageKey: 'qrBorderColor', cssVariable: '--otk-qr-border-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'qr-border' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Background:", storageKey: 'qrHeaderBgColor', cssVariable: '--otk-qr-header-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'qr-header-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Text:", storageKey: 'qrHeaderTextColor', cssVariable: '--otk-qr-header-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'qr-header-text' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Textarea Background:", storageKey: 'qrTextareaBgColor', cssVariable: '--otk-qr-textarea-bg-color', defaultValue: '#222222', inputType: 'color', idSuffix: 'qr-textarea-bg' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Textarea Text:", storageKey: 'qrTextareaTextColor', cssVariable: '--otk-qr-textarea-text-color', defaultValue: '#eeeeee', inputType: 'color', idSuffix: 'qr-textarea-text' }));
+
         // --- Messages Section Restructuring ---
-        // Remove old global "Messages" heading and global font size option (done by not adding them back here)
+        // --- Messages (Odds) Section ---
+        const oddMessagesHeading = createSectionHeading('Messages (Odds)');
+        oddMessagesHeading.style.marginTop = "22px";
+        oddMessagesHeading.style.marginBottom = "18px";
+        themeOptionsContainer.appendChild(oddMessagesHeading);
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepthOddContentFontSize', cssVariable: '--otk-msg-depth-odd-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-odd-content-fontsize', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepthOddBgColor', cssVariable: '--otk-msg-depth-odd-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth-odd-bg', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepthOddTextColor', cssVariable: '--otk-msg-depth-odd-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-odd-text', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepthOddHeaderTextColor', cssVariable: '--otk-msg-depth-odd-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-odd-header-text', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerHeaderBorderColorOdd', cssVariable: '--otk-viewer-header-border-color-odd', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border-odd', requiresRerender: true }));
 
-        // --- Depth 0 Messages Section ---
-        const depth0MessagesHeading = createSectionHeading('Depth 0 Messages');
-        depth0MessagesHeading.style.marginTop = "22px";
-        depth0MessagesHeading.style.marginBottom = "18px";
-        themeOptionsContainer.appendChild(depth0MessagesHeading);
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepth0ContentFontSize', cssVariable: '--otk-msg-depth0-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth0-content-fontsize', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepth0BgColor', cssVariable: '--otk-msg-depth0-bg-color', defaultValue: '#343434', inputType: 'color', idSuffix: 'msg-depth0-bg', requiresRerender: true })); // Default for original theme, new theme uses #fff
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepth0TextColor', cssVariable: '--otk-msg-depth0-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-text', requiresRerender: true })); // Default for original theme, new theme uses #333
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepth0HeaderTextColor', cssVariable: '--otk-msg-depth0-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth0-header-text', requiresRerender: true })); // Default for original theme, new theme uses #555
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerHeaderBorderColor', cssVariable: '--otk-viewer-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Hide Message Underline:", storageKey: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth0-disable-header-underline', requiresRerender: false }));
-        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Show Media Filenames:", storageKey: 'otkMsgDepth0DisplayMediaFilename', defaultValue: false, idSuffix: 'msg-depth0-display-media-filename', requiresRerender: false }));
+        // --- Messages (Evens) Section ---
+        const evenMessagesHeading = createSectionHeading('Messages (Evens)');
+        evenMessagesHeading.style.marginTop = "22px";
+        evenMessagesHeading.style.marginBottom = "18px";
+        themeOptionsContainer.appendChild(evenMessagesHeading);
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepthEvenContentFontSize', cssVariable: '--otk-msg-depth-even-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-even-content-fontsize', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepthEvenBgColor', cssVariable: '--otk-msg-depth-even-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'msg-depth-even-bg', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepthEvenTextColor', cssVariable: '--otk-msg-depth-even-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-even-text', requiresRerender: true }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepthEvenHeaderTextColor', cssVariable: '--otk-msg-depth-even-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-even-header-text', requiresRerender: true }));
 
-        // --- Depth 1 Messages Section ---
-        const depth1MessagesHeading = createSectionHeading('Depth 1 Messages');
-        depth1MessagesHeading.style.marginTop = "22px";
-        depth1MessagesHeading.style.marginBottom = "18px";
-        themeOptionsContainer.appendChild(depth1MessagesHeading);
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepth1ContentFontSize', cssVariable: '--otk-msg-depth1-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth1-content-fontsize', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepth1BgColor', cssVariable: '--otk-msg-depth1-bg-color', defaultValue: '#525252', inputType: 'color', idSuffix: 'msg-depth1-bg', requiresRerender: true })); // Default for original theme
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepth1TextColor', cssVariable: '--otk-msg-depth1-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-text', requiresRerender: true })); // Default for original theme
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepth1HeaderTextColor', cssVariable: '--otk-msg-depth1-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth1-header-text', requiresRerender: true })); // Default for original theme
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerQuote1HeaderBorderColor', cssVariable: '--otk-viewer-quote1-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote1-border', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Hide Message Underline:", storageKey: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: true, idSuffix: 'msg-depth1-disable-header-underline', requiresRerender: false }));
-        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Show Media Filenames:", storageKey: 'otkMsgDepth1DisplayMediaFilename', defaultValue: false, idSuffix: 'msg-depth1-display-media-filename', requiresRerender: false }));
-
-        // --- Depth 2+ Messages Section ---
-        const depth2plusMessagesHeading = createSectionHeading('Depth 2+ Messages');
-        depth2plusMessagesHeading.style.marginTop = "22px";
-        depth2plusMessagesHeading.style.marginBottom = "18px";
-        themeOptionsContainer.appendChild(depth2plusMessagesHeading);
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepth2plusContentFontSize', cssVariable: '--otk-msg-depth2plus-content-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth2plus-content-fontsize', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepth2plusBgColor', cssVariable: '--otk-msg-depth2plus-bg-color', defaultValue: '#484848', inputType: 'color', idSuffix: 'msg-depth2plus-bg', requiresRerender: true })); // Default for original theme
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepth2plusTextColor', cssVariable: '--otk-msg-depth2plus-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-text', requiresRerender: true })); // Default for original theme
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepth2plusHeaderTextColor', cssVariable: '--otk-msg-depth2plus-header-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'msg-depth2plus-header-text', requiresRerender: true })); // Default for original theme
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerQuote2plusHeaderBorderColor', cssVariable: '--otk-viewer-quote2plus-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote2plus-border', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Hide Message Underline:", storageKey: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: true, idSuffix: 'msg-depth2plus-disable-header-underline', requiresRerender: false }));
-        themeOptionsContainer.appendChild(createCheckboxOptionRow({ labelText: "Show Media Filenames:", storageKey: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: false, idSuffix: 'msg-depth2plus-display-media-filename', requiresRerender: false }));
+        // --- Message Icons Section ---
+        const messageIconsHeading = createSectionHeading('Message Icons');
+        messageIconsHeading.style.marginTop = "22px";
+        messageIconsHeading.style.marginBottom = "18px";
+        themeOptionsContainer.appendChild(messageIconsHeading);
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Block Icon (Odd):", storageKey: 'blockIconColorOdd', cssVariable: '--otk-block-icon-color-odd', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-odd' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Block Icon (Even):", storageKey: 'blockIconColorEven', cssVariable: '--otk-block-icon-color-even', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-even' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Odd):", storageKey: 'pinIconColorOdd', cssVariable: '--otk-pin-icon-color-odd', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-odd' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Even):", storageKey: 'pinIconColorEven', cssVariable: '--otk-pin-icon-color-even', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-even' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Active):", storageKey: 'pinIconColorActive', cssVariable: '--otk-pin-icon-color-active', defaultValue: '#ff0000', inputType: 'color', idSuffix: 'pin-icon-active' }));
+        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Media Menu Icon:", storageKey: 'mediaMenuIconColor', cssVariable: '--otk-media-menu-icon-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'media-menu-icon' }));
 
         // --- Options Panel Section ---
         const optionsPanelSectionHeading = createSectionHeading('Options Panel');
@@ -8625,24 +8486,17 @@ function applyThemeSettings(options = {}) {
                 { storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' },
                 { storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#ffd1a4', inputType: 'color', idSuffix: 'viewer-bg' },
                 { storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'gui-bottom-border' },
-                // { storageKey: 'viewerMessageFontSize', cssVariable: '--otk-viewer-message-font-size', defaultValue: '13px', inputType: 'number', unit: 'px', idSuffix: 'fontsize-message-text' }, // Removed old global
-                // New Depth-Specific Content Font Sizes
-                { storageKey: 'msgDepth0ContentFontSize', cssVariable: '--otk-msg-depth0-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth0-content-fontsize'},
-                { storageKey: 'msgDepth1ContentFontSize', cssVariable: '--otk-msg-depth1-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth1-content-fontsize'},
-                { storageKey: 'msgDepth2plusContentFontSize', cssVariable: '--otk-msg-depth2plus-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth2plus-content-fontsize'},
-                // Existing depth-specific color options (no changes needed to these specific lines, just context for new font sizes)
-                { storageKey: 'msgDepth0BgColor', cssVariable: '--otk-msg-depth0-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth0-bg' },
-                { storageKey: 'msgDepth0TextColor', cssVariable: '--otk-msg-depth0-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth0-text' },
-                { storageKey: 'msgDepth0HeaderTextColor', cssVariable: '--otk-msg-depth0-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth0-header-text' },
-                { storageKey: 'viewerHeaderBorderColor', cssVariable: '--otk-viewer-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border' },
-                { storageKey: 'msgDepth1BgColor', cssVariable: '--otk-msg-depth1-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'msg-depth1-bg' },
-                { storageKey: 'msgDepth1TextColor', cssVariable: '--otk-msg-depth1-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth1-text' },
-                { storageKey: 'msgDepth1HeaderTextColor', cssVariable: '--otk-msg-depth1-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth1-header-text' },
-                { storageKey: 'viewerQuote1HeaderBorderColor', cssVariable: '--otk-viewer-quote1-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote1-border' },
-                { storageKey: 'msgDepth2plusBgColor', cssVariable: '--otk-msg-depth2plus-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth2plus-bg' },
-                { storageKey: 'msgDepth2plusTextColor', cssVariable: '--otk-msg-depth2plus-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth2plus-text' },
-                { storageKey: 'msgDepth2plusHeaderTextColor', cssVariable: '--otk-msg-depth2plus-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth2plus-header-text' },
-                { storageKey: 'viewerQuote2plusHeaderBorderColor', cssVariable: '--otk-viewer-quote2plus-header-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-quote2plus-border' },
+                // Messages (Odds) - Corresponds to Depth 0, 2, 4...
+                { storageKey: 'msgDepthOddContentFontSize', cssVariable: '--otk-msg-depth-odd-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-odd-content-fontsize'},
+                { storageKey: 'msgDepthOddBgColor', cssVariable: '--otk-msg-depth-odd-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth-odd-bg' },
+                { storageKey: 'msgDepthOddTextColor', cssVariable: '--otk-msg-depth-odd-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-odd-text' },
+                { storageKey: 'msgDepthOddHeaderTextColor', cssVariable: '--otk-msg-depth-odd-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-odd-header-text' },
+                { storageKey: 'viewerHeaderBorderColorOdd', cssVariable: '--otk-viewer-header-border-color-odd', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border-odd' },
+                // Messages (Evens) - Corresponds to Depth 1, 3, 5...
+                { storageKey: 'msgDepthEvenContentFontSize', cssVariable: '--otk-msg-depth-even-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-even-content-fontsize'},
+                { storageKey: 'msgDepthEvenBgColor', cssVariable: '--otk-msg-depth-even-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'msg-depth-even-bg' },
+                { storageKey: 'msgDepthEvenTextColor', cssVariable: '--otk-msg-depth-even-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-even-text' },
+                { storageKey: 'msgDepthEvenHeaderTextColor', cssVariable: '--otk-msg-depth-even-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-even-header-text' },
                 { storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'cog-icon' },
                 { storageKey: 'disableBgFontColor', cssVariable: '--otk-disable-bg-font-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'disable-bg-font' },
                 { storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' },
@@ -8655,9 +8509,12 @@ function applyThemeSettings(options = {}) {
                 { storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: false },
                 { storageKey: 'blockedContentFontColor', cssVariable: '--otk-blocked-content-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'blocked-content-font' },
 
-                // Anchor Highlight Colors
-                { storageKey: 'anchorHighlightBgColor', cssVariable: '--otk-anchor-highlight-bg-color', defaultValue: '#ffd1a4', inputType: 'color', idSuffix: 'anchor-bg' },
-                { storageKey: 'anchorHighlightBorderColor', cssVariable: '--otk-anchor-highlight-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'anchor-border' },
+                // Pin Highlight Colors
+                { storageKey: 'pinHighlightBgColor', cssVariable: '--otk-pin-highlight-bg-color', defaultValue: '#ffd1a4', inputType: 'color', idSuffix: 'pin-bg' },
+                { storageKey: 'pinHighlightBorderColor', cssVariable: '--otk-pin-highlight-border-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'pin-border' },
+
+                // '+' Icon Background
+                { storageKey: 'plusIconBgColor', cssVariable: '--otk-plus-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'plus-icon-bg-color' },
 
                 // Icon Colors
                 { storageKey: 'blurIconColor', cssVariable: '--otk-blur-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'blur-icon' },
@@ -8686,7 +8543,23 @@ function applyThemeSettings(options = {}) {
                 { storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'clock-border' },
                 { storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' },
                 { storageKey: 'clockCogColor', cssVariable: '--otk-clock-cog-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'clock-cog' },
-                { storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }
+                { storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' },
+
+                // QR Theming
+                { storageKey: 'qrBgColor', cssVariable: '--otk-qr-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'qr-bg' },
+                { storageKey: 'qrBorderColor', cssVariable: '--otk-qr-border-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'qr-border' },
+                { storageKey: 'qrHeaderBgColor', cssVariable: '--otk-qr-header-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'qr-header-bg' },
+                { storageKey: 'qrHeaderTextColor', cssVariable: '--otk-qr-header-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'qr-header-text' },
+                { storageKey: 'qrTextareaBgColor', cssVariable: '--otk-qr-textarea-bg-color', defaultValue: '#222222', inputType: 'color', idSuffix: 'qr-textarea-bg' },
+                { storageKey: 'qrTextareaTextColor', cssVariable: '--otk-qr-textarea-text-color', defaultValue: '#eeeeee', inputType: 'color', idSuffix: 'qr-textarea-text' },
+
+                // Message Header Icon Colors
+                { storageKey: 'blockIconColorOdd', cssVariable: '--otk-block-icon-color-odd', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-odd' },
+                { storageKey: 'blockIconColorEven', cssVariable: '--otk-block-icon-color-even', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-even' },
+                { storageKey: 'pinIconColorOdd', cssVariable: '--otk-pin-icon-color-odd', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-odd' },
+                { storageKey: 'pinIconColorEven', cssVariable: '--otk-pin-icon-color-even', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-even' },
+                { storageKey: 'pinIconColorActive', cssVariable: '--otk-pin-icon-color-active', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'pin-icon-active' },
+                { storageKey: 'mediaMenuIconColor', cssVariable: '--otk-media-menu-icon-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'media-menu-icon' }
             ];
         }
 
@@ -8726,14 +8599,11 @@ function applyThemeSettings(options = {}) {
                 }
             });
 
-            // Also reset new boolean settings to their defaults
             const newBooleanSettings = [
-                { key: 'otkMsgDepth0DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth0-disable-header-underline' },
-                { key: 'otkMsgDepth0DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth0-display-media-filename' },
-                { key: 'otkMsgDepth1DisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth1-disable-header-underline' },
-                { key: 'otkMsgDepth1DisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth1-display-media-filename' },
-                { key: 'otkMsgDepth2plusDisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth2plus-disable-header-underline' },
-                { key: 'otkMsgDepth2plusDisplayMediaFilename', defaultValue: true, idSuffix: 'msg-depth2plus-display-media-filename' }
+                { key: 'otkMsgDepthOddDisableHeaderUnderline', defaultValue: false, idSuffix: 'msg-depth-odd-disable-header-underline' },
+                { key: 'otkMsgDepthEvenDisableHeaderUnderline', defaultValue: true, idSuffix: 'msg-depth-even-disable-header-underline' },
+                { key: 'showOddMessageFilename', defaultValue: false, idSuffix: 'show-odd-filename'},
+                { key: 'showEvenMessageFilename', defaultValue: false, idSuffix: 'show-even-filename'}
             ];
             newBooleanSettings.forEach(opt => {
                 const checkbox = document.getElementById(`otk-${opt.idSuffix}-checkbox`);
@@ -8828,6 +8698,18 @@ function applyThemeSettings(options = {}) {
                 // localStorage.setItem('otkOptionsWindowPos', JSON.stringify({top: optionsWindow.style.top, left: optionsWindow.style.left}));
             }
         });
+
+window.addEventListener('otkMultiQuoteApplied', () => {
+    multiQuoteSelections.clear();
+    document.querySelectorAll('.otk-multiquote-checkbox-wrapper.selected').forEach(wrapper => {
+        wrapper.classList.remove('selected');
+        const checkbox = wrapper.querySelector('input');
+        if (checkbox) {
+            checkbox.checked = false;
+        }
+    });
+    consoleLog('Multi-quote selections have been cleared after being applied.');
+});
 
         consoleLog("Options Window setup complete with drag functionality.");
     }
@@ -9504,6 +9386,14 @@ function setupClockOptionsWindow() {
 
     // --- Initial Actions / Main Execution ---
     async function main() {
+        // Ensure default animation speed is set on first run
+        let settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+        if (settings.otkThreadTitleAnimationSpeed === undefined) {
+            settings.otkThreadTitleAnimationSpeed = '1';
+            localStorage.setItem(THEME_SETTINGS_KEY, JSON.stringify(settings));
+            consoleLog("Initialized default animation speed to 1.");
+        }
+
         // Migration: Remove old filter rules key if it exists
         if (localStorage.getItem('otkFilterRules')) {
             localStorage.removeItem('otkFilterRules');
@@ -9578,27 +9468,25 @@ function setupClockOptionsWindow() {
                 --otk-viewer-bg-color: #ffd1a4;
                 --otk-gui-threadlist-title-color: #e0e0e0;
                 --otk-gui-threadlist-time-color: #FFD700;
-                --otk-viewer-header-border-color: #000000; /* Default theme's header underline for depth 0 - Now black */
-                --otk-viewer-quote1-header-border-color: #000000; /* Default theme's header underline for depth 1 - Now black */
-                /* New defaults based on example.html for the new design, now acting as global defaults */
-                --otk-msg-depth0-bg-color: #ffffff; /* example.html main bg */
-                --otk-msg-depth1-bg-color: #d9d9d9; /* example.html quote1 bg */
-                --otk-msg-depth2plus-bg-color: #ffffff; /* example.html quote2 bg (alternating) */
+                /* Message Styles (Odd Depths: 0, 2, 4...) */
+                --otk-msg-depth-odd-content-font-size: 16px;
+                --otk-msg-depth-odd-bg-color: #ffffff;
+                --otk-msg-depth-odd-text-color: #333333;
+                --otk-msg-depth-odd-header-text-color: #555555;
+                --otk-viewer-header-border-color-odd: #000000;
 
-                --otk-msg-depth0-text-color: #333333; /* example.html content text (assumed) */
-                --otk-msg-depth1-text-color: #333333; /* example.html content text (assumed) */
-                --otk-msg-depth2plus-text-color: #333333; /* example.html content text (assumed) */
-
-                --otk-msg-depth0-header-text-color: #555555; /* example.html header text */
-                --otk-msg-depth1-header-text-color: #555555; /* example.html header text */
-                --otk-msg-depth2plus-header-text-color: #555555; /* example.html header text */
+                /* Message Styles (Even Depths: 1, 3, 5...) */
+                --otk-msg-depth-even-content-font-size: 16px;
+                --otk-msg-depth-even-bg-color: #d9d9d9;
+                --otk-msg-depth-even-text-color: #333333;
+                --otk-msg-depth-even-header-text-color: #555555;
+                --otk-viewer-header-border-color-even: #777777;
 
                 --otk-viewer-message-font-size: 13px; /* Default font size for message text - remains common */
                 --otk-gui-bottom-border-color: #ff8040; /* Default for GUI bottom border - remains common */
                 --otk-cog-icon-color: #FFD700; /* Default for settings cog icon */
                 --otk-disable-bg-font-color: #ff8040; /* Default for "Disable Background Updates" text */
                 --otk-countdown-timer-text-color: #ff8040; /* Default for countdown timer text */
-                --otk-viewer-quote2plus-header-border-color: #000000; /* Default for Depth 2+ message header underline - Now black */
                 --otk-new-messages-divider-color: #000000; /* Default for new message separator line */
                 --otk-new-messages-font-color: #000000; /* Default for new message separator text */
                 --otk-new-messages-font-size: 16px;
@@ -9625,15 +9513,34 @@ function setupClockOptionsWindow() {
                 /* Add more variables here as they are identified */
 
                 /* Anchor Highlight Colors */
-                --otk-anchor-highlight-bg-color: #ff8040;    /* Default: dark yellow/greenish */
-                --otk-anchor-highlight-border-color: #000000; /* Default: gold */
+                --otk-pin-highlight-bg-color: #ffd1a4;    /* Default: dark yellow/greenish */
+                --otk-pin-highlight-border-color: #000000; /* Default: gold */
 
                 /* Icon Colors */
+                --otk-plus-icon-bg-color: #d9d9d9;
                 --otk-resize-icon-color: #000000;
                 --otk-resize-icon-bg-color: #d9d9d9;
                 --otk-blur-icon-color: #000000;
                 --otk-blur-icon-bg-color: #d9d9d9;
                 --otk-blocked-content-font-color: #e6e6e6;
+
+                /* QR Theming */
+                --otk-qr-bg-color: #333333;
+                --otk-qr-border-color: #555555;
+                --otk-qr-header-bg-color: #444444;
+                --otk-qr-header-text-color: #ffffff;
+                --otk-qr-textarea-bg-color: #222222;
+                --otk-qr-textarea-text-color: #eeeeee;
+
+                /* Message Header Icon Colors */
+                --otk-block-icon-color-odd: #999999;
+                --otk-block-icon-color-even: #999999;
+                --otk-pin-icon-color-odd: #666666;
+                --otk-pin-icon-color-even: #666666;
+                --otk-pin-icon-color-active: #ffffff;
+                --otk-media-controls-bg-color-odd: rgba(255, 255, 255, 0.8);
+                --otk-media-controls-bg-color-even: rgba(217, 217, 217, 0.8);
+                --otk-media-menu-icon-color: #ff8040;
             }
 
             /* Refined Chrome Scrollbar Styling for Overlay Effect */
@@ -9685,10 +9592,39 @@ function setupClockOptionsWindow() {
             #otk-clock:hover #otk-clock-search-icon {
                 display: inline-block;
             }
-            .${ANCHORED_MESSAGE_CLASS} {
-                background-color: var(--otk-anchor-highlight-bg-color) !important;
-                border: 1px solid var(--otk-anchor-highlight-border-color) !important;
+            .${PINNED_MESSAGE_CLASS} {
+                background-color: var(--otk-pin-highlight-bg-color) !important;
+                border: 1px solid var(--otk-pin-highlight-border-color) !important;
                 /* Add other styles if needed, e.g., box-shadow */
+            }
+
+            .otk-pin-icon {
+                visibility: hidden; /* Hidden by default, visibility is controlled by JS */
+                cursor: pointer;
+                margin-left: 8px; /* Space between icons */
+                vertical-align: middle;
+            width: 18px;
+            height: 18px;
+                transition: color 0.2s ease-in-out; /* Transition color now */
+            }
+
+            /* Block Icon Colors */
+            .otk-message-depth-odd .block-icon {
+                color: var(--otk-block-icon-color-odd);
+            }
+            .otk-message-depth-even .block-icon {
+                color: var(--otk-block-icon-color-even);
+            }
+
+            /* Pin Icon Colors */
+            .otk-message-depth-odd .otk-pin-icon {
+                color: var(--otk-pin-icon-color-odd);
+            }
+            .otk-message-depth-even .otk-pin-icon {
+                color: var(--otk-pin-icon-color-even);
+            }
+            .${PINNED_MESSAGE_CLASS} .otk-pin-icon {
+                color: var(--otk-pin-icon-color-active);
             }
                 .otk-youtube-embed-wrapper.otk-embed-inline {
                     /* max-width and margins are now controlled by inline styles in createYouTubeEmbedElement */
@@ -9712,9 +9648,40 @@ function setupClockOptionsWindow() {
                 user-select: none;
                 -webkit-user-select: none; /* For Safari */
             }
+
+            /* Multi-Quote Checkbox Styling */
+            .otk-multiquote-checkbox-wrapper {
+                display: inline-block;
+                margin-left: 8px;
+                visibility: hidden; /* Hidden by default */
+            }
+            .otk-multiquote-checkbox-wrapper.visible,
+            .otk-multiquote-checkbox-wrapper.selected {
+                visibility: visible;
+            }
+            .otk-multiquote-checkbox {
+                vertical-align: middle;
+            }
+
+            /* Quick Reply Theming */
+            #quickReply {
+                background-color: var(--otk-qr-bg-color) !important;
+                border: 1px solid var(--otk-qr-border-color) !important;
+            }
+            #quickReply .move, #qrHeader, #quickReply > div:first-child { /* Header */
+                background-color: var(--otk-qr-header-bg-color) !important;
+                color: var(--otk-qr-header-text-color) !important;
+            }
+            #quickReply .move a, #qrHeader a, #quickReply > div:first-child a { /* Header links */
+                color: var(--otk-qr-header-text-color) !important;
+            }
+            #quickReply textarea[name="com"] {
+                background-color: var(--otk-qr-textarea-bg-color) !important;
+                color: var(--otk-qr-textarea-text-color) !important;
+            }
         `;
         document.head.appendChild(styleElement);
-        consoleLog("Injected CSS for anchored messages.");
+        consoleLog("Injected CSS for anchored messages and multi-quote.");
 
         await applyMainTheme();
         setupOptionsWindow(); // Call to create the options window shell and event listeners
@@ -10031,3 +9998,4 @@ function setupClockOptionsWindow() {
     }
 
 })();
+
