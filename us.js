@@ -2582,7 +2582,7 @@ function _createMediaPopupMenu(options) {
     };
 
     menu.appendChild(createMenuItem('Download', downloadHandler));
-    menu.appendChild(createMenuItem('Toggle Full Size', resizeHandler));
+    menu.appendChild(createMenuItem('Toggle Original Size', resizeHandler));
     if (isImage) {
         menu.appendChild(createMenuItem('Toggle Blur', blurHandler));
     }
@@ -2727,7 +2727,7 @@ function _populateAttachmentDivWithMedia(
             const tnW = message.attachment.tn_w;
             const aspectRatio = fullsizeWidth / fullsizeHeight;
             const defaultToThumbnail = !((fullsizeWidth <= 800 && fullsizeHeight <= 600) || aspectRatio > 3 || tnW < 75);
-            
+
             setImageProperties = (mode) => {
                 img.dataset.mode = mode;
                 let isThumb = (mode === 'thumb');
@@ -2768,10 +2768,21 @@ function _populateAttachmentDivWithMedia(
             setImageProperties(defaultToThumbnail ? 'thumb' : 'full');
             uniqueImageViewerHashes.add(filehash);
 
+            const maxHeightConstraint = isTopLevelMessage ? 400 : 350;
+            const skipFullView = (message.attachment.h < maxHeightConstraint * 1.2) && (message.attachment.w < 1200);
+
             img.addEventListener('click', () => {
                 const currentMode = img.dataset.mode;
-                if (currentMode === 'thumb') setImageProperties('full');
-                else setImageProperties('thumb');
+                let nextMode;
+
+                if (currentMode === 'thumb') {
+                    nextMode = skipFullView ? 'original' : 'full';
+                } else if (currentMode === 'full') {
+                    nextMode = 'original';
+                } else { // This covers 'original' and any other case, cycling back to thumb
+                    nextMode = 'thumb';
+                }
+                setImageProperties(nextMode);
             });
             img.addEventListener('setImageProperties', (e) => {
                 setImageProperties(e.detail.mode);
@@ -2828,7 +2839,7 @@ function _populateAttachmentDivWithMedia(
         const vSpan = document.createElement('span');
         vSpan.textContent = '☰';
         vSpan.style.cssText = "cursor: pointer; color: var(--otk-media-menu-icon-color, #ff8040); font-weight: bold;";
-        
+
         const downloadHandler = () => {
             const url = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
             GM_xmlhttpRequest({
@@ -4825,6 +4836,11 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             } else {
                 consoleWarn('[Clear] otkMediaDB not initialized, skipping IndexedDB clear.');
             }
+
+            // Re-initialize DB and loading screen after clearing, before refreshing.
+            // This ensures the handles are valid.
+            await initDB();
+            setupLoadingScreen();
 
             consoleLog('[Clear] Calling refreshThreadsAndMessages to repopulate data (viewer updates will be skipped by refresh function)...');
             await refreshThreadsAndMessages({ skipViewerUpdate: true, isChildCall: true });
