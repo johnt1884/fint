@@ -204,10 +204,10 @@ document.addEventListener("visibilitychange", () => {
         overlay.id = 'otk-loading-overlay';
         overlay.style.cssText = `
             position: fixed;
-            top: 86px; /* Height of otkGuiWrapper (85px) + border (1px) */
+            top: 89px; /* Height of otkGuiWrapper (85px) + border (4px) */
             left: 0;
             width: 100%;
-            height: calc(100vh - 86px); /* Full viewport height minus GUI height */
+            height: calc(100vh - 89px); /* Full viewport height minus GUI height */
             background-color: rgba(var(--otk-loading-overlay-bg-rgb, 0,0,0), var(--otk-loading-overlay-opacity, 0.8)); /* Use CSS variables */
             z-index: 100000; /* Ensure it's on top of everything, including viewer */
             display: none; /* Hidden by default */
@@ -852,7 +852,7 @@ function createTweetEmbedElement(tweetId) {
             position: fixed;
             top: 0;
             left: 0;
-            width: 100vw;
+            right: 0;
             height: 89px; /* 85px for GUI + 4px for border */
             z-index: 9999;
             background: var(--otk-gui-bg-color);
@@ -890,6 +890,7 @@ function createTweetEmbedElement(tweetId) {
         `;
         otkGuiWrapper.appendChild(borderDiv);
         document.body.style.paddingTop = '89px';
+        document.body.style.margin = '0';
         document.body.insertBefore(otkGuiWrapper, document.body.firstChild);
 
         // Thread display container (left)
@@ -1044,8 +1045,8 @@ function createTweetEmbedElement(tweetId) {
         `;
         otkGui.appendChild(buttonContainer);
     } else { // If GUI wrapper exists, ensure consistency
-        if (document.body.style.paddingTop !== '86px') {
-            document.body.style.paddingTop = '86px';
+        if (document.body.style.paddingTop !== '89px') {
+            document.body.style.paddingTop = '89px';
         }
 
         if (!otkGui) { // Re-create otkGui if missing
@@ -4908,10 +4909,10 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
 
         otkViewer.style.cssText = `
             position: fixed;
-            top: 86px;
+            top: 89px;
             left: 0;
             width: 100vw;
-            height: calc(100vh - 86px);
+            height: calc(100vh - 89px);
             bottom: 0;
             /* background-color: #181818; */ /* New background color - replaced by variable below */
             opacity: 1; /* Ensure full opacity */
@@ -5215,7 +5216,7 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
     clockElement.id = 'otk-clock';
     clockElement.style.cssText = `
         position: fixed;
-        top: 86px;
+        top: 89px;
         right: 10px;
         background-color: var(--otk-clock-bg-color);
         color: var(--otk-clock-text-color, var(--otk-gui-text-color));
@@ -6635,10 +6636,10 @@ function applyThemeSettings(options = {}) {
             pipBackground = document.createElement('div');
             pipBackground.id = 'otk-pip-background';
             pipBackground.style.position = 'fixed';
-            pipBackground.style.top = '86px';
+            pipBackground.style.top = '89px';
             pipBackground.style.left = '50vw';
             pipBackground.style.width = '50vw';
-            pipBackground.style.height = 'calc(100% - 86px)';
+            pipBackground.style.height = 'calc(100% - 89px)';
             pipBackground.style.zIndex = '9997';
             document.body.appendChild(pipBackground);
         }
@@ -6677,12 +6678,12 @@ function applyThemeSettings(options = {}) {
             position: fixed;
             top: 0;
             left: 0;
-            width: 100%;
-            height: 100%;
+            width: 100vw;
+            height: 100vh;
             background-color: #2c2c2c; /* Slightly lighter than GUI for distinction */
             border: none;
             border-radius: 0;
-            z-index: 10000; /* Below loading screen, above viewer/GUI */
+            z-index: 100002; /* Above clock, loading screen, etc. */
             display: none; /* Hidden by default */
             flex-direction: column;
             color: var(--otk-options-text-color); /* Use specific variable for options window text */
@@ -6753,7 +6754,7 @@ function applyThemeSettings(options = {}) {
         const contentArea = document.createElement('div');
         contentArea.id = 'otk-options-content';
         contentArea.style.cssText = `
-            padding: 15px 0; /* Top, Right (0), Bottom, Left (0) */
+            padding: 15px 0; /* Let child elements handle horizontal padding */
             flex-grow: 1; /* Allows content to fill space */
             overflow-y: auto; /* If content gets too long */
             box-sizing: border-box; /* Ensure padding is included in width/height */
@@ -6775,13 +6776,15 @@ function applyThemeSettings(options = {}) {
             flex-direction: column;
             gap: 10px; /* Space between general option groups */
             margin-bottom: 15px; /* Space before the theme section */
-            padding: 0 10px 0 20px;
+            padding: 0;
             box-sizing: border-box; /* Ensure padding is included if not already part of a width calc */
         `;
         contentArea.appendChild(generalSettingsSection); // Add general settings section first
 
         // Add a heading for the General Settings section using the helper
-        generalSettingsSection.appendChild(createSectionHeading('General Settings'));
+        const generalSettingsHeading = createSectionHeading('General Settings');
+        generalSettingsHeading.style.padding = '0 12px';
+        generalSettingsSection.appendChild(generalSettingsHeading);
 
         // --- Tracked Keyword(s) Option ---
         const trackedKeywordsGroup = document.createElement('div');
@@ -6793,7 +6796,7 @@ function applyThemeSettings(options = {}) {
         trackedKeywordsLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const trackedKeywordsControlsWrapper = document.createElement('div');
-        trackedKeywordsControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
+        trackedKeywordsControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; grid-column: 2 / 5;";
 
         const trackedKeywordsInput = document.createElement('input');
         trackedKeywordsInput.type = 'text';
@@ -6830,7 +6833,7 @@ function applyThemeSettings(options = {}) {
         blockedKeywordsLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const blockedKeywordsControlsWrapper = document.createElement('div');
-        blockedKeywordsControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
+        blockedKeywordsControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; grid-column: 2 / 5;";
 
         const blockedKeywordsInput = document.createElement('input');
         blockedKeywordsInput.type = 'text';
@@ -6863,21 +6866,17 @@ function applyThemeSettings(options = {}) {
             label.htmlFor = `otk-${idSuffix}-input`;
             label.style.cssText = "font-size: 12px; text-align: left;";
 
-            const controlsWrapper = document.createElement('div');
-            controlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
-
             const timeInput = document.createElement('input');
             timeInput.type = 'text';
             timeInput.id = `otk-${idSuffix}-input`;
             timeInput.placeholder = "hh:mm:ss";
             timeInput.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
-            
+
             const savedSeconds = localStorage.getItem(storageKey);
             timeInput.value = secondsToHHMMSS(savedSeconds !== null ? savedSeconds : defaultValueSeconds);
 
             timeInput.addEventListener('change', () => {
                 const seconds = hhmmssToSeconds(timeInput.value);
-                // Basic validation, if parsing fails, revert to default
                 if (seconds === 0 && timeInput.value !== '00:00:00') {
                     timeInput.value = secondsToHHMMSS(defaultValueSeconds);
                     localStorage.setItem(storageKey, defaultValueSeconds);
@@ -6888,15 +6887,35 @@ function applyThemeSettings(options = {}) {
                 }
             });
 
-            controlsWrapper.appendChild(timeInput);
+            const upButton = document.createElement('button');
+            upButton.textContent = '▲';
+            upButton.style.cssText = "width: 25px; height: 25px; padding: 0; font-size: 10px;";
+
+            const downButton = document.createElement('button');
+            downButton.textContent = '▼';
+            downButton.style.cssText = "width: 25px; height: 25px; padding: 0; font-size: 10px;";
+
+            const handleArrowClick = (amount) => {
+                let currentSeconds = hhmmssToSeconds(timeInput.value);
+                currentSeconds += amount;
+                if (currentSeconds < 0) currentSeconds = 0;
+                timeInput.value = secondsToHHMMSS(currentSeconds);
+                timeInput.dispatchEvent(new Event('change'));
+            };
+
+            upButton.addEventListener('click', () => handleArrowClick(10));
+            downButton.addEventListener('click', () => handleArrowClick(-10));
+
             group.appendChild(label);
-            group.appendChild(controlsWrapper);
+            group.appendChild(timeInput);
+            group.appendChild(upButton);
+            group.appendChild(downButton);
             return group;
         };
-        
+
         // Minimum update time
         generalSettingsSection.appendChild(createTimeInputRow({
-            labelText: "Minimum time between updates:",
+            labelText: "Minimum Time Between Updates:",
             storageKey: 'otkMinUpdateSeconds',
             defaultValueSeconds: 10,
             idSuffix: 'min-update-time'
@@ -6904,7 +6923,7 @@ function applyThemeSettings(options = {}) {
 
         // Maximum update time
         generalSettingsSection.appendChild(createTimeInputRow({
-            labelText: "Maximum time between updates:",
+            labelText: "Maximum Time Between Updates:",
             storageKey: 'otkMaxUpdateSeconds',
             defaultValueSeconds: 300, // 5 minutes
             idSuffix: 'max-update-time'
@@ -6915,16 +6934,16 @@ function applyThemeSettings(options = {}) {
         suspendGroup.classList.add('otk-option-row');
 
         const suspendLabel = document.createElement('label');
-        suspendLabel.textContent = "Suspend after inactivity:";
+        suspendLabel.textContent = "Suspend After Inactivity:";
         suspendLabel.htmlFor = 'otk-suspend-after-inactive-select';
         suspendLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const suspendControlsWrapper = document.createElement('div');
-        suspendControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
+        suspendControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; grid-column: 2 / 5;";
 
         const suspendSelect = document.createElement('select');
         suspendSelect.id = 'otk-suspend-after-inactive-select';
-        suspendSelect.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px;";
+        suspendSelect.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align-last: right;";
 
         const suspendOptions = ["Disabled", "1", "5", "10", "15", "30", "60"];
         suspendOptions.forEach(opt => {
@@ -6956,11 +6975,11 @@ function applyThemeSettings(options = {}) {
         mediaLoadModeLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const mediaLoadModeControlsWrapper = document.createElement('div');
-        mediaLoadModeControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
+        mediaLoadModeControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; grid-column: 2 / 5;";
 
         const mediaLoadModeSelect = document.createElement('select');
         mediaLoadModeSelect.id = 'otk-media-load-mode-select';
-        mediaLoadModeSelect.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px;";
+        mediaLoadModeSelect.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align-last: right;";
 
         const mediaLoadOptions = [
             { label: 'Source First (Default)', value: 'source_first' },
@@ -6987,73 +7006,90 @@ function applyThemeSettings(options = {}) {
         mediaLoadModeGroup.appendChild(mediaLoadModeControlsWrapper);
         generalSettingsSection.appendChild(mediaLoadModeGroup);
 
-        // --- Message Limiting Feature (Moved & Restyled) ---
+        // --- Message Limiting Feature (Refactored) ---
         const messageLimitGroup = document.createElement('div');
         messageLimitGroup.classList.add('otk-option-row');
-        messageLimitGroup.style.alignItems = "flex-start"; // Special case for this multi-line control
 
         const messageLimitLabel = document.createElement('label');
         messageLimitLabel.textContent = "Limit Number of Messages:";
-        messageLimitLabel.style.cssText = "font-size: 12px; text-align: left; padding-top: 5px;";
-
-        const messageLimitControlsWrapper = document.createElement('div');
-        messageLimitControlsWrapper.style.cssText = "display: flex; flex-direction: column; align-items: flex-end; gap: 5px;";
-        
-        const inputAndButtonRow = document.createElement('div');
-        inputAndButtonRow.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; justify-content: flex-end;";
+        messageLimitLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const messageLimitInput = document.createElement('input');
-        messageLimitInput.type = 'number';
+        messageLimitInput.type = 'text'; // Changed to text
         messageLimitInput.id = 'otk-message-limit-input';
-        messageLimitInput.min = '1';
-        messageLimitInput.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right; max-width: 138px;";
-        
+        messageLimitInput.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
+
         const initialThemeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-        messageLimitInput.value = initialThemeSettings.otkMessageLimitValue || '500';
+        if (initialThemeSettings.otkMessageLimitEnabled === false) {
+            messageLimitInput.value = 'disabled';
+        } else {
+            messageLimitInput.value = initialThemeSettings.otkMessageLimitValue || '500';
+        }
 
-        const defaultBtn = document.createElement('button');
-        defaultBtn.textContent = 'Default';
-        defaultBtn.style.cssText = "padding: 2px 6px; height: 25px; font-size: 11px; box-sizing: border-box;";
-        defaultBtn.addEventListener('click', () => {
-            messageLimitInput.value = '500';
-            saveThemeSetting('otkMessageLimitValue', '500', true);
-        });
-        
-        inputAndButtonRow.appendChild(messageLimitInput);
-        inputAndButtonRow.appendChild(defaultBtn);
+        const upButton = document.createElement('button');
+        upButton.textContent = '▲';
+        upButton.style.cssText = "width: 25px; height: 25px; padding: 0; font-size: 10px;";
 
-        const checkboxRow = document.createElement('div');
-        checkboxRow.style.cssText = "display: flex; align-items: center; gap: 5px;";
+        const downButton = document.createElement('button');
+        downButton.textContent = '▼';
+        downButton.style.cssText = "width: 25px; height: 25px; padding: 0; font-size: 10px;";
 
-        const messageLimitCheckbox = document.createElement('input');
-        messageLimitCheckbox.type = 'checkbox';
-        messageLimitCheckbox.id = 'otk-message-limit-checkbox';
-        messageLimitCheckbox.style.cssText = "height: 16px; width: 16px;";
-        messageLimitCheckbox.checked = initialThemeSettings.otkMessageLimitEnabled !== false;
-        messageLimitInput.disabled = !messageLimitCheckbox.checked;
-        
-        const checkboxLabel = document.createElement('label');
-        checkboxLabel.textContent = "Enabled";
-        checkboxLabel.htmlFor = 'otk-message-limit-checkbox';
-        checkboxLabel.style.fontSize = "12px";
+        const handleArrowClick = (direction) => {
+            let currentValue = messageLimitInput.value;
+            let newValue;
 
-        checkboxRow.appendChild(checkboxLabel);
-        checkboxRow.appendChild(messageLimitCheckbox);
+            if (currentValue === 'disabled') {
+                if (direction === 'up') {
+                    newValue = 0;
+                } else {
+                    return; // Do nothing on down arrow if disabled
+                }
+            } else {
+                let numValue = parseInt(currentValue, 10);
+                if (isNaN(numValue)) numValue = 500; // Default if invalid
 
-        messageLimitCheckbox.addEventListener('change', () => {
-            const isEnabled = messageLimitCheckbox.checked;
-            saveThemeSetting('otkMessageLimitEnabled', isEnabled, true);
-            messageLimitInput.disabled = !isEnabled;
-        });
+                if (direction === 'up') {
+                    newValue = numValue + 1;
+                } else { // down
+                    if (numValue > 0) {
+                        newValue = numValue - 1;
+                    } else { // numValue is 0 or less
+                        newValue = 'disabled';
+                    }
+                }
+            }
+            messageLimitInput.value = newValue;
+            messageLimitInput.dispatchEvent(new Event('change'));
+        };
+
+        upButton.addEventListener('click', () => handleArrowClick('up'));
+        downButton.addEventListener('click', () => handleArrowClick('down'));
 
         messageLimitInput.addEventListener('change', () => {
-            saveThemeSetting('otkMessageLimitValue', messageLimitInput.value, true);
+            const value = messageLimitInput.value;
+            if (value === 'disabled') {
+                saveThemeSetting('otkMessageLimitEnabled', false, true);
+            } else {
+                const numValue = parseInt(value, 10);
+                if (!isNaN(numValue) && numValue >= 0) {
+                    saveThemeSetting('otkMessageLimitEnabled', true, true);
+                    saveThemeSetting('otkMessageLimitValue', String(numValue), true);
+                } else {
+                    // Revert to saved state if input is invalid
+                    const savedSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+                    if (savedSettings.otkMessageLimitEnabled === false) {
+                        messageLimitInput.value = 'disabled';
+                    } else {
+                        messageLimitInput.value = savedSettings.otkMessageLimitValue || '500';
+                    }
+                }
+            }
         });
 
-        messageLimitControlsWrapper.appendChild(inputAndButtonRow);
-        messageLimitControlsWrapper.appendChild(checkboxRow);
         messageLimitGroup.appendChild(messageLimitLabel);
-        messageLimitGroup.appendChild(messageLimitControlsWrapper);
+        messageLimitGroup.appendChild(messageLimitInput);
+        messageLimitGroup.appendChild(upButton);
+        messageLimitGroup.appendChild(downButton);
         generalSettingsSection.appendChild(messageLimitGroup);
 
 
@@ -7067,7 +7103,7 @@ function applyThemeSettings(options = {}) {
         debugToggleLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const debugToggleControlsWrapper = document.createElement('div');
-        debugToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
+        debugToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end; grid-column: 2 / 5;";
 
         const debugToggleCheckbox = document.createElement('input');
         debugToggleCheckbox.type = 'checkbox';
@@ -7101,7 +7137,7 @@ function applyThemeSettings(options = {}) {
         bgUpdateLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const bgUpdateControlsWrapper = document.createElement('div');
-        bgUpdateControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
+        bgUpdateControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end; grid-column: 2 / 5;";
 
         const bgUpdateCheckbox = document.createElement('input');
         bgUpdateCheckbox.type = 'checkbox';
@@ -7144,7 +7180,7 @@ function applyThemeSettings(options = {}) {
         clockToggleLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const clockToggleControlsWrapper = document.createElement('div');
-        clockToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
+        clockToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end; grid-column: 2 / 5;";
 
         const clockToggleCheckbox = document.createElement('input');
         clockToggleCheckbox.type = 'checkbox';
@@ -7177,7 +7213,7 @@ function applyThemeSettings(options = {}) {
         pipToggleLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const pipToggleControlsWrapper = document.createElement('div');
-        pipToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
+        pipToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end; grid-column: 2 / 5;";
 
         const pipToggleCheckbox = document.createElement('input');
         pipToggleCheckbox.type = 'checkbox';
@@ -7214,7 +7250,7 @@ function applyThemeSettings(options = {}) {
             display: flex;
             flex-direction: column;
             gap: 10px; /* Space between color option groups */
-            padding: 0 10px 0 20px;
+            padding: 0;
             box-sizing: border-box;
         `;
         // Add a heading for the section (optional)
@@ -7227,6 +7263,8 @@ function applyThemeSettings(options = {}) {
             padding-bottom: 5px;
             cursor: pointer;
             user-select: none;
+            padding-left: 12px;
+            padding-right: 12px;
         `;
         themeSection.appendChild(themeSectionHeading);
 
@@ -7241,7 +7279,7 @@ function applyThemeSettings(options = {}) {
             /* gap: 10px; Will be handled by margins/padding of new structure or individual rows */
             max-height: 300px; /* Adjusted from themeSection's previous max-height */
             overflow-y: auto;
-            padding-right: 20px; /* Further Increased right padding for scrollbar clearance (15px + 5px) */
+            /* padding-right: 20px; */ /* This was preventing full-width backgrounds. Scrollbar will now overlay content. */
             box-sizing: border-box; /* Ensure padding is included */
             /* padding-left: 5px; */ /* Minor padding for content - Remains Removed, covered by contentArea */
         `;
@@ -7313,14 +7351,7 @@ function applyThemeSettings(options = {}) {
             // options = { labelText, storageKey, cssVariable, defaultValue, inputType ('color'|'number'), unit ('px'|null), min, max, idSuffix }
             const group = document.createElement('div');
             group.classList.add('otk-option-row');
-            // Using Flexbox for more dynamic sizing
-            group.style.cssText = `
-                display: flex;
-                align-items: center; /* Vertically align label and controls-wrapper */
-                gap: 8px; /* Space between label and controls-wrapper */
-                width: 100%;
-                margin-bottom: 5px;
-            `;
+            group.style.marginBottom = '5px'; // Keep margin
 
             const label = document.createElement('label');
             label.textContent = options.labelText;
@@ -7328,14 +7359,12 @@ function applyThemeSettings(options = {}) {
             label.style.cssText = `
                 font-size: 12px;
                 text-align: left;
-                flex-grow: 1; /* Allow label to take up remaining space */
             `;
 
             // Create a wrapper for all controls (hex, main input, button)
             const controlsWrapperDiv = document.createElement('div');
             controlsWrapperDiv.style.cssText = `
                 display: flex;
-                width: 25%;
                 align-items: center; /* Vertically align controls */
                 gap: 8px; /* Space between controls */
                 min-width: 0; /* Allow shrinking if needed */
@@ -7570,7 +7599,9 @@ function applyThemeSettings(options = {}) {
 
             const content = document.createElement('div');
             content.style.display = 'none';
-            content.style.paddingLeft = '20px';
+            content.style.paddingLeft = '0px';
+            content.style.width = '100%';
+            content.style.boxSizing = 'border-box';
 
             heading.addEventListener('click', () => {
                 const isHidden = content.style.display === 'none';
@@ -9753,11 +9784,17 @@ function setupClockOptionsWindow() {
                 color: var(--otk-qr-textarea-text-color) !important;
             }
             .otk-option-row {
-                display: flex;
-                justify-content: space-between;
+                display: grid;
+                grid-template-columns: 240px 1fr 25px 25px;
+                gap: 4px;
                 align-items: center;
-                padding: 8px 10px 8px 20px; /* Increased vertical padding */
-                margin: 0; /* Removed margin to let padding handle spacing */
+                padding: 4px 10px;
+                margin: 0;
+                width: 100%;
+                box-sizing: border-box;
+            }
+            .otk-option-row > label {
+                white-space: nowrap;
             }
             .otk-option-row:nth-child(even) {
                 background-color: #383838;
@@ -9861,6 +9898,9 @@ function setupClockOptionsWindow() {
         }
 
         setInterval(updateClockTimes, 1000);
+
+        // Final re-render of clocks to ensure they are populated correctly
+        renderClocks();
 
         function handleActivity() {
             lastActivityTimestamp = Date.now();
