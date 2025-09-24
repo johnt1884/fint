@@ -6693,7 +6693,7 @@ function applyThemeSettings(options = {}) {
         titleBar.id = 'otk-options-title-bar';
         titleBar.style.cssText = `
             padding: 8px 12px;
-            background-color: #383838;
+            background-color: var(--otk-gui-bg-color);
             color: #f0f0f0;
             font-weight: bold;
             border-bottom: 1px solid #444;
@@ -6796,13 +6796,12 @@ function applyThemeSettings(options = {}) {
         trackedKeywordsLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const trackedKeywordsControlsWrapper = document.createElement('div');
-        trackedKeywordsControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; grid-column: 2 / 5;";
+        trackedKeywordsControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px;"; // Removed grid-column
 
         const trackedKeywordsInput = document.createElement('input');
         trackedKeywordsInput.type = 'text';
         trackedKeywordsInput.id = 'otk-tracked-keywords-input';
         trackedKeywordsInput.placeholder = "e.g., otk, item2, phrase three";
-        // Explicitly set width to 100% of its parent wrapper and right-align text.
         trackedKeywordsInput.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
         trackedKeywordsInput.value = localStorage.getItem(OTK_TRACKED_KEYWORDS_KEY) || "otk"; // Load saved value or default
 
@@ -6833,7 +6832,7 @@ function applyThemeSettings(options = {}) {
         blockedKeywordsLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const blockedKeywordsControlsWrapper = document.createElement('div');
-        blockedKeywordsControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; grid-column: 2 / 5;";
+        blockedKeywordsControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px;";
 
         const blockedKeywordsInput = document.createElement('input');
         blockedKeywordsInput.type = 'text';
@@ -6906,10 +6905,16 @@ function applyThemeSettings(options = {}) {
             upButton.addEventListener('click', () => handleArrowClick(10));
             downButton.addEventListener('click', () => handleArrowClick(-10));
 
+            const controlsWrapper = document.createElement('div');
+            controlsWrapper.style.cssText = "display: flex; align-items: center; gap: 4px;";
+            timeInput.style.flexGrow = '1';
+
+            controlsWrapper.appendChild(timeInput);
+            controlsWrapper.appendChild(upButton);
+            controlsWrapper.appendChild(downButton);
+
             group.appendChild(label);
-            group.appendChild(timeInput);
-            group.appendChild(upButton);
-            group.appendChild(downButton);
+            group.appendChild(controlsWrapper);
             return group;
         };
 
@@ -6938,12 +6943,9 @@ function applyThemeSettings(options = {}) {
         suspendLabel.htmlFor = 'otk-suspend-after-inactive-select';
         suspendLabel.style.cssText = "font-size: 12px; text-align: left;";
 
-        const suspendControlsWrapper = document.createElement('div');
-        suspendControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; grid-column: 2 / 5;";
-
         const suspendSelect = document.createElement('select');
         suspendSelect.id = 'otk-suspend-after-inactive-select';
-        suspendSelect.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align-last: right;";
+        suspendSelect.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align-last: right;";
 
         const suspendOptions = ["Disabled", "1", "5", "10", "15", "30", "60"];
         suspendOptions.forEach(opt => {
@@ -6960,9 +6962,8 @@ function applyThemeSettings(options = {}) {
             consoleLog(`Suspend after inactive time saved: ${suspendSelect.value}`);
         });
 
-        suspendControlsWrapper.appendChild(suspendSelect);
         suspendGroup.appendChild(suspendLabel);
-        suspendGroup.appendChild(suspendControlsWrapper);
+        suspendGroup.appendChild(suspendSelect);
         generalSettingsSection.appendChild(suspendGroup);
 
         // --- Media Load Mode Option ---
@@ -6974,12 +6975,9 @@ function applyThemeSettings(options = {}) {
         mediaLoadModeLabel.htmlFor = 'otk-media-load-mode-select';
         mediaLoadModeLabel.style.cssText = "font-size: 12px; text-align: left;";
 
-        const mediaLoadModeControlsWrapper = document.createElement('div');
-        mediaLoadModeControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; grid-column: 2 / 5;";
-
         const mediaLoadModeSelect = document.createElement('select');
         mediaLoadModeSelect.id = 'otk-media-load-mode-select';
-        mediaLoadModeSelect.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align-last: right;";
+        mediaLoadModeSelect.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align-last: right;";
 
         const mediaLoadOptions = [
             { label: 'Source First (Default)', value: 'source_first' },
@@ -7001,9 +6999,8 @@ function applyThemeSettings(options = {}) {
             alert('Media loading preference saved. This will take effect for newly rendered messages.');
         });
 
-        mediaLoadModeControlsWrapper.appendChild(mediaLoadModeSelect);
         mediaLoadModeGroup.appendChild(mediaLoadModeLabel);
-        mediaLoadModeGroup.appendChild(mediaLoadModeControlsWrapper);
+        mediaLoadModeGroup.appendChild(mediaLoadModeSelect);
         generalSettingsSection.appendChild(mediaLoadModeGroup);
 
         // --- Message Limiting Feature (Refactored) ---
@@ -7086,45 +7083,17 @@ function applyThemeSettings(options = {}) {
             }
         });
 
+        const messageLimitControlsWrapper = document.createElement('div');
+        messageLimitControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 4px;";
+        messageLimitInput.style.flexGrow = "1";
+
+        messageLimitControlsWrapper.appendChild(messageLimitInput);
+        messageLimitControlsWrapper.appendChild(upButton);
+        messageLimitControlsWrapper.appendChild(downButton);
+
         messageLimitGroup.appendChild(messageLimitLabel);
-        messageLimitGroup.appendChild(messageLimitInput);
-        messageLimitGroup.appendChild(upButton);
-        messageLimitGroup.appendChild(downButton);
+        messageLimitGroup.appendChild(messageLimitControlsWrapper);
         generalSettingsSection.appendChild(messageLimitGroup);
-
-
-        // --- Debugging Toggle Option ---
-        const debugToggleGroup = document.createElement('div');
-        debugToggleGroup.classList.add('otk-option-row');
-
-        const debugToggleLabel = document.createElement('label');
-        debugToggleLabel.textContent = "Enable Console Debugging:";
-        debugToggleLabel.htmlFor = 'otk-debug-mode-checkbox';
-        debugToggleLabel.style.cssText = "font-size: 12px; text-align: left;";
-
-        const debugToggleControlsWrapper = document.createElement('div');
-        debugToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end; grid-column: 2 / 5;";
-
-        const debugToggleCheckbox = document.createElement('input');
-        debugToggleCheckbox.type = 'checkbox';
-        debugToggleCheckbox.id = 'otk-debug-mode-checkbox';
-        // Specific styling for checkbox
-        debugToggleCheckbox.style.cssText = "height: 16px; width: 16px;";
-        debugToggleCheckbox.checked = DEBUG_MODE;
-
-        debugToggleCheckbox.addEventListener('change', () => {
-            DEBUG_MODE = debugToggleCheckbox.checked;
-            localStorage.setItem(DEBUG_MODE_KEY, DEBUG_MODE.toString());
-            consoleLog(`Debug mode ${DEBUG_MODE ? 'enabled' : 'disabled'}.`);
-            if (DEBUG_MODE) {
-                 consoleLog('[OTK Tracker]', `Debug mode explicitly enabled via UI.`);
-            }
-        });
-
-        debugToggleControlsWrapper.appendChild(debugToggleCheckbox);
-        debugToggleGroup.appendChild(debugToggleLabel);
-        debugToggleGroup.appendChild(debugToggleControlsWrapper);
-        generalSettingsSection.appendChild(debugToggleGroup);
 
 
         // --- Disable Background Updates Option ---
@@ -7137,7 +7106,7 @@ function applyThemeSettings(options = {}) {
         bgUpdateLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const bgUpdateControlsWrapper = document.createElement('div');
-        bgUpdateControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end; grid-column: 2 / 5;";
+        bgUpdateControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
 
         const bgUpdateCheckbox = document.createElement('input');
         bgUpdateCheckbox.type = 'checkbox';
@@ -7180,7 +7149,7 @@ function applyThemeSettings(options = {}) {
         clockToggleLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const clockToggleControlsWrapper = document.createElement('div');
-        clockToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end; grid-column: 2 / 5;";
+        clockToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
 
         const clockToggleCheckbox = document.createElement('input');
         clockToggleCheckbox.type = 'checkbox';
@@ -7213,7 +7182,7 @@ function applyThemeSettings(options = {}) {
         pipToggleLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const pipToggleControlsWrapper = document.createElement('div');
-        pipToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end; grid-column: 2 / 5;";
+        pipToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
 
         const pipToggleCheckbox = document.createElement('input');
         pipToggleCheckbox.type = 'checkbox';
@@ -7236,6 +7205,38 @@ function applyThemeSettings(options = {}) {
         generalSettingsSection.appendChild(pipToggleGroup);
 
 
+        // --- Debugging Toggle Option ---
+        const debugToggleGroup = document.createElement('div');
+        debugToggleGroup.classList.add('otk-option-row');
+
+        const debugToggleLabel = document.createElement('label');
+        debugToggleLabel.textContent = "Enable Console Debugging:";
+        debugToggleLabel.htmlFor = 'otk-debug-mode-checkbox';
+        debugToggleLabel.style.cssText = "font-size: 12px; text-align: left;";
+
+        const debugToggleControlsWrapper = document.createElement('div');
+        debugToggleControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
+
+        const debugToggleCheckbox = document.createElement('input');
+        debugToggleCheckbox.type = 'checkbox';
+        debugToggleCheckbox.id = 'otk-debug-mode-checkbox';
+        // Specific styling for checkbox
+        debugToggleCheckbox.style.cssText = "height: 16px; width: 16px;";
+        debugToggleCheckbox.checked = DEBUG_MODE;
+
+        debugToggleCheckbox.addEventListener('change', () => {
+            DEBUG_MODE = debugToggleCheckbox.checked;
+            localStorage.setItem(DEBUG_MODE_KEY, DEBUG_MODE.toString());
+            consoleLog(`Debug mode ${DEBUG_MODE ? 'enabled' : 'disabled'}.`);
+            if (DEBUG_MODE) {
+                 consoleLog('[OTK Tracker]', `Debug mode explicitly enabled via UI.`);
+            }
+        });
+
+        debugToggleControlsWrapper.appendChild(debugToggleCheckbox);
+        debugToggleGroup.appendChild(debugToggleLabel);
+        debugToggleGroup.appendChild(debugToggleControlsWrapper);
+        generalSettingsSection.appendChild(debugToggleGroup);
         // --- Theme/Appearance Section ---
         // This section will now be added after the general settings.
         // The 'sectionsContainer' might be redundant if themeSection is the only thing in it.
@@ -8240,8 +8241,8 @@ function applyThemeSettings(options = {}) {
             height: 25px;
             box-sizing: border-box;
             font-size: 12px;
-            text-align: center;
-            text-align-last: center;
+            text-align: right;
+            text-align-last: right;
         `;
         const tweetEmbedOptions = [
             { label: 'Disabled', value: 'disabled' },
@@ -8368,7 +8369,7 @@ function applyThemeSettings(options = {}) {
         // Dropdown (Row 2, Col 1)
         const customThemesDropdown = document.createElement('select');
         customThemesDropdown.id = 'otk-custom-themes-dropdown';
-        customThemesDropdown.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: center; text-align-last: center;"; // Attempt to center-align
+        customThemesDropdown.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right; text-align-last: right;";
         // Needs explicit grid-column to go to the next row in the same column
         customThemesDropdown.style.gridColumn = '1 / 2';
 
@@ -9785,13 +9786,14 @@ function setupClockOptionsWindow() {
             }
             .otk-option-row {
                 display: grid;
-                grid-template-columns: 240px 1fr 25px 25px;
-                gap: 4px;
+                grid-template-columns: 240px 1fr;
+                gap: 8px;
                 align-items: center;
-                padding: 4px 10px;
+                padding: 4px 10px 4px 5px;
                 margin: 0;
                 width: 100%;
                 box-sizing: border-box;
+                min-height: 35px;
             }
             .otk-option-row > label {
                 white-space: nowrap;
