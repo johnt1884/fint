@@ -6679,7 +6679,7 @@ function applyThemeSettings(options = {}) {
             position: fixed;
             top: 0;
             left: 0;
-            width: 100vw;
+            width: 50%;
             height: 100vh;
             background-color: #2c2c2c; /* Slightly lighter than GUI for distinction */
             border: none;
@@ -7810,10 +7810,9 @@ function applyThemeSettings(options = {}) {
         function createDropdownRow(options) {
             const group = document.createElement('div');
             group.classList.add('otk-option-row');
-            group.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
             const label = document.createElement('label');
             label.textContent = options.labelText;
-            label.style.cssText = "font-size: 12px; text-align: left; flex-grow: 1;";
+            label.style.cssText = "font-size: 12px; text-align: left;";
             const controlsWrapperDiv = document.createElement('div');
             controlsWrapperDiv.style.cssText = "display: flex; width: 100%; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
             const select = document.createElement('select');
@@ -9789,15 +9788,14 @@ function setupClockOptionsWindow() {
             }
             .otk-option-row {
                 display: grid;
-                grid-template-columns: 240px 450px;
+                grid-template-columns: 240px 1fr;
                 gap: 8px;
                 align-items: center;
-                padding: 4px 10px 4px 5px;
+                padding: 4px 10px 4px 12px;
                 margin: 0;
                 width: 100%;
                 box-sizing: border-box;
                 height: 35px;
-                justify-content: end;
             }
             .otk-option-row > label {
                 white-space: nowrap;
