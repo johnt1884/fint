@@ -6452,6 +6452,7 @@ function applyThemeSettings(options = {}) {
             align-items: center;
             gap: 8px;
             justify-content: flex-end;
+            width: 100%;
         `;
 
         const textInput = document.createElement('input');
@@ -6906,7 +6907,7 @@ function applyThemeSettings(options = {}) {
             downButton.addEventListener('click', () => handleArrowClick(-10));
 
             const controlsWrapper = document.createElement('div');
-            controlsWrapper.style.cssText = "display: flex; align-items: center; gap: 4px;";
+            controlsWrapper.style.cssText = "display: flex; align-items: center; gap: 4px; width: 100%;";
             timeInput.style.flexGrow = '1';
 
             controlsWrapper.appendChild(timeInput);
@@ -7321,6 +7322,7 @@ function applyThemeSettings(options = {}) {
                 display: flex;
                 align-items: center;
                 justify-content: flex-end; /* Align checkbox to the right */
+                width: 100%;
             `;
 
             const checkbox = document.createElement('input');
@@ -7370,6 +7372,7 @@ function applyThemeSettings(options = {}) {
                 gap: 8px; /* Space between controls */
                 min-width: 0; /* Allow shrinking if needed */
                 justify-content: flex-end;
+                width: 100%;
             `;
 
             let hexInput = null;
@@ -7812,7 +7815,7 @@ function applyThemeSettings(options = {}) {
             label.textContent = options.labelText;
             label.style.cssText = "font-size: 12px; text-align: left; flex-grow: 1;";
             const controlsWrapperDiv = document.createElement('div');
-            controlsWrapperDiv.style.cssText = "display: flex; width: 25%; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
+            controlsWrapperDiv.style.cssText = "display: flex; width: 100%; align-items: center; gap: 8px; min-width: 0; justify-content: flex-end;";
             const select = document.createElement('select');
             select.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align-last: right;";
             options.options.forEach(opt => {
@@ -9786,14 +9789,15 @@ function setupClockOptionsWindow() {
             }
             .otk-option-row {
                 display: grid;
-                grid-template-columns: 240px 1fr;
+                grid-template-columns: 240px 450px;
                 gap: 8px;
                 align-items: center;
                 padding: 4px 10px 4px 5px;
                 margin: 0;
                 width: 100%;
                 box-sizing: border-box;
-                min-height: 35px;
+                height: 35px;
+                justify-content: end;
             }
             .otk-option-row > label {
                 white-space: nowrap;
