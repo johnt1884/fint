@@ -6694,7 +6694,7 @@ function applyThemeSettings(options = {}) {
         const titleBar = document.createElement('div');
         titleBar.id = 'otk-options-title-bar';
         titleBar.style.cssText = `
-            padding: 8px 12px;
+            padding: 8px 30px;
             background-color: var(--otk-gui-bg-color);
             color: #f0f0f0;
             font-weight: bold;
@@ -6785,7 +6785,6 @@ function applyThemeSettings(options = {}) {
 
         // Add a heading for the General Settings section using the helper
         const generalSettingsHeading = createSectionHeading('General Settings');
-        generalSettingsHeading.style.padding = '0 12px';
         generalSettingsSection.appendChild(generalSettingsHeading);
 
         // --- Tracked Keyword(s) Option ---
@@ -7549,7 +7548,7 @@ function applyThemeSettings(options = {}) {
             const h = document.createElement('h5');
             h.textContent = text;
             // Adjusted margins for more space, removed border-bottom
-            h.style.cssText = "margin-top: 10px; margin-bottom: 15px; color: #cccccc; font-size: 13px; padding-bottom: 4px; font-weight: bold; text-align: left;";
+            h.style.cssText = "margin: 0; color: #cccccc; font-size: 13px; padding: 4px 10px 4px 30px; font-weight: bold; text-align: left; display: flex; align-items: center;";
             return h;
         }
 
@@ -7565,7 +7564,10 @@ function applyThemeSettings(options = {}) {
                 heading.style.marginBottom = "6px";
             }
 
+            heading.style.position = 'relative';
+
             const icon = document.createElement('span');
+            icon.style.cssText = 'position: absolute; left: 13px; top: 50%; transform: translateY(-50%);';
             icon.textContent = defaultCollapsed ? '► ' : '▼ ';
             heading.textContent = title;
             heading.insertBefore(icon, heading.firstChild);
@@ -9761,7 +9763,7 @@ function setupClockOptionsWindow() {
                 grid-template-columns: 240px 1fr;
                 gap: 8px;
                 align-items: center;
-                padding: 4px 10px 4px 12px;
+                padding: 4px 10px 4px 30px;
                 margin: 0;
                 width: 100%;
                 box-sizing: border-box;
