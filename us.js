@@ -6771,21 +6771,46 @@ function applyThemeSettings(options = {}) {
         // For now, let's keep it but add general settings directly to contentArea or sectionsContainer.
         // Let's add general settings directly to contentArea, above the theme section.
 
+        const generalSettingsContainer = document.createElement('div');
+        generalSettingsContainer.id = 'otk-general-settings-container';
+        generalSettingsContainer.style.cssText = `
+            margin-bottom: 15px;
+            padding: 0;
+            box-sizing: border-box;
+        `;
+        contentArea.appendChild(generalSettingsContainer);
+
+        const generalSettingsHeading = createSectionHeading('General Settings');
+        generalSettingsHeading.style.cursor = 'pointer';
+        generalSettingsHeading.style.position = 'relative'; // For icon positioning
+        // Vertically center the text content
+        generalSettingsHeading.style.display = 'flex';
+        generalSettingsHeading.style.alignItems = 'center';
+
+
+        const generalSettingsIcon = document.createElement('span');
+        generalSettingsIcon.style.cssText = 'position: absolute; left: 13px; top: 50%; transform: translateY(-50%);';
+        generalSettingsIcon.textContent = '▼ '; // Default to open
+        generalSettingsHeading.insertBefore(generalSettingsIcon, generalSettingsHeading.firstChild);
+
         const generalSettingsSection = document.createElement('div');
         generalSettingsSection.id = 'otk-general-settings-section';
         generalSettingsSection.style.cssText = `
-            display: flex;
+            display: flex; /* Default to open */
             flex-direction: column;
-            gap: 2px; /* Space between general option groups */
-            margin-bottom: 15px; /* Space before the theme section */
+            gap: 2px;
             padding: 0;
-            box-sizing: border-box; /* Ensure padding is included if not already part of a width calc */
+            box-sizing: border-box;
         `;
-        contentArea.appendChild(generalSettingsSection); // Add general settings section first
 
-        // Add a heading for the General Settings section using the helper
-        const generalSettingsHeading = createSectionHeading('General Settings');
-        generalSettingsSection.appendChild(generalSettingsHeading);
+        generalSettingsHeading.addEventListener('click', () => {
+            const isHidden = generalSettingsSection.style.display === 'none';
+            generalSettingsSection.style.display = isHidden ? 'flex' : 'none';
+            generalSettingsIcon.textContent = isHidden ? '▼ ' : '► ';
+        });
+
+        generalSettingsContainer.appendChild(generalSettingsHeading);
+        generalSettingsContainer.appendChild(generalSettingsSection);
 
         // --- Tracked Keyword(s) Option ---
         const trackedKeywordsGroup = document.createElement('div');
@@ -7263,8 +7288,6 @@ function applyThemeSettings(options = {}) {
             display: flex; /* Reiterate, will be toggled */
             flex-direction: column;
             /* gap: 10px; Will be handled by margins/padding of new structure or individual rows */
-            max-height: 300px; /* Adjusted from themeSection's previous max-height */
-            overflow-y: auto;
             box-sizing: border-box; /* Ensure padding is included */
         `;
         themeSection.appendChild(themeOptionsContainer);
@@ -7319,6 +7342,83 @@ function applyThemeSettings(options = {}) {
             return group;
         }
 
+        function createImagePickerRow(options) {
+            const { labelText, storageKey, idSuffix } = options;
+
+            const row = document.createElement('div');
+            row.classList.add('otk-option-row');
+            row.style.marginBottom = '5px';
+
+            const label = document.createElement('label');
+            label.textContent = labelText;
+            label.htmlFor = `otk-${idSuffix}-url-input`;
+            label.style.cssText = "font-size: 12px; text-align: left;";
+
+            const controlsWrapper = document.createElement('div');
+            controlsWrapper.style.cssText = "display: flex; width: 100%; align-items: center; gap: 8px; min-width: 0;";
+
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.id = `otk-${idSuffix}-url-input`;
+            input.placeholder = 'Enter image URL or browse';
+            input.style.cssText = "flex: 1 1 70px; min-width: 50px; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
+
+            const initialUrl = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {})[storageKey] || '';
+            if (initialUrl.startsWith('data:image')) {
+                input.value = '(Local file is selected)';
+                input.dataset.fullUrl = initialUrl;
+            } else {
+                input.value = initialUrl;
+            }
+
+            input.addEventListener('input', () => {
+                input.dataset.fullUrl = '';
+            });
+
+            input.addEventListener('change', () => {
+                const valueToSave = input.dataset.fullUrl || input.value;
+                saveThemeSetting(storageKey, valueToSave, false);
+                applyThemeSettings({ forceRerender: false });
+            });
+
+            const browseButton = document.createElement('button');
+            browseButton.textContent = "Browse...";
+            browseButton.style.cssText = "height: 25px; flex-shrink: 0; padding: 2px 10px; font-size: 11px; box-sizing: border-box;";
+
+            const fileInput = document.createElement('input');
+            fileInput.type = 'file';
+            fileInput.accept = 'image/*';
+            fileInput.style.display = 'none';
+
+            browseButton.addEventListener('click', (e) => {
+                e.preventDefault();
+                fileInput.click();
+            });
+
+            fileInput.addEventListener('change', (event) => {
+                const file = event.target.files[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        const dataUrl = e.target.result;
+                        input.value = `(Local file: ${file.name})`;
+                        input.dataset.fullUrl = dataUrl;
+                        input.dispatchEvent(new Event('change'));
+                    };
+                    reader.readAsDataURL(file);
+                }
+            });
+
+            controlsWrapper.appendChild(input);
+            controlsWrapper.appendChild(browseButton);
+            controlsWrapper.appendChild(fileInput);
+
+            row.appendChild(label);
+            row.appendChild(controlsWrapper);
+
+            return row;
+        }
+
         // Helper function to create a theme option row
         function createThemeOptionRow(options) {
             // options = { labelText, storageKey, cssVariable, defaultValue, inputType ('color'|'number'), unit ('px'|null), min, max, idSuffix }
@@ -7371,7 +7471,7 @@ function applyThemeSettings(options = {}) {
                     padding: 1px; /* Adjusted padding */
                     box-sizing: border-box;
                 `;
-            } else if (options.inputType === 'number') {
+            } else if (options.inputType === 'number' || options.inputType === 'text') {
                 mainInput.style.cssText = `
                     flex: 1 1 60px; /* flex-grow, flex-shrink, flex-basis */
                     min-width: 40px;
@@ -7380,7 +7480,7 @@ function applyThemeSettings(options = {}) {
                     font-size: 12px;
                 `;
                 // Add text-align: right for number inputs created by createThemeOptionRow
-                if (options.inputType === 'number') {
+                if (options.inputType === 'number' || options.inputType === 'text') {
                     mainInput.style.textAlign = 'right';
                 }
                 if (options.min !== undefined) mainInput.min = options.min;
@@ -7555,7 +7655,7 @@ function applyThemeSettings(options = {}) {
         // Clear existing content from themeOptionsContainer before repopulating
         themeOptionsContainer.innerHTML = '';
 
-        const createCollapsibleSubSection = (title, { isH6 = false, defaultCollapsed = true } = {}) => {
+        const createCollapsibleSubSection = (title, { isH6 = false, defaultCollapsed = true, parent = themeOptionsContainer } = {}) => {
             const heading = isH6 ? document.createElement('h6') : createSectionHeading('');
             if (isH6) {
                 heading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;";
@@ -7585,23 +7685,49 @@ function applyThemeSettings(options = {}) {
                 icon.textContent = isHidden ? '▼ ' : '► ';
             });
 
-            themeOptionsContainer.appendChild(heading);
-            themeOptionsContainer.appendChild(content);
+            parent.appendChild(heading);
+            parent.appendChild(content);
             return content;
         };
 
         // --- GUI Section ---
         const guiSectionContent = createCollapsibleSubSection('GUI');
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Title Text:", storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'title-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' }));
 
-        const threadListDisplayContent = createCollapsibleSubSection('Thread List Display');
+        guiSectionContent.appendChild(createImagePickerRow({
+            labelText: 'Background Image URL:',
+            storageKey: 'guiBackgroundImageUrl',
+            idSuffix: 'gui-bg'
+        }));
 
-        threadListDisplayContent.appendChild(createColorOrNoneOptionRow({ labelText: "Thread Box Outline:", storageKey: 'guiThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'gui-thread-box-outline' }));
-        threadListDisplayContent.appendChild(createThemeOptionRow({ labelText: "Thread Titles Text:", storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' }));
-        threadListDisplayContent.appendChild(createThemeOptionRow({ labelText: "Thread Times Text:", storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' }));
+        guiSectionContent.appendChild(createDropdownRow({
+            labelText: 'Background Size:',
+            storageKey: 'guiBgSize',
+            options: ['auto', 'cover', 'contain'],
+            defaultValue: 'cover',
+            requiresRerender: false
+        }));
+        guiSectionContent.appendChild(createDropdownRow({
+            labelText: 'Background Repeat:',
+            storageKey: 'guiBgRepeat',
+            options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
+            defaultValue: 'no-repeat',
+            requiresRerender: false
+        }));
+        guiSectionContent.appendChild(createDropdownRow({
+            labelText: 'Background Position:',
+            storageKey: 'guiBgPosition',
+            options: ['center', 'top', 'bottom', 'left', 'right'],
+            defaultValue: 'center',
+            requiresRerender: false
+        }));
 
-        threadListDisplayContent.appendChild(createDropdownRow({
+        guiSectionContent.appendChild(createColorOrNoneOptionRow({ labelText: "Thread Box Outline:", storageKey: 'guiThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'gui-thread-box-outline' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Thread Titles Text:", storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Thread Times Text:", storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' }));
+
+        guiSectionContent.appendChild(createDropdownRow({
             labelText: 'Time Position:',
             storageKey: 'otkThreadTimePosition',
             options: ['After Title', 'Before Title'],
@@ -7610,12 +7736,12 @@ function applyThemeSettings(options = {}) {
         }));
 
         const dividerCheckboxRow = createCheckboxOptionRow({
-            labelText: "Enable Divider:",
+            labelText: "Enable Thread List Divider:",
             storageKey: 'otkThreadTimeDividerEnabled',
             defaultValue: true,
             idSuffix: 'thread-time-divider-enable'
         });
-        threadListDisplayContent.appendChild(dividerCheckboxRow);
+        guiSectionContent.appendChild(dividerCheckboxRow);
 
         const dividerSymbolRow = createThemeOptionRow({
             labelText: "Divider Symbol:",
@@ -7625,7 +7751,7 @@ function applyThemeSettings(options = {}) {
             inputType: 'text',
             idSuffix: 'thread-time-divider-symbol'
         });
-        threadListDisplayContent.appendChild(dividerSymbolRow);
+        guiSectionContent.appendChild(dividerSymbolRow);
 
         const dividerColorRow = createThemeOptionRow({
             labelText: "Divider Color:",
@@ -7635,13 +7761,13 @@ function applyThemeSettings(options = {}) {
             inputType: 'color',
             idSuffix: 'thread-time-divider-color'
         });
-        threadListDisplayContent.appendChild(dividerColorRow);
+        guiSectionContent.appendChild(dividerColorRow);
 
         const dividerCheckbox = dividerCheckboxRow.querySelector('input[type="checkbox"]');
         const updateDividerOptionsVisibility = () => {
             const isEnabled = dividerCheckbox.checked;
-            dividerSymbolRow.style.display = isEnabled ? 'flex' : 'none';
-            dividerColorRow.style.display = isEnabled ? 'flex' : 'none';
+            dividerSymbolRow.style.display = isEnabled ? 'grid' : 'none';
+            dividerColorRow.style.display = isEnabled ? 'grid' : 'none';
         };
 
         dividerCheckbox.addEventListener('change', updateDividerOptionsVisibility);
@@ -7649,7 +7775,7 @@ function applyThemeSettings(options = {}) {
         // Initial call to set visibility based on saved state
         setTimeout(updateDividerOptionsVisibility, 0);
 
-        threadListDisplayContent.appendChild(createDropdownRow({
+        guiSectionContent.appendChild(createDropdownRow({
             labelText: 'Bracket Style:',
             storageKey: 'otkThreadTimeBracketStyle',
             options: ['[]', '()', 'none'],
@@ -7657,7 +7783,7 @@ function applyThemeSettings(options = {}) {
             requiresRerender: false
         }));
 
-        threadListDisplayContent.appendChild(createThemeOptionRow({
+        guiSectionContent.appendChild(createThemeOptionRow({
             labelText: "Bracket Color:",
             storageKey: 'otkThreadTimeBracketColor',
             cssVariable: '--otk-thread-time-bracket-color',
@@ -7666,7 +7792,7 @@ function applyThemeSettings(options = {}) {
             idSuffix: 'thread-time-bracket-color'
         }));
 
-        threadListDisplayContent.appendChild(createThemeOptionRow({
+        guiSectionContent.appendChild(createThemeOptionRow({
             labelText: "Thread Title Animation Speed:",
             storageKey: 'otkThreadTitleAnimationSpeed',
             cssVariable: '--otk-thread-title-animation-speed',
@@ -7680,104 +7806,32 @@ function applyThemeSettings(options = {}) {
             requiresRerender: false
         }));
 
-        const statsContent = createCollapsibleSubSection('Stats');
-        statsContent.appendChild(createThemeOptionRow({ labelText: "Stats Text:", storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' }));
-        statsContent.appendChild(createThemeOptionRow({ labelText: "Stats Dash:", storageKey: 'statsDashColor', cssVariable: '--otk-stats-dash-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'stats-dash' }));
-        statsContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Text:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Stats Text:", storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Stats Dash:", storageKey: 'statsDashColor', cssVariable: '--otk-stats-dash-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'stats-dash' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Text:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
 
-        const miscContent = createCollapsibleSubSection('Misc');
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Cog Icon:", storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Countdown Background:", storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Countdown Label Text:", storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Countdown Timer Text:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Separator:", storageKey: 'separatorColor', cssVariable: '--otk-separator-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'separator' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Clock Background:", storageKey: 'clockBgColor', cssVariable: '--otk-clock-bg-color', defaultValue: '', inputType: 'color', idSuffix: 'clock-bg' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Clock Text:", storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Clock Border:", storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-border' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Clock Divider:", storageKey: 'clockDividerColor', cssVariable: '--otk-clock-divider-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-divider' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Clock Cog Icon:", storageKey: 'clockCogColor', cssVariable: '--otk-clock-cog-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-cog' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Background:", storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' }));
-        miscContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Text:", storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Cog Icon:", storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Background:", storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Label Text:", storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Timer Text:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Separator:", storageKey: 'separatorColor', cssVariable: '--otk-separator-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'separator' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Background:", storageKey: 'clockBgColor', cssVariable: '--otk-clock-bg-color', defaultValue: '', inputType: 'color', idSuffix: 'clock-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Text:", storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Border:", storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-border' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Divider:", storageKey: 'clockDividerColor', cssVariable: '--otk-clock-divider-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-divider' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Cog Icon:", storageKey: 'clockCogColor', cssVariable: '--otk-clock-cog-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-cog' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Background:", storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Text:", storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }));
 
-        const guiButtonsContent = createCollapsibleSubSection('GUI Buttons', { isH6: true });
-        guiButtonsContent.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' }));
-        guiButtonsContent.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' }));
-        guiButtonsContent.appendChild(createThemeOptionRow({ labelText: "Border:", storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' }));
-        guiButtonsContent.appendChild(createThemeOptionRow({ labelText: "Hover Background:", storageKey: 'guiButtonHoverBgColor', cssVariable: '--otk-button-hover-bg-color', defaultValue: '#666666', inputType: 'color', idSuffix: 'gui-button-hover-bg' }));
-        guiButtonsContent.appendChild(createThemeOptionRow({ labelText: "Active Background:", storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' }));
-
-        const guiBackgroundContent = createCollapsibleSubSection('GUI Background', { isH6: true });
-        const bgImageUrlRow = document.createElement('div');
-        bgImageUrlRow.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
-
-        const bgImageUrlLabel = document.createElement('label');
-        bgImageUrlLabel.textContent = 'Background Image URL:';
-        bgImageUrlLabel.htmlFor = 'otk-gui-bg-image-url-input';
-        bgImageUrlLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
-
-        const bgImageUrlControlsWrapper = document.createElement('div');
-        bgImageUrlControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
-
-        const bgImageUrlInput = document.createElement('input');
-        bgImageUrlInput.type = 'text';
-        bgImageUrlInput.id = 'otk-gui-bg-image-url-input';
-        bgImageUrlInput.placeholder = 'Enter image URL or browse';
-        bgImageUrlInput.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align: left;";
-
-        const initialBgUrl = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {}).guiBackgroundImageUrl || '';
-        if (initialBgUrl.startsWith('data:image')) {
-            bgImageUrlInput.value = '(Local file is selected)';
-            bgImageUrlInput.dataset.fullUrl = initialBgUrl;
-        } else {
-            bgImageUrlInput.value = initialBgUrl;
-        }
-
-        bgImageUrlInput.addEventListener('input', () => {
-            bgImageUrlInput.dataset.fullUrl = '';
-        });
-
-        bgImageUrlInput.addEventListener('change', () => {
-            const valueToSave = bgImageUrlInput.dataset.fullUrl || bgImageUrlInput.value;
-            saveThemeSetting('guiBackgroundImageUrl', valueToSave, false);
-            applyThemeSettings({ forceRerender: false });
-        });
-
-        const browseButton = document.createElement('button');
-        browseButton.textContent = "Browse...";
-        browseButton.style.cssText = "height: 25px; flex-shrink: 0; padding: 2px 6px; font-size: 11px;";
-
-        const fileInput = document.createElement('input');
-        fileInput.type = 'file';
-        fileInput.accept = 'image/*';
-        fileInput.style.display = 'none';
-
-        browseButton.addEventListener('click', (e) => {
-            e.preventDefault();
-            fileInput.click();
-        });
-
-        fileInput.addEventListener('change', (event) => {
-            const file = event.target.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    const dataUrl = e.target.result;
-                    bgImageUrlInput.value = `(Local file: ${file.name})`;
-                    bgImageUrlInput.dataset.fullUrl = dataUrl;
-                    bgImageUrlInput.dispatchEvent(new Event('change'));
-                };
-                reader.readAsDataURL(file);
-            }
-        });
-
-        bgImageUrlControlsWrapper.appendChild(bgImageUrlInput);
-        bgImageUrlControlsWrapper.appendChild(browseButton);
-        bgImageUrlControlsWrapper.appendChild(fileInput);
-
-        bgImageUrlRow.appendChild(bgImageUrlLabel);
-        bgImageUrlRow.appendChild(bgImageUrlControlsWrapper);
-
-        themeOptionsContainer.appendChild(bgImageUrlRow);
+        const guiButtonsHeading = document.createElement('h6');
+        guiButtonsHeading.textContent = "GUI Buttons";
+        guiButtonsHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left; padding-left: 30px;";
+        guiSectionContent.appendChild(guiButtonsHeading);
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Border:", storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Hover Background:", storageKey: 'guiButtonHoverBgColor', cssVariable: '--otk-button-hover-bg-color', defaultValue: '#666666', inputType: 'color', idSuffix: 'gui-button-hover-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Active Background:", storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' }));
 
         function createDropdownRow(options) {
             const group = document.createElement('div');
@@ -7808,105 +7862,17 @@ function applyThemeSettings(options = {}) {
             return group;
         }
 
-        themeOptionsContainer.appendChild(createDropdownRow({
-            labelText: 'Background Size:',
-            storageKey: 'guiBgSize',
-            options: ['auto', 'cover', 'contain'],
-            defaultValue: 'cover',
-            requiresRerender: false
-        }));
-        themeOptionsContainer.appendChild(createDropdownRow({
-            labelText: 'Background Repeat:',
-            storageKey: 'guiBgRepeat',
-            options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
-            defaultValue: 'no-repeat',
-            requiresRerender: false
-        }));
-        themeOptionsContainer.appendChild(createDropdownRow({
-            labelText: 'Background Position:',
-            storageKey: 'guiBgPosition',
-            options: ['center', 'top', 'bottom', 'left', 'right'],
-            defaultValue: 'center',
-            requiresRerender: false
-        }));
-
         // --- Viewer Background Section ---
         const viewerBackgroundSubHeading = document.createElement('h6');
         viewerBackgroundSubHeading.textContent = "Viewer Background";
         viewerBackgroundSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;";
         themeOptionsContainer.appendChild(viewerBackgroundSubHeading);
 
-        const viewerBgImageUrlRow = document.createElement('div');
-        viewerBgImageUrlRow.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
-
-        const viewerBgImageUrlLabel = document.createElement('label');
-        viewerBgImageUrlLabel.textContent = 'Background Image URL:';
-        viewerBgImageUrlLabel.htmlFor = 'otk-viewer-bg-image-url-input';
-        viewerBgImageUrlLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
-
-        const viewerBgImageUrlControlsWrapper = document.createElement('div');
-        viewerBgImageUrlControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
-
-        const viewerBgImageUrlInput = document.createElement('input');
-        viewerBgImageUrlInput.type = 'text';
-        viewerBgImageUrlInput.id = 'otk-viewer-bg-image-url-input';
-        viewerBgImageUrlInput.placeholder = 'Enter image URL or browse';
-        viewerBgImageUrlInput.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align: left;";
-
-        const initialViewerBgUrl = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {}).viewerBackgroundImageUrl || '';
-        if (initialViewerBgUrl.startsWith('data:image')) {
-            viewerBgImageUrlInput.value = '(Local file is selected)';
-            viewerBgImageUrlInput.dataset.fullUrl = initialViewerBgUrl;
-        } else {
-            viewerBgImageUrlInput.value = initialViewerBgUrl;
-        }
-
-        viewerBgImageUrlInput.addEventListener('input', () => {
-            viewerBgImageUrlInput.dataset.fullUrl = '';
-        });
-
-        viewerBgImageUrlInput.addEventListener('change', () => {
-            const valueToSave = viewerBgImageUrlInput.dataset.fullUrl || viewerBgImageUrlInput.value;
-            saveThemeSetting('viewerBackgroundImageUrl', valueToSave, false);
-            applyThemeSettings({ forceRerender: false });
-        });
-
-        const viewerBrowseButton = document.createElement('button');
-        viewerBrowseButton.textContent = "Browse...";
-        viewerBrowseButton.style.cssText = "height: 25px; flex-shrink: 0; padding: 2px 6px; font-size: 11px;";
-
-        const viewerFileInput = document.createElement('input');
-        viewerFileInput.type = 'file';
-        viewerFileInput.accept = 'image/*';
-        viewerFileInput.style.display = 'none';
-
-        viewerBrowseButton.addEventListener('click', (e) => {
-            e.preventDefault();
-            viewerFileInput.click();
-        });
-
-        viewerFileInput.addEventListener('change', (event) => {
-            const file = event.target.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    const dataUrl = e.target.result;
-                    viewerBgImageUrlInput.value = `(Local file: ${file.name})`;
-                    viewerBgImageUrlInput.dataset.fullUrl = dataUrl;
-                    viewerBgImageUrlInput.dispatchEvent(new Event('change'));
-                };
-                reader.readAsDataURL(file);
-            }
-        });
-
-        viewerBgImageUrlControlsWrapper.appendChild(viewerBgImageUrlInput);
-        viewerBgImageUrlControlsWrapper.appendChild(viewerBrowseButton);
-        viewerBgImageUrlControlsWrapper.appendChild(viewerFileInput);
-
-        viewerBgImageUrlRow.appendChild(viewerBgImageUrlLabel);
-        viewerBgImageUrlRow.appendChild(viewerBgImageUrlControlsWrapper);
-
-        themeOptionsContainer.appendChild(viewerBgImageUrlRow);
+        themeOptionsContainer.appendChild(createImagePickerRow({
+            labelText: 'Background Image URL:',
+            storageKey: 'viewerBackgroundImageUrl',
+            idSuffix: 'viewer-bg'
+        }));
 
         themeOptionsContainer.appendChild(createDropdownRow({
             labelText: 'Background Size:',
@@ -7938,77 +7904,11 @@ function applyThemeSettings(options = {}) {
 
         themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'pipBackgroundColor', cssVariable: '--otk-pip-bg-color', defaultValue: '#1a1a1a', inputType: 'color', idSuffix: 'pip-bg' }));
 
-        const pipBgImageUrlRow = document.createElement('div');
-        pipBgImageUrlRow.style.cssText = "display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 5px;";
-
-        const pipBgImageUrlLabel = document.createElement('label');
-        pipBgImageUrlLabel.textContent = 'Background Image URL:';
-        pipBgImageUrlLabel.htmlFor = 'otk-pip-bg-image-url-input';
-        pipBgImageUrlLabel.style.cssText = "font-size: 12px; text-align: left; flex-basis: 230px; flex-shrink: 0;";
-
-        const pipBgImageUrlControlsWrapper = document.createElement('div');
-        pipBgImageUrlControlsWrapper.style.cssText = "display: flex; flex-grow: 1; align-items: center; gap: 8px; min-width: 0;";
-
-        const pipBgImageUrlInput = document.createElement('input');
-        pipBgImageUrlInput.type = 'text';
-        pipBgImageUrlInput.id = 'otk-pip-bg-image-url-input';
-        pipBgImageUrlInput.placeholder = 'Enter image URL or browse';
-        pipBgImageUrlInput.style.cssText = "flex-grow: 1; height: 25px; box-sizing: border-box; font-size: 12px; text-align: left;";
-
-        const initialPipBgUrl = (JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {}).pipBackgroundImageUrl || '';
-        if (initialPipBgUrl.startsWith('data:image')) {
-            pipBgImageUrlInput.value = '(Local file is selected)';
-            pipBgImageUrlInput.dataset.fullUrl = initialPipBgUrl;
-        } else {
-            pipBgImageUrlInput.value = initialPipBgUrl;
-        }
-
-        pipBgImageUrlInput.addEventListener('input', () => {
-            pipBgImageUrlInput.dataset.fullUrl = '';
-        });
-
-        pipBgImageUrlInput.addEventListener('change', () => {
-            const valueToSave = pipBgImageUrlInput.dataset.fullUrl || pipBgImageUrlInput.value;
-            saveThemeSetting('pipBackgroundImageUrl', valueToSave, false);
-            applyThemeSettings({ forceRerender: false });
-        });
-
-        const pipBrowseButton = document.createElement('button');
-        pipBrowseButton.textContent = "Browse...";
-        pipBrowseButton.style.cssText = "height: 25px; flex-shrink: 0; padding: 2px 6px; font-size: 11px;";
-
-        const pipFileInput = document.createElement('input');
-        pipFileInput.type = 'file';
-        pipFileInput.accept = 'image/*';
-        pipFileInput.style.display = 'none';
-
-        pipBrowseButton.addEventListener('click', (e) => {
-            e.preventDefault();
-            pipFileInput.click();
-        });
-
-        pipFileInput.addEventListener('change', (event) => {
-            const file = event.target.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    const dataUrl = e.target.result;
-                    pipBgImageUrlInput.value = `(Local file: ${file.name})`;
-                    pipBgImageUrlInput.dataset.fullUrl = dataUrl;
-                    pipBgImageUrlInput.dispatchEvent(new Event('change'));
-                };
-                reader.readAsDataURL(file);
-            }
-        });
-
-        pipBgImageUrlControlsWrapper.appendChild(pipBgImageUrlInput);
-        pipBgImageUrlControlsWrapper.appendChild(pipBrowseButton);
-        pipBgImageUrlControlsWrapper.appendChild(pipFileInput);
-
-        pipBgImageUrlRow.appendChild(pipBgImageUrlLabel);
-        pipBgImageUrlRow.appendChild(pipBgImageUrlControlsWrapper);
-
-        themeOptionsContainer.appendChild(pipBgImageUrlRow);
+        themeOptionsContainer.appendChild(createImagePickerRow({
+            labelText: 'Background Image URL:',
+            storageKey: 'pipBackgroundImageUrl',
+            idSuffix: 'pip-bg'
+        }));
 
         themeOptionsContainer.appendChild(createDropdownRow({
             labelText: 'Background Size:',
