@@ -9791,11 +9791,10 @@ function setupClockOptionsWindow() {
                 grid-template-columns: 240px 1fr;
                 gap: 8px;
                 align-items: center;
-                padding: 4px 10px 4px 12px;
+                padding: 8px 10px 8px 12px;
                 margin: 0;
                 width: 100%;
                 box-sizing: border-box;
-                height: 35px;
             }
             .otk-option-row > label {
                 white-space: nowrap;
