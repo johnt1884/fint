@@ -6685,6 +6685,7 @@ function applyThemeSettings(options = {}) {
             border: none;
             border-radius: 0;
             z-index: 100002; /* Above clock, loading screen, etc. */
+            box-shadow: 5px 0 5px -2px #000;
             display: none; /* Hidden by default */
             flex-direction: column;
             color: var(--otk-options-text-color); /* Use specific variable for options window text */
@@ -6775,7 +6776,7 @@ function applyThemeSettings(options = {}) {
         generalSettingsSection.style.cssText = `
             display: flex;
             flex-direction: column;
-            gap: 10px; /* Space between general option groups */
+            gap: 2px; /* Space between general option groups */
             margin-bottom: 15px; /* Space before the theme section */
             padding: 0;
             box-sizing: border-box; /* Ensure padding is included if not already part of a width calc */
@@ -7251,57 +7252,27 @@ function applyThemeSettings(options = {}) {
         themeSection.style.cssText = `
             display: flex;
             flex-direction: column;
-            gap: 10px; /* Space between color option groups */
+            gap: 2px; /* Space between color option groups */
             padding: 0;
             box-sizing: border-box;
         `;
         // Add a heading for the section (optional)
-        const themeSectionHeading = document.createElement('h4');
-        themeSectionHeading.textContent = '► Theme'; // Changed text and added indicator
-        themeSectionHeading.style.cssText = `
-            margin-top: 0;
-            margin-bottom: 10px;
-            border-bottom: 1px solid #555;
-            padding-bottom: 5px;
-            cursor: pointer;
-            user-select: none;
-            padding-left: 12px;
-            padding-right: 12px;
-        `;
-        themeSection.appendChild(themeSectionHeading);
-
-        // Create a container for the actual theme options, to be toggled
         const themeOptionsContainer = document.createElement('div');
         themeOptionsContainer.id = 'otk-theme-options-container';
-        themeOptionsContainer.style.display = 'none'; // Hidden by default
-        // Apply scrolling properties to this container instead of themeSection directly
+        themeOptionsContainer.style.display = 'flex'; // Always visible
         themeOptionsContainer.style.cssText += `
-            display: none; /* Reiterate, will be toggled */
+            display: flex; /* Reiterate, will be toggled */
             flex-direction: column;
             /* gap: 10px; Will be handled by margins/padding of new structure or individual rows */
             max-height: 300px; /* Adjusted from themeSection's previous max-height */
             overflow-y: auto;
-            /* padding-right: 20px; */ /* This was preventing full-width backgrounds. Scrollbar will now overlay content. */
             box-sizing: border-box; /* Ensure padding is included */
-            /* padding-left: 5px; */ /* Minor padding for content - Remains Removed, covered by contentArea */
         `;
         themeSection.appendChild(themeOptionsContainer);
 
         sectionsContainer.appendChild(themeSection); // Add theme section to main content
 
         document.body.appendChild(optionsWindow);
-
-        // Event listener for toggling theme options visibility
-        themeSectionHeading.addEventListener('click', () => {
-            const isHidden = themeOptionsContainer.style.display === 'none';
-            if (isHidden) {
-                themeOptionsContainer.style.display = 'flex'; // Use 'flex' as it's a flex container
-                themeSectionHeading.textContent = '▼ Theme';
-            } else {
-                themeOptionsContainer.style.display = 'none';
-                themeSectionHeading.textContent = '► Theme';
-            }
-        });
 
         // Helper function to create a checkbox option row
         function createCheckboxOptionRow(options) {
@@ -7354,7 +7325,6 @@ function applyThemeSettings(options = {}) {
             // options = { labelText, storageKey, cssVariable, defaultValue, inputType ('color'|'number'), unit ('px'|null), min, max, idSuffix }
             const group = document.createElement('div');
             group.classList.add('otk-option-row');
-            group.style.marginBottom = '5px'; // Keep margin
 
             const label = document.createElement('label');
             label.textContent = options.labelText;
@@ -7579,7 +7549,7 @@ function applyThemeSettings(options = {}) {
             const h = document.createElement('h5');
             h.textContent = text;
             // Adjusted margins for more space, removed border-bottom
-            h.style.cssText = "margin-top: 10px; margin-bottom: 6px; color: #cccccc; font-size: 13px; padding-bottom: 4px; font-weight: bold; text-align: left;";
+            h.style.cssText = "margin-top: 10px; margin-bottom: 15px; color: #cccccc; font-size: 13px; padding-bottom: 4px; font-weight: bold; text-align: left;";
             return h;
         }
 
@@ -9791,7 +9761,7 @@ function setupClockOptionsWindow() {
                 grid-template-columns: 240px 1fr;
                 gap: 8px;
                 align-items: center;
-                padding: 8px 10px 8px 12px;
+                padding: 4px 10px 4px 12px;
                 margin: 0;
                 width: 100%;
                 box-sizing: border-box;
