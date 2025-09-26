@@ -3316,17 +3316,26 @@ function _createMessageHeaderIcons(message, messageDiv, isFiltered, headerContai
     } else {
         blockIcon.style.visibility = 'hidden';
         blockIcon.title = 'Create filter for this message';
-        headerContainer.addEventListener('mouseenter', () => {
-            blockIcon.style.visibility = 'visible';
-            if (pinIcon) pinIcon.style.visibility = 'visible';
-        });
-        headerContainer.addEventListener('mouseleave', () => {
-            blockIcon.style.visibility = 'hidden';
-            if (pinIcon && !messageDiv.classList.contains(PINNED_MESSAGE_CLASS)) {
-                pinIcon.style.visibility = 'hidden';
-            }
-        });
     }
+
+    // Attach hover listeners regardless of filter status to handle pin icon visibility
+    headerContainer.addEventListener('mouseenter', () => {
+        if (!isFiltered) { // Only toggle block icon if not filtered
+            blockIcon.style.visibility = 'visible';
+        }
+        if (pinIcon) {
+            pinIcon.style.visibility = 'visible';
+        }
+    });
+
+    headerContainer.addEventListener('mouseleave', () => {
+        if (!isFiltered) { // Only toggle block icon if not filtered
+            blockIcon.style.visibility = 'hidden';
+        }
+        if (pinIcon && !messageDiv.classList.contains(PINNED_MESSAGE_CLASS)) {
+            pinIcon.style.visibility = 'hidden';
+        }
+    });
     headerContainer.appendChild(blockIcon);
 
     blockIcon.addEventListener('click', (e) => {
@@ -6803,14 +6812,35 @@ function applyThemeSettings(options = {}) {
             box-sizing: border-box;
         `;
 
+        const storageKey = 'otkCollapsibleStates';
+        const generalSectionId = 'otk-section-general-settings';
+
+        const restoreGeneralSettingsState = () => {
+            let states = {};
+            try {
+                states = JSON.parse(localStorage.getItem(storageKey)) || {};
+            } catch (e) { consoleError(e); }
+            const isCollapsed = states[generalSectionId] === 'closed'; // Default to open
+            generalSettingsSection.style.display = isCollapsed ? 'none' : 'flex';
+            generalSettingsIcon.textContent = isCollapsed ? '► ' : '▼ ';
+        };
+
         generalSettingsHeading.addEventListener('click', () => {
             const isHidden = generalSettingsSection.style.display === 'none';
             generalSettingsSection.style.display = isHidden ? 'flex' : 'none';
             generalSettingsIcon.textContent = isHidden ? '▼ ' : '► ';
+
+            let states = {};
+            try {
+                states = JSON.parse(localStorage.getItem(storageKey)) || {};
+            } catch (e) { consoleError(e); }
+            states[generalSectionId] = isHidden ? 'open' : 'closed';
+            localStorage.setItem(storageKey, JSON.stringify(states));
         });
 
         generalSettingsContainer.appendChild(generalSettingsHeading);
         generalSettingsContainer.appendChild(generalSettingsSection);
+        restoreGeneralSettingsState();
 
         // --- Tracked Keyword(s) Option ---
         const trackedKeywordsGroup = document.createElement('div');
@@ -7029,106 +7059,89 @@ function applyThemeSettings(options = {}) {
         mediaLoadModeGroup.appendChild(mediaLoadModeSelect);
         generalSettingsSection.appendChild(mediaLoadModeGroup);
 
-        // --- Message Limiting Feature (Refactored) ---
-        const messageLimitGroup = document.createElement('div');
-        messageLimitGroup.classList.add('otk-option-row');
-
-        const messageLimitLabel = document.createElement('label');
-        messageLimitLabel.textContent = "Limit Number of Messages:";
-        messageLimitLabel.style.cssText = "font-size: 12px; text-align: left;";
-
-        const messageLimitInput = document.createElement('input');
-        messageLimitInput.type = 'text'; // Changed to text
-        messageLimitInput.id = 'otk-message-limit-input';
-        messageLimitInput.style.cssText = "width: 100%; height: 25px; box-sizing: border-box; font-size: 12px; text-align: right;";
-
+        // --- Enable Message Number Limiting & Set Value ---
         const initialThemeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-        if (initialThemeSettings.otkMessageLimitEnabled === false) {
-            messageLimitInput.value = 'disabled';
-        } else {
-            messageLimitInput.value = initialThemeSettings.otkMessageLimitValue || '500';
-        }
 
-        const upButton = document.createElement('button');
-        upButton.textContent = '▲';
-        upButton.style.cssText = "width: 25px; height: 25px; padding: 0; font-size: 10px;";
-
-        const downButton = document.createElement('button');
-        downButton.textContent = '▼';
-        downButton.style.cssText = "width: 25px; height: 25px; padding: 0; font-size: 10px;";
-
-        const handleArrowClick = (direction) => {
-            let currentValue = messageLimitInput.value;
-            let newValue;
-
-            if (currentValue === 'disabled') {
-                if (direction === 'up') {
-                    newValue = 0;
-                } else {
-                    return; // Do nothing on down arrow if disabled
-                }
-            } else {
-                let numValue = parseInt(currentValue, 10);
-                if (isNaN(numValue)) numValue = 500; // Default if invalid
-
-                if (direction === 'up') {
-                    newValue = numValue + 1;
-                } else { // down
-                    if (numValue > 0) {
-                        newValue = numValue - 1;
-                    } else { // numValue is 0 or less
-                        newValue = 'disabled';
-                    }
-                }
-            }
-            messageLimitInput.value = newValue;
-            messageLimitInput.dispatchEvent(new Event('change'));
+        const messageLimitGroup = createTimeInputRow({
+            labelText: "Message Number Limiting:",
+            storageKey: 'otkMessageLimitValue',
+            defaultValueSeconds: 500, // This is not seconds, but reusing the function structure
+            idSuffix: 'message-limit-value'
+        });
+        // Adapt the time input row for a simple number input
+        const messageLimitValueInput = messageLimitGroup.querySelector('input[type="text"]');
+        messageLimitValueInput.type = 'number';
+        messageLimitValueInput.placeholder = '';
+        messageLimitValueInput.value = initialThemeSettings.otkMessageLimitValue || '500';
+        messageLimitValueInput.addEventListener('change', () => {
+             const numValue = parseInt(messageLimitValueInput.value, 10);
+             if (!isNaN(numValue) && numValue >= 0) {
+                 saveThemeSetting('otkMessageLimitValue', String(numValue), true);
+             } else {
+                 const savedSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+                 messageLimitValueInput.value = savedSettings.otkMessageLimitValue || '500';
+             }
+        });
+        // Remove the hh:mm:ss conversion logic from this specific instance
+        const upButton = messageLimitGroup.querySelector('button:nth-of-type(1)');
+        const downButton = messageLimitGroup.querySelector('button:nth-of-type(2)');
+        upButton.onclick = () => {
+            messageLimitValueInput.stepUp(10);
+            messageLimitValueInput.dispatchEvent(new Event('change'));
+        };
+        downButton.onclick = () => {
+            messageLimitValueInput.stepDown(10);
+            messageLimitValueInput.dispatchEvent(new Event('change'));
         };
 
-        upButton.addEventListener('click', () => handleArrowClick('up'));
-        downButton.addEventListener('click', () => handleArrowClick('down'));
 
-        messageLimitInput.addEventListener('change', () => {
-            const value = messageLimitInput.value;
-            if (value === 'disabled') {
-                saveThemeSetting('otkMessageLimitEnabled', false, true);
-            } else {
-                const numValue = parseInt(value, 10);
-                if (!isNaN(numValue) && numValue >= 0) {
-                    saveThemeSetting('otkMessageLimitEnabled', true, true);
-                    saveThemeSetting('otkMessageLimitValue', String(numValue), true);
-                } else {
-                    // Revert to saved state if input is invalid
-                    const savedSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-                    if (savedSettings.otkMessageLimitEnabled === false) {
-                        messageLimitInput.value = 'disabled';
-                    } else {
-                        messageLimitInput.value = savedSettings.otkMessageLimitValue || '500';
-                    }
-                }
-            }
-        });
+        const messageLimitEnableGroup = document.createElement('div');
+        messageLimitEnableGroup.classList.add('otk-option-row');
+
+        const messageLimitEnableLabel = document.createElement('label');
+        messageLimitEnableLabel.textContent = "Enable Limiting:";
+        messageLimitEnableLabel.htmlFor = 'otk-message-limit-enable-checkbox';
+        messageLimitEnableLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const messageLimitControlsWrapper = document.createElement('div');
-        messageLimitControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 4px;";
-        messageLimitInput.style.flexGrow = "1";
+        messageLimitControlsWrapper.style.cssText = "display: flex; align-items: center; gap: 8px; justify-content: flex-end;";
 
-        messageLimitControlsWrapper.appendChild(messageLimitInput);
-        messageLimitControlsWrapper.appendChild(upButton);
-        messageLimitControlsWrapper.appendChild(downButton);
+        const messageLimitEnableCheckbox = document.createElement('input');
+        messageLimitEnableCheckbox.type = 'checkbox';
+        messageLimitEnableCheckbox.id = 'otk-message-limit-enable-checkbox';
+        messageLimitEnableCheckbox.style.cssText = "height: 16px; width: 16px;";
+        messageLimitEnableCheckbox.checked = initialThemeSettings.otkMessageLimitEnabled !== false;
 
-        messageLimitGroup.appendChild(messageLimitLabel);
-        messageLimitGroup.appendChild(messageLimitControlsWrapper);
+        messageLimitControlsWrapper.appendChild(messageLimitEnableCheckbox);
+        messageLimitEnableGroup.appendChild(messageLimitEnableLabel);
+        messageLimitEnableGroup.appendChild(messageLimitControlsWrapper);
+
+
+        const toggleValueInput = (enabled) => {
+            messageLimitValueInput.disabled = !enabled;
+            messageLimitValueInput.style.opacity = enabled ? '1' : '0.5';
+            upButton.disabled = !enabled;
+            downButton.disabled = !enabled;
+        };
+
+        messageLimitEnableCheckbox.addEventListener('change', () => {
+            const isEnabled = messageLimitEnableCheckbox.checked;
+            saveThemeSetting('otkMessageLimitEnabled', isEnabled, true);
+            toggleValueInput(isEnabled);
+        });
+
         generalSettingsSection.appendChild(messageLimitGroup);
+        generalSettingsSection.appendChild(messageLimitEnableGroup);
+        toggleValueInput(messageLimitEnableCheckbox.checked); // Set initial state
 
 
-        // --- Disable Background Updates Option ---
+        // --- Enable Background Updates Option ---
         const bgUpdateGroup = document.createElement('div');
         bgUpdateGroup.classList.add('otk-option-row');
 
         const bgUpdateLabel = document.createElement('label');
-        bgUpdateLabel.textContent = "Disable Background Updates:";
-        bgUpdateLabel.htmlFor = 'otk-disable-bg-update-checkbox';
+        bgUpdateLabel.textContent = "Enable Background Updates:";
+        bgUpdateLabel.htmlFor = 'otk-enable-bg-update-checkbox';
         bgUpdateLabel.style.cssText = "font-size: 12px; text-align: left;";
 
         const bgUpdateControlsWrapper = document.createElement('div');
@@ -7136,12 +7149,18 @@ function applyThemeSettings(options = {}) {
 
         const bgUpdateCheckbox = document.createElement('input');
         bgUpdateCheckbox.type = 'checkbox';
-        bgUpdateCheckbox.id = 'otk-disable-bg-update-checkbox';
+        bgUpdateCheckbox.id = 'otk-enable-bg-update-checkbox';
         bgUpdateCheckbox.style.cssText = "height: 16px; width: 16px;";
-        bgUpdateCheckbox.checked = localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) === 'true';
+        bgUpdateCheckbox.checked = localStorage.getItem(BACKGROUND_UPDATES_DISABLED_KEY) !== 'true';
 
         bgUpdateCheckbox.addEventListener('change', () => {
             if (bgUpdateCheckbox.checked) {
+                // If checked, updates are ENABLED
+                localStorage.setItem(BACKGROUND_UPDATES_DISABLED_KEY, 'false');
+                startBackgroundRefresh(true); // Start immediately
+                consoleLog('Background updates enabled via checkbox.');
+            } else {
+                // If not checked, updates are DISABLED
                 stopBackgroundRefresh();
                 if (countdownIntervalId) {
                     clearInterval(countdownIntervalId);
@@ -7153,10 +7172,6 @@ function applyThemeSettings(options = {}) {
                 }
                 localStorage.setItem(BACKGROUND_UPDATES_DISABLED_KEY, 'true');
                 consoleLog('Background updates disabled via checkbox.');
-            } else {
-                localStorage.setItem(BACKGROUND_UPDATES_DISABLED_KEY, 'false');
-                startBackgroundRefresh(true); // Start immediately
-                consoleLog('Background updates enabled via checkbox.');
             }
         });
 
@@ -7473,8 +7488,8 @@ function applyThemeSettings(options = {}) {
                 `;
             } else if (options.inputType === 'number' || options.inputType === 'text') {
                 mainInput.style.cssText = `
-                    flex: 1 1 60px; /* flex-grow, flex-shrink, flex-basis */
-                    min-width: 40px;
+                    flex: 1 1 70px; /* flex-grow, flex-shrink, flex-basis */
+                    min-width: 50px;
                     height: 25px;
                     box-sizing: border-box;
                     font-size: 12px;
@@ -7656,6 +7671,9 @@ function applyThemeSettings(options = {}) {
         themeOptionsContainer.innerHTML = '';
 
         const createCollapsibleSubSection = (title, { isH6 = false, defaultCollapsed = true, parent = themeOptionsContainer } = {}) => {
+            const sectionId = `otk-section-${title.toLowerCase().replace(/\s+/g, '-')}`;
+            const storageKey = 'otkCollapsibleStates';
+
             const heading = isH6 ? document.createElement('h6') : createSectionHeading('');
             if (isH6) {
                 heading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;";
@@ -7668,21 +7686,35 @@ function applyThemeSettings(options = {}) {
 
             const icon = document.createElement('span');
             icon.style.cssText = 'position: absolute; left: 13px; top: 50%; transform: translateY(-50%);';
-            icon.textContent = defaultCollapsed ? '► ' : '▼ ';
             heading.textContent = title;
             heading.insertBefore(icon, heading.firstChild);
             heading.style.cursor = 'pointer';
 
             const content = document.createElement('div');
-            content.style.display = 'none';
             content.style.paddingLeft = '0px';
             content.style.width = '100%';
             content.style.boxSizing = 'border-box';
+
+            // Restore state from localStorage
+            let states = {};
+            try {
+                states = JSON.parse(localStorage.getItem(storageKey)) || {};
+            } catch (e) { consoleError(e); }
+            const isCollapsed = states[sectionId] !== undefined ? states[sectionId] === 'closed' : defaultCollapsed;
+            content.style.display = isCollapsed ? 'none' : 'block';
+            icon.textContent = isCollapsed ? '► ' : '▼ ';
 
             heading.addEventListener('click', () => {
                 const isHidden = content.style.display === 'none';
                 content.style.display = isHidden ? 'block' : 'none';
                 icon.textContent = isHidden ? '▼ ' : '► ';
+
+                let currentStates = {};
+                try {
+                    currentStates = JSON.parse(localStorage.getItem(storageKey)) || {};
+                } catch (e) { consoleError(e); }
+                currentStates[sectionId] = isHidden ? 'open' : 'closed';
+                localStorage.setItem(storageKey, JSON.stringify(currentStates));
             });
 
             parent.appendChild(heading);
@@ -7691,7 +7723,7 @@ function applyThemeSettings(options = {}) {
         };
 
         // --- GUI Section ---
-        const guiSectionContent = createCollapsibleSubSection('GUI');
+        const guiSectionContent = createCollapsibleSubSection('GUI', { defaultCollapsed: false });
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Title Text:", storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'title-text' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' }));
 
@@ -7738,12 +7770,59 @@ function applyThemeSettings(options = {}) {
         const dividerSymbolRow = createThemeOptionRow({
             labelText: "Divider:",
             storageKey: 'otkThreadTimeDividerSymbol',
-            cssVariable: '--otk-thread-time-divider-symbol', // This is not used but kept for consistency
+            cssVariable: '--otk-thread-time-divider-symbol',
             defaultValue: '|',
             inputType: 'text',
             idSuffix: 'thread-time-divider-symbol'
         });
+
+        // Customization for the divider row
+        const dividerControls = dividerSymbolRow.querySelector('div:last-child');
+        const dividerDefaultButton = dividerControls.querySelector('button');
+        dividerControls.removeChild(dividerDefaultButton); // Remove the original 'Default' button
+
+        const dividerDropdown = document.createElement('select');
+        dividerDropdown.style.cssText = `
+            flex-grow: 0;
+            flex-shrink: 0;
+            height: 25px;
+            font-size: 11px;
+            box-sizing: border-box;
+            width: 108px;
+        `;
+        const dividerOptions = ['Enabled', 'Disabled', 'Default'];
+        dividerOptions.forEach(opt => {
+            const optionEl = document.createElement('option');
+            optionEl.value = opt.toLowerCase();
+            optionEl.textContent = opt;
+            dividerDropdown.appendChild(optionEl);
+        });
+
+        const dividerInput = dividerSymbolRow.querySelector('input');
+        const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+        const isDividerEnabled = themeSettings.otkThreadTimeDividerEnabled !== false; // Default to true
+        dividerDropdown.value = isDividerEnabled ? 'enabled' : 'disabled';
+        dividerInput.disabled = !isDividerEnabled;
+
+        dividerDropdown.addEventListener('change', () => {
+            const selected = dividerDropdown.value;
+            if (selected === 'default') {
+                dividerInput.value = '|';
+                saveThemeSetting('otkThreadTimeDividerSymbol', '|', false);
+                saveThemeSetting('otkThreadTimeDividerEnabled', true, false);
+                dividerInput.disabled = false;
+                dividerDropdown.value = 'enabled'; // Revert dropdown to 'Enabled'
+            } else {
+                const isEnabled = selected === 'enabled';
+                saveThemeSetting('otkThreadTimeDividerEnabled', isEnabled, false);
+                dividerInput.disabled = !isEnabled;
+            }
+            renderThreadList();
+        });
+
+        dividerControls.appendChild(dividerDropdown);
         guiSectionContent.appendChild(dividerSymbolRow);
+
 
         const dividerColorRow = createThemeOptionRow({
             labelText: "Divider Color:",
@@ -7755,59 +7834,8 @@ function applyThemeSettings(options = {}) {
         });
         guiSectionContent.appendChild(dividerColorRow);
 
-        // Modify the divider symbol row to include the new dropdown
-        const dividerSymbolControlsWrapper = dividerSymbolRow.querySelector('.otk-option-row > div');
-        const dividerSymbolInput = dividerSymbolRow.querySelector('input[type="text"]');
-        const dividerDefaultButton = dividerSymbolRow.querySelector('button');
-        if (dividerSymbolControlsWrapper && dividerSymbolInput && dividerDefaultButton) {
-            dividerDefaultButton.remove(); // Remove the original 'Default' button
-
-            const dividerStateDropdown = document.createElement('select');
-            dividerStateDropdown.style.cssText = `
-                height: 25px;
-                font-size: 11px;
-                box-sizing: border-box;
-                margin-left: 8px;
-            `;
-            const states = ['Enabled', 'Disabled', 'Default'];
-            states.forEach(state => {
-                const option = document.createElement('option');
-                option.value = state.toLowerCase();
-                option.textContent = state;
-                dividerStateDropdown.appendChild(option);
-            });
-
-            dividerSymbolControlsWrapper.appendChild(dividerStateDropdown);
-
-            const settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
-            const isEnabled = settings.otkThreadTimeDividerEnabled !== false; // Default to true if not set
-            dividerStateDropdown.value = isEnabled ? 'enabled' : 'disabled';
-
-
-            const updateDividerVisibility = () => {
-                const state = dividerStateDropdown.value;
-                const enabled = state !== 'disabled';
-                dividerSymbolInput.style.visibility = enabled ? 'visible' : 'hidden';
-                dividerColorRow.style.display = enabled ? 'grid' : 'none';
-            };
-
-            dividerStateDropdown.addEventListener('change', () => {
-                const state = dividerStateDropdown.value;
-                if (state === 'default') {
-                    saveThemeSetting('otkThreadTimeDividerEnabled', true, false);
-                    saveThemeSetting('otkThreadTimeDividerSymbol', '|', false);
-                    dividerSymbolInput.value = '|';
-                    dividerStateDropdown.value = 'enabled';
-                } else {
-                    const isEnabled = state === 'enabled';
-                    saveThemeSetting('otkThreadTimeDividerEnabled', isEnabled, false);
-                }
-                updateDividerVisibility();
-                renderThreadList();
-            });
-
-            // Initial setup
-            updateDividerVisibility();
+        if (dividerInput) {
+            dividerInput.style.flex = '1 1 70px';
         }
 
         guiSectionContent.appendChild(createDropdownRow({
@@ -7898,32 +7926,27 @@ function applyThemeSettings(options = {}) {
         }
 
         // --- Viewer Background Section ---
-        const viewerBackgroundSubHeading = document.createElement('h6');
-        viewerBackgroundSubHeading.textContent = "Viewer Background";
-        viewerBackgroundSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;";
-        themeOptionsContainer.appendChild(viewerBackgroundSubHeading);
-
-        themeOptionsContainer.appendChild(createImagePickerRow({
+        const viewerBgSection = createCollapsibleSubSection('Viewer Background');
+        viewerBgSection.appendChild(createImagePickerRow({
             labelText: 'Background Image URL:',
             storageKey: 'viewerBackgroundImageUrl',
             idSuffix: 'viewer-bg'
         }));
-
-        themeOptionsContainer.appendChild(createDropdownRow({
+        viewerBgSection.appendChild(createDropdownRow({
             labelText: 'Background Size:',
             storageKey: 'viewerBgSize',
             options: ['auto', 'cover', 'contain'],
             defaultValue: 'cover',
             requiresRerender: false
         }));
-        themeOptionsContainer.appendChild(createDropdownRow({
+        viewerBgSection.appendChild(createDropdownRow({
             labelText: 'Background Repeat:',
             storageKey: 'viewerBgRepeat',
             options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
             defaultValue: 'no-repeat',
             requiresRerender: false
         }));
-        themeOptionsContainer.appendChild(createDropdownRow({
+        viewerBgSection.appendChild(createDropdownRow({
             labelText: 'Background Position:',
             storageKey: 'viewerBgPosition',
             options: ['center', 'top', 'bottom', 'left', 'right'],
@@ -7932,34 +7955,28 @@ function applyThemeSettings(options = {}) {
         }));
 
         // --- PiP Background Section ---
-        const pipBackgroundSubHeading = document.createElement('h6');
-        pipBackgroundSubHeading.textContent = "PiP Background";
-        pipBackgroundSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;";
-        themeOptionsContainer.appendChild(pipBackgroundSubHeading);
-
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'pipBackgroundColor', cssVariable: '--otk-pip-bg-color', defaultValue: '#1a1a1a', inputType: 'color', idSuffix: 'pip-bg' }));
-
-        themeOptionsContainer.appendChild(createImagePickerRow({
+        const pipBgSection = createCollapsibleSubSection('PiP Background');
+        pipBgSection.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'pipBackgroundColor', cssVariable: '--otk-pip-bg-color', defaultValue: '#1a1a1a', inputType: 'color', idSuffix: 'pip-bg' }));
+        pipBgSection.appendChild(createImagePickerRow({
             labelText: 'Background Image URL:',
             storageKey: 'pipBackgroundImageUrl',
             idSuffix: 'pip-bg'
         }));
-
-        themeOptionsContainer.appendChild(createDropdownRow({
+        pipBgSection.appendChild(createDropdownRow({
             labelText: 'Background Size:',
             storageKey: 'pipBgSize',
             options: ['auto', 'cover', 'contain'],
             defaultValue: 'cover',
             requiresRerender: false
         }));
-        themeOptionsContainer.appendChild(createDropdownRow({
+        pipBgSection.appendChild(createDropdownRow({
             labelText: 'Background Repeat:',
             storageKey: 'pipBgRepeat',
             options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
             defaultValue: 'no-repeat',
             requiresRerender: false
         }));
-        themeOptionsContainer.appendChild(createDropdownRow({
+        pipBgSection.appendChild(createDropdownRow({
             labelText: 'Background Position:',
             storageKey: 'pipBgPosition',
             options: ['center', 'top', 'bottom', 'left', 'right'],
@@ -7967,48 +7984,32 @@ function applyThemeSettings(options = {}) {
             requiresRerender: false
         }));
 
-
         // --- Viewer Section ---
-        const viewerSectionHeading = createSectionHeading('Viewer');
-        viewerSectionHeading.style.marginTop = "22px"; // Increased top margin for space before Viewer heading
-        viewerSectionHeading.style.marginBottom = "18px"; // Increased bottom margin for space after Viewer heading
-        themeOptionsContainer.appendChild(viewerSectionHeading);
-
-        // Add Message Layout Dropdown to Viewer section (moved to top)
-
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' }));
-        themeOptionsContainer.appendChild(createColorOrNoneOptionRow({ labelText: "Viewer Thread Box Outline:", storageKey: 'viewerThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'viewer-thread-box-outline' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "GUI Bottom Border:", storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'gui-bottom-border' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Divider:", storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-divider' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Text:", storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-font' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "'Blocked Content' Font:", storageKey: 'blockedContentFontColor', cssVariable: '--otk-blocked-content-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'blocked-content-font' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "New Messages Font Size (px):", storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: false }));
-        themeOptionsContainer.appendChild(createDropdownRow({
+        const viewerSectionContent = createCollapsibleSubSection('Viewer');
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' }));
+        viewerSectionContent.appendChild(createColorOrNoneOptionRow({ labelText: "Viewer Thread Box Outline:", storageKey: 'viewerThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'viewer-thread-box-outline' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "GUI Bottom Border:", storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'gui-bottom-border' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "New Messages Divider:", storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-divider' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "New Messages Text:", storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-font' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "'Blocked Content' Font:", storageKey: 'blockedContentFontColor', cssVariable: '--otk-blocked-content-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'blocked-content-font' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "New Messages Font Size (px):", storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: false }));
+        viewerSectionContent.appendChild(createDropdownRow({
             labelText: 'New Msgs Separator Align:',
             storageKey: 'otkNewMessagesSeparatorAlignment',
             options: ['Left', 'Center', 'Right'],
             defaultValue: 'Left',
             requiresRerender: false
         }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Pin Highlight Background:", storageKey: 'pinHighlightBgColor', cssVariable: '--otk-pin-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'pin-bg', requiresRerender: true }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Pin Highlight Border:", storageKey: 'pinHighlightBorderColor', cssVariable: '--otk-pin-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'pin-border', requiresRerender: true }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "'+' Icon Background:", storageKey: 'plusIconBgColor', cssVariable: '--otk-plus-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'plus-icon-bg-color', requiresRerender: false }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Blur Icon Color:", storageKey: 'blurIconColor', cssVariable: '--otk-blur-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'blur-icon' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Blur Icon Background:", storageKey: 'blurIconBgColor', cssVariable: '--otk-blur-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'blur-icon-bg' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Resize Icon Color:", storageKey: 'resizeIconColor', cssVariable: '--otk-resize-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'resize-icon' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Resize Icon Background:", storageKey: 'resizeIconBgColor', cssVariable: '--otk-resize-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'resize-icon-bg' }));
 
-        // Anchor Highlight Colors
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Highlight Background:", storageKey: 'pinHighlightBgColor', cssVariable: '--otk-pin-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'pin-bg', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Highlight Border:", storageKey: 'pinHighlightBorderColor', cssVariable: '--otk-pin-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'pin-border', requiresRerender: true }));
-
-        // '+' Icon Background
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "'+' Icon Background:", storageKey: 'plusIconBgColor', cssVariable: '--otk-plus-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'plus-icon-bg-color', requiresRerender: false }));
-
-        // Icon Colors
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Blur Icon Color:", storageKey: 'blurIconColor', cssVariable: '--otk-blur-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'blur-icon' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Blur Icon Background:", storageKey: 'blurIconBgColor', cssVariable: '--otk-blur-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'blur-icon-bg' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Resize Icon Color:", storageKey: 'resizeIconColor', cssVariable: '--otk-resize-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'resize-icon' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Resize Icon Background:", storageKey: 'resizeIconBgColor', cssVariable: '--otk-resize-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'resize-icon-bg' }));
-
-        const imageBlurSectionHeading = createSectionHeading('Image Blurring');
-        imageBlurSectionHeading.style.marginTop = "22px";
-        imageBlurSectionHeading.style.marginBottom = "18px";
-        themeOptionsContainer.appendChild(imageBlurSectionHeading);
-
+        // --- Image Blurring Section ---
+        const imageBlurSection = createCollapsibleSubSection('Image Blurring');
         const blurGroup = document.createElement('div');
         blurGroup.style.cssText = `
             display: flex;
@@ -8017,7 +8018,6 @@ function applyThemeSettings(options = {}) {
             width: 100%;
             margin-bottom: 5px;
         `;
-
         const blurLabel = document.createElement('label');
         blurLabel.textContent = "Blur Amount (%):";
         blurLabel.htmlFor = `otk-image-blur-amount`;
@@ -8027,7 +8027,6 @@ function applyThemeSettings(options = {}) {
             flex-basis: 230px;
             flex-shrink: 0;
         `;
-
         const blurControlsWrapper = document.createElement('div');
         blurControlsWrapper.style.cssText = `
             display: flex;
@@ -8036,7 +8035,6 @@ function applyThemeSettings(options = {}) {
             gap: 8px;
             min-width: 0;
         `;
-
         const blurInput = document.createElement('input');
         blurInput.type = 'number';
         blurInput.id = 'otk-image-blur-amount';
@@ -8051,7 +8049,6 @@ function applyThemeSettings(options = {}) {
             text-align: right;
         `;
         blurInput.value = localStorage.getItem(IMAGE_BLUR_AMOUNT_KEY) || '60';
-
         blurInput.addEventListener('change', (e) => {
             let value = parseInt(e.target.value, 10);
             if (isNaN(value) || value < 0 || value > 100) {
@@ -8061,7 +8058,6 @@ function applyThemeSettings(options = {}) {
             localStorage.setItem(IMAGE_BLUR_AMOUNT_KEY, value);
             consoleLog(`Image blur amount saved: ${value}%`);
         });
-
         const blurDefaultBtn = document.createElement('button');
         blurDefaultBtn.textContent = 'Default';
         blurDefaultBtn.style.cssText = `
@@ -8073,16 +8069,13 @@ function applyThemeSettings(options = {}) {
             box-sizing: border-box;
             width: auto;
         `;
-
         blurDefaultBtn.addEventListener('click', () => {
             blurInput.value = '60';
             localStorage.setItem(IMAGE_BLUR_AMOUNT_KEY, '60');
             consoleLog(`Image blur amount reset to default: 60%`);
         });
-
         blurControlsWrapper.appendChild(blurInput);
         blurControlsWrapper.appendChild(blurDefaultBtn);
-
         const clearBlurredBtn = document.createElement('button');
         clearBlurredBtn.textContent = 'Clear All';
         clearBlurredBtn.style.cssText = `
@@ -8098,28 +8091,25 @@ function applyThemeSettings(options = {}) {
         `;
         clearBlurredBtn.onmouseover = () => clearBlurredBtn.style.backgroundColor = '#a04444';
         clearBlurredBtn.onmouseout = () => clearBlurredBtn.style.backgroundColor = '#803333';
-
         clearBlurredBtn.addEventListener('click', () => {
             if (confirm("Are you sure you want to clear all blurred images? This cannot be undone.")) {
                 blurredImages.clear();
                 localStorage.removeItem(BLURRED_IMAGES_KEY);
-
-                // Remove blur from all currently blurred images on the page
                 const allImagesOnPage = document.querySelectorAll('img[data-filehash]');
                 allImagesOnPage.forEach(img => {
                     img.style.filter = '';
                 });
-
                 consoleLog("Cleared all blurred images.");
                 alert("All blurred images have been cleared.");
             }
         });
         blurControlsWrapper.appendChild(clearBlurredBtn);
-
         blurGroup.appendChild(blurLabel);
         blurGroup.appendChild(blurControlsWrapper);
-        themeOptionsContainer.appendChild(blurGroup);
+        imageBlurSection.appendChild(blurGroup);
 
+        // --- Tweet Embeds Section ---
+        const tweetEmbedsSection = createCollapsibleSubSection('Tweet Embeds');
         const tweetEmbedModeGroup = document.createElement('div');
         tweetEmbedModeGroup.style.cssText = `
             display: flex;
@@ -8171,77 +8161,53 @@ function applyThemeSettings(options = {}) {
         tweetEmbedModeGroup.appendChild(tweetEmbedModeLabel);
         tweetEmbedModeControlsWrapper.appendChild(tweetEmbedModeDropdown);
         tweetEmbedModeGroup.appendChild(tweetEmbedModeControlsWrapper);
-        themeOptionsContainer.appendChild(tweetEmbedModeGroup);
-
-        // themeOptionsContainer.appendChild(createDivider()); // Removed divider
+        tweetEmbedsSection.appendChild(tweetEmbedModeGroup);
 
         // --- Quick Reply Theming Section ---
-        const qrThemingHeading = createSectionHeading('Quick Reply Window');
-        qrThemingHeading.style.marginTop = "22px";
-        qrThemingHeading.style.marginBottom = "18px";
-        themeOptionsContainer.appendChild(qrThemingHeading);
+        const qrThemingSection = createCollapsibleSubSection('Quick Reply Window');
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'qrBgColor', cssVariable: '--otk-qr-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'qr-bg' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Border:", storageKey: 'qrBorderColor', cssVariable: '--otk-qr-border-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'qr-border' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Header Background:", storageKey: 'qrHeaderBgColor', cssVariable: '--otk-qr-header-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'qr-header-bg' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Header Text:", storageKey: 'qrHeaderTextColor', cssVariable: '--otk-qr-header-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'qr-header-text' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Textarea Background:", storageKey: 'qrTextareaBgColor', cssVariable: '--otk-qr-textarea-bg-color', defaultValue: '#222222', inputType: 'color', idSuffix: 'qr-textarea-bg' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Textarea Text:", storageKey: 'qrTextareaTextColor', cssVariable: '--otk-qr-textarea-text-color', defaultValue: '#eeeeee', inputType: 'color', idSuffix: 'qr-textarea-text' }));
 
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'qrBgColor', cssVariable: '--otk-qr-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'qr-bg' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Border:", storageKey: 'qrBorderColor', cssVariable: '--otk-qr-border-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'qr-border' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Background:", storageKey: 'qrHeaderBgColor', cssVariable: '--otk-qr-header-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'qr-header-bg' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Text:", storageKey: 'qrHeaderTextColor', cssVariable: '--otk-qr-header-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'qr-header-text' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Textarea Background:", storageKey: 'qrTextareaBgColor', cssVariable: '--otk-qr-textarea-bg-color', defaultValue: '#222222', inputType: 'color', idSuffix: 'qr-textarea-bg' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Textarea Text:", storageKey: 'qrTextareaTextColor', cssVariable: '--otk-qr-textarea-text-color', defaultValue: '#eeeeee', inputType: 'color', idSuffix: 'qr-textarea-text' }));
-
-        // --- Messages Section Restructuring ---
         // --- Messages (Odds) Section ---
-        const oddMessagesHeading = createSectionHeading('Messages (Odds)');
-        oddMessagesHeading.style.marginTop = "22px";
-        oddMessagesHeading.style.marginBottom = "18px";
-        themeOptionsContainer.appendChild(oddMessagesHeading);
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepthOddContentFontSize', cssVariable: '--otk-msg-depth-odd-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-odd-content-fontsize', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepthOddBgColor', cssVariable: '--otk-msg-depth-odd-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth-odd-bg', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepthOddTextColor', cssVariable: '--otk-msg-depth-odd-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-odd-text', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepthOddHeaderTextColor', cssVariable: '--otk-msg-depth-odd-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-odd-header-text', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerHeaderBorderColorOdd', cssVariable: '--otk-viewer-header-border-color-odd', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border-odd', requiresRerender: true }));
+        const oddMessagesSection = createCollapsibleSubSection('Messages (Odds)');
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepthOddContentFontSize', cssVariable: '--otk-msg-depth-odd-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-odd-content-fontsize', requiresRerender: true }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepthOddBgColor', cssVariable: '--otk-msg-depth-odd-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth-odd-bg', requiresRerender: true }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepthOddTextColor', cssVariable: '--otk-msg-depth-odd-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-odd-text', requiresRerender: true }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepthOddHeaderTextColor', cssVariable: '--otk-msg-depth-odd-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-odd-header-text', requiresRerender: true }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerHeaderBorderColorOdd', cssVariable: '--otk-viewer-header-border-color-odd', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border-odd', requiresRerender: true }));
 
         // --- Messages (Evens) Section ---
-        const evenMessagesHeading = createSectionHeading('Messages (Evens)');
-        evenMessagesHeading.style.marginTop = "22px";
-        evenMessagesHeading.style.marginBottom = "18px";
-        themeOptionsContainer.appendChild(evenMessagesHeading);
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepthEvenContentFontSize', cssVariable: '--otk-msg-depth-even-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-even-content-fontsize', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepthEvenBgColor', cssVariable: '--otk-msg-depth-even-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'msg-depth-even-bg', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepthEvenTextColor', cssVariable: '--otk-msg-depth-even-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-even-text', requiresRerender: true }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepthEvenHeaderTextColor', cssVariable: '--otk-msg-depth-even-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-even-header-text', requiresRerender: true }));
+        const evenMessagesSection = createCollapsibleSubSection('Messages (Evens)');
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepthEvenContentFontSize', cssVariable: '--otk-msg-depth-even-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-even-content-fontsize', requiresRerender: true }));
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepthEvenBgColor', cssVariable: '--otk-msg-depth-even-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'msg-depth-even-bg', requiresRerender: true }));
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepthEvenTextColor', cssVariable: '--otk-msg-depth-even-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-even-text', requiresRerender: true }));
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepthEvenHeaderTextColor', cssVariable: '--otk-msg-depth-even-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-even-header-text', requiresRerender: true }));
 
         // --- Message Icons Section ---
-        const messageIconsHeading = createSectionHeading('Message Icons');
-        messageIconsHeading.style.marginTop = "22px";
-        messageIconsHeading.style.marginBottom = "18px";
-        themeOptionsContainer.appendChild(messageIconsHeading);
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Block Icon (Odd):", storageKey: 'blockIconColorOdd', cssVariable: '--otk-block-icon-color-odd', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-odd' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Block Icon (Even):", storageKey: 'blockIconColorEven', cssVariable: '--otk-block-icon-color-even', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-even' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Odd):", storageKey: 'pinIconColorOdd', cssVariable: '--otk-pin-icon-color-odd', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-odd' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Even):", storageKey: 'pinIconColorEven', cssVariable: '--otk-pin-icon-color-even', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-even' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Active):", storageKey: 'pinIconColorActive', cssVariable: '--otk-pin-icon-color-active', defaultValue: '#ff0000', inputType: 'color', idSuffix: 'pin-icon-active' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Media Menu Icon:", storageKey: 'mediaMenuIconColor', cssVariable: '--otk-media-menu-icon-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'media-menu-icon' }));
+        const messageIconsSection = createCollapsibleSubSection('Message Icons');
+        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Block Icon (Odd):", storageKey: 'blockIconColorOdd', cssVariable: '--otk-block-icon-color-odd', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-odd' }));
+        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Block Icon (Even):", storageKey: 'blockIconColorEven', cssVariable: '--otk-block-icon-color-even', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-even' }));
+        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Odd):", storageKey: 'pinIconColorOdd', cssVariable: '--otk-pin-icon-color-odd', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-odd' }));
+        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Even):", storageKey: 'pinIconColorEven', cssVariable: '--otk-pin-icon-color-even', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-even' }));
+        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Active):", storageKey: 'pinIconColorActive', cssVariable: '--otk-pin-icon-color-active', defaultValue: '#ff0000', inputType: 'color', idSuffix: 'pin-icon-active' }));
+        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Media Menu Icon:", storageKey: 'mediaMenuIconColor', cssVariable: '--otk-media-menu-icon-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'media-menu-icon' }));
 
         // --- Options Panel Section ---
-        const optionsPanelSectionHeading = createSectionHeading('Options Panel');
-        optionsPanelSectionHeading.style.marginTop = "22px"; // Increased top margin
-        optionsPanelSectionHeading.style.marginBottom = "18px"; // Increased bottom margin
-        themeOptionsContainer.appendChild(optionsPanelSectionHeading);
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Panel Text:", storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' }));
+        const optionsPanelSection = createCollapsibleSubSection('Options Panel');
+        optionsPanelSection.appendChild(createThemeOptionRow({ labelText: "Panel Text:", storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' }));
 
         // --- Loading Screen Sub-Section (within Theme) ---
-        const loadingScreenSubHeading = document.createElement('h6');
-        loadingScreenSubHeading.textContent = "Loading Screen";
-        loadingScreenSubHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left;"; // Increased margin-top and margin-bottom
-        themeOptionsContainer.appendChild(loadingScreenSubHeading);
-
-        // Add Overlay Opacity first
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Overlay Opacity:", storageKey: 'loadingOverlayOpacity', cssVariable: '--otk-loading-overlay-opacity', defaultValue: '0.8', inputType: 'number', min:0.0, max:1.0, step:0.05, idSuffix: 'loading-overlay-opacity' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Overlay Base:", storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'loadingTextColor', cssVariable: '--otk-loading-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-text' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Progress Bar Background:", storageKey: 'loadingProgressBarBgColor', cssVariable: '--otk-loading-progress-bar-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'loading-progress-bg' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Progress Bar Fill:", storageKey: 'loadingProgressBarFillColor', cssVariable: '--otk-loading-progress-bar-fill-color', defaultValue: '#4CAF50', inputType: 'color', idSuffix: 'loading-progress-fill' }));
-        themeOptionsContainer.appendChild(createThemeOptionRow({ labelText: "Progress Bar Text:", storageKey: 'loadingProgressBarTextColor', cssVariable: '--otk-loading-progress-bar-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-progress-text' }));
+        const loadingScreenSection = createCollapsibleSubSection('Loading Screen');
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Overlay Opacity:", storageKey: 'loadingOverlayOpacity', cssVariable: '--otk-loading-overlay-opacity', defaultValue: '0.8', inputType: 'number', min:0.0, max:1.0, step:0.05, idSuffix: 'loading-overlay-opacity' }));
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Overlay Base:", storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' }));
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'loadingTextColor', cssVariable: '--otk-loading-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-text' }));
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Progress Bar Background:", storageKey: 'loadingProgressBarBgColor', cssVariable: '--otk-loading-progress-bar-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'loading-progress-bg' }));
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Progress Bar Fill:", storageKey: 'loadingProgressBarFillColor', cssVariable: '--otk-loading-progress-bar-fill-color', defaultValue: '#4CAF50', inputType: 'color', idSuffix: 'loading-progress-fill' }));
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Progress Bar Text:", storageKey: 'loadingProgressBarTextColor', cssVariable: '--otk-loading-progress-bar-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-progress-text' }));
 
         // --- Custom Themes Section ---
         // themeOptionsContainer.appendChild(createDivider()); // Removed divider
@@ -8669,13 +8635,15 @@ function applyThemeSettings(options = {}) {
             if (show) {
                 optionsWindow.style.display = 'flex';
                 if (clockElement) clockElement.style.display = 'none';
-                if (countdownElement) countdownElement.style.display = 'none';
+                // Keep countdown timer visible
+                // if (countdownElement) countdownElement.style.display = 'none';
             } else {
                 optionsWindow.style.display = 'none';
                 if (clockElement && localStorage.getItem('otkClockEnabled') === 'true') {
                     clockElement.style.display = 'flex';
                 }
-                if (countdownElement) countdownElement.style.display = 'flex';
+                // Keep countdown timer visible
+                // if (countdownElement) countdownElement.style.display = 'flex';
             }
             consoleLog(`Toggled options window visibility to: ${show ? 'flex' : 'none'}`);
         };
