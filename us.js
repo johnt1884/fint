@@ -6488,7 +6488,7 @@ function applyThemeSettings(options = {}) {
             height: 25px;
             font-size: 11px;
             box-sizing: border-box;
-            width: auto;
+            width: 70px;
         `;
 
         group.appendChild(label);
@@ -7383,7 +7383,7 @@ function applyThemeSettings(options = {}) {
 
             const browseButton = document.createElement('button');
             browseButton.textContent = "Browse...";
-            browseButton.style.cssText = "height: 25px; flex-shrink: 0; padding: 2px 10px; font-size: 11px; box-sizing: border-box;";
+            browseButton.style.cssText = "height: 25px; flex-shrink: 0; padding: 2px 10px; font-size: 11px; box-sizing: border-box; width: 108px;";
 
             const fileInput = document.createElement('input');
             fileInput.type = 'file';
@@ -7497,7 +7497,7 @@ function applyThemeSettings(options = {}) {
                 height: 25px;
                 font-size: 11px;
                 box-sizing: border-box;
-                width: auto;
+                width: 70px;
             `;
 
             group.appendChild(label);
@@ -7735,18 +7735,10 @@ function applyThemeSettings(options = {}) {
             requiresRerender: false
         }));
 
-        const dividerCheckboxRow = createCheckboxOptionRow({
-            labelText: "Enable Thread List Divider:",
-            storageKey: 'otkThreadTimeDividerEnabled',
-            defaultValue: true,
-            idSuffix: 'thread-time-divider-enable'
-        });
-        guiSectionContent.appendChild(dividerCheckboxRow);
-
         const dividerSymbolRow = createThemeOptionRow({
-            labelText: "Divider Symbol:",
+            labelText: "Divider:",
             storageKey: 'otkThreadTimeDividerSymbol',
-            cssVariable: '--otk-thread-time-divider-symbol',
+            cssVariable: '--otk-thread-time-divider-symbol', // This is not used but kept for consistency
             defaultValue: '|',
             inputType: 'text',
             idSuffix: 'thread-time-divider-symbol'
@@ -7763,17 +7755,60 @@ function applyThemeSettings(options = {}) {
         });
         guiSectionContent.appendChild(dividerColorRow);
 
-        const dividerCheckbox = dividerCheckboxRow.querySelector('input[type="checkbox"]');
-        const updateDividerOptionsVisibility = () => {
-            const isEnabled = dividerCheckbox.checked;
-            dividerSymbolRow.style.display = isEnabled ? 'grid' : 'none';
-            dividerColorRow.style.display = isEnabled ? 'grid' : 'none';
-        };
+        // Modify the divider symbol row to include the new dropdown
+        const dividerSymbolControlsWrapper = dividerSymbolRow.querySelector('.otk-option-row > div');
+        const dividerSymbolInput = dividerSymbolRow.querySelector('input[type="text"]');
+        const dividerDefaultButton = dividerSymbolRow.querySelector('button');
+        if (dividerSymbolControlsWrapper && dividerSymbolInput && dividerDefaultButton) {
+            dividerDefaultButton.remove(); // Remove the original 'Default' button
 
-        dividerCheckbox.addEventListener('change', updateDividerOptionsVisibility);
+            const dividerStateDropdown = document.createElement('select');
+            dividerStateDropdown.style.cssText = `
+                height: 25px;
+                font-size: 11px;
+                box-sizing: border-box;
+                margin-left: 8px;
+            `;
+            const states = ['Enabled', 'Disabled', 'Default'];
+            states.forEach(state => {
+                const option = document.createElement('option');
+                option.value = state.toLowerCase();
+                option.textContent = state;
+                dividerStateDropdown.appendChild(option);
+            });
 
-        // Initial call to set visibility based on saved state
-        setTimeout(updateDividerOptionsVisibility, 0);
+            dividerSymbolControlsWrapper.appendChild(dividerStateDropdown);
+
+            const settings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
+            const isEnabled = settings.otkThreadTimeDividerEnabled !== false; // Default to true if not set
+            dividerStateDropdown.value = isEnabled ? 'enabled' : 'disabled';
+
+
+            const updateDividerVisibility = () => {
+                const state = dividerStateDropdown.value;
+                const enabled = state !== 'disabled';
+                dividerSymbolInput.style.visibility = enabled ? 'visible' : 'hidden';
+                dividerColorRow.style.display = enabled ? 'grid' : 'none';
+            };
+
+            dividerStateDropdown.addEventListener('change', () => {
+                const state = dividerStateDropdown.value;
+                if (state === 'default') {
+                    saveThemeSetting('otkThreadTimeDividerEnabled', true, false);
+                    saveThemeSetting('otkThreadTimeDividerSymbol', '|', false);
+                    dividerSymbolInput.value = '|';
+                    dividerStateDropdown.value = 'enabled';
+                } else {
+                    const isEnabled = state === 'enabled';
+                    saveThemeSetting('otkThreadTimeDividerEnabled', isEnabled, false);
+                }
+                updateDividerVisibility();
+                renderThreadList();
+            });
+
+            // Initial setup
+            updateDividerVisibility();
+        }
 
         guiSectionContent.appendChild(createDropdownRow({
             labelText: 'Bracket Style:',
