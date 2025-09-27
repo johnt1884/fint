@@ -3169,6 +3169,9 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
                                     const quotedElement = createMessageElementDOM(quotedMessageObject, mediaLoadPromises, uniqueImageViewerHashes, quotedMessageObject.board || boardForLink, false, currentDepth + 1, null, message.id, ancestors, effectiveDepthForStyling + 1);
                                     if (quotedElement) {
                                         textElement.appendChild(quotedElement);
+                                        if (currentTextSegment.substring(earliestMatch[0].length).trim().length > 0) {
+                                            textElement.appendChild(document.createElement('br'));
+                                        }
                                     }
                                 } else {
                                     const notFoundSpan = document.createElement('span');
@@ -6687,7 +6690,7 @@ function applyThemeSettings(options = {}) {
         optionsWindow.style.cssText = `
             position: fixed;
             top: 0;
-            left: 0;
+            left: -50%;
             width: 50%;
             height: 100vh;
             background-color: #2c2c2c; /* Slightly lighter than GUI for distinction */
@@ -6698,6 +6701,7 @@ function applyThemeSettings(options = {}) {
             display: none; /* Hidden by default */
             flex-direction: column;
             color: var(--otk-options-text-color); /* Use specific variable for options window text */
+            transition: left 0.3s ease-in-out;
         `;
 
         const titleBar = document.createElement('div');
@@ -6783,7 +6787,6 @@ function applyThemeSettings(options = {}) {
         const generalSettingsContainer = document.createElement('div');
         generalSettingsContainer.id = 'otk-general-settings-container';
         generalSettingsContainer.style.cssText = `
-            margin-bottom: 15px;
             padding: 0;
             box-sizing: border-box;
         `;
@@ -6792,6 +6795,8 @@ function applyThemeSettings(options = {}) {
         const generalSettingsHeading = createSectionHeading('General Settings');
         generalSettingsHeading.style.cursor = 'pointer';
         generalSettingsHeading.style.position = 'relative'; // For icon positioning
+        generalSettingsHeading.style.marginTop = "10px";
+        generalSettingsHeading.style.marginBottom = "6px";
         // Vertically center the text content
         generalSettingsHeading.style.display = 'flex';
         generalSettingsHeading.style.alignItems = 'center';
@@ -7724,8 +7729,8 @@ function applyThemeSettings(options = {}) {
 
         // --- GUI Section ---
         const guiSectionContent = createCollapsibleSubSection('GUI', { defaultCollapsed: false });
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Title Text:", storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'title-text' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Title Font Colour:", storageKey: 'titleTextColor', cssVariable: '--otk-title-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'title-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Colour:", storageKey: 'guiBgColor', cssVariable: '--otk-gui-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'gui-bg' }));
 
         guiSectionContent.appendChild(createImagePickerRow({
             labelText: 'Background Image URL:',
@@ -7734,33 +7739,33 @@ function applyThemeSettings(options = {}) {
         }));
 
         guiSectionContent.appendChild(createDropdownRow({
-            labelText: 'Background Size:',
+            labelText: 'Background Image Size:',
             storageKey: 'guiBgSize',
             options: ['auto', 'cover', 'contain'],
             defaultValue: 'cover',
             requiresRerender: false
         }));
         guiSectionContent.appendChild(createDropdownRow({
-            labelText: 'Background Repeat:',
+            labelText: 'Background Image Repeat Mode:',
             storageKey: 'guiBgRepeat',
             options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
             defaultValue: 'no-repeat',
             requiresRerender: false
         }));
         guiSectionContent.appendChild(createDropdownRow({
-            labelText: 'Background Position:',
+            labelText: 'Background Image Position:',
             storageKey: 'guiBgPosition',
             options: ['center', 'top', 'bottom', 'left', 'right'],
             defaultValue: 'center',
             requiresRerender: false
         }));
 
-        guiSectionContent.appendChild(createColorOrNoneOptionRow({ labelText: "Thread Box Outline:", storageKey: 'guiThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'gui-thread-box-outline' }));
+        guiSectionContent.appendChild(createColorOrNoneOptionRow({ labelText: "Thread Title Box Outline:", storageKey: 'guiThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'gui-thread-box-outline' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Thread Titles Text:", storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Thread Times Text:", storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' }));
 
         guiSectionContent.appendChild(createDropdownRow({
-            labelText: 'Time Position:',
+            labelText: 'Thread Time Position:',
             storageKey: 'otkThreadTimePosition',
             options: ['After Title', 'Before Title'],
             defaultValue: 'Before Title',
@@ -7768,7 +7773,7 @@ function applyThemeSettings(options = {}) {
         }));
 
         const dividerSymbolRow = createThemeOptionRow({
-            labelText: "Divider:",
+            labelText: "Thread Title/Thread Clock Divider:",
             storageKey: 'otkThreadTimeDividerSymbol',
             cssVariable: '--otk-thread-time-divider-symbol',
             defaultValue: '|',
@@ -7825,7 +7830,7 @@ function applyThemeSettings(options = {}) {
 
 
         const dividerColorRow = createThemeOptionRow({
-            labelText: "Divider Color:",
+            labelText: "Thread Title/Thread Time Divider Colour:",
             storageKey: 'otkThreadTimeDividerColor',
             cssVariable: '--otk-thread-time-divider-color',
             defaultValue: '#ff8040',
@@ -7839,7 +7844,7 @@ function applyThemeSettings(options = {}) {
         }
 
         guiSectionContent.appendChild(createDropdownRow({
-            labelText: 'Bracket Style:',
+            labelText: 'Thread Time Bracket Style:',
             storageKey: 'otkThreadTimeBracketStyle',
             options: ['[]', '()', 'none'],
             defaultValue: '[]',
@@ -7847,7 +7852,7 @@ function applyThemeSettings(options = {}) {
         }));
 
         guiSectionContent.appendChild(createThemeOptionRow({
-            labelText: "Bracket Color:",
+            labelText: "Thread Time Bracket Colour:",
             storageKey: 'otkThreadTimeBracketColor',
             cssVariable: '--otk-thread-time-bracket-color',
             defaultValue: '#aaa',
@@ -7869,32 +7874,27 @@ function applyThemeSettings(options = {}) {
             requiresRerender: false
         }));
 
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Stats Text:", storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Stats Dash:", storageKey: 'statsDashColor', cssVariable: '--otk-stats-dash-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'stats-dash' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Text:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Thread(s) Stats Font Colour:", storageKey: 'actualStatsTextColor', cssVariable: '--otk-stats-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'actual-stats-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Thread(s) Stats Bullet point Colour:", storageKey: 'statsDashColor', cssVariable: '--otk-stats-dash-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'stats-dash' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Font Colour:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
 
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Cog Icon:", storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Background:", storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Label Text:", storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Timer Text:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Separator:", storageKey: 'separatorColor', cssVariable: '--otk-separator-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'separator' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Background:", storageKey: 'clockBgColor', cssVariable: '--otk-clock-bg-color', defaultValue: '', inputType: 'color', idSuffix: 'clock-bg' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Text:", storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Border:", storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-border' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Divider:", storageKey: 'clockDividerColor', cssVariable: '--otk-clock-divider-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-divider' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Cog Icon:", storageKey: 'clockCogColor', cssVariable: '--otk-clock-cog-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-cog' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Background:", storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Text:", storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Options Icon Colour:", storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Background Colour:", storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Main Font Colour:", storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Timer Font Colour:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Background Colour:", storageKey: 'clockBgColor', cssVariable: '--otk-clock-bg-color', defaultValue: '', inputType: 'color', idSuffix: 'clock-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Font Colour:", storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Border Colour:", storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-border' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Divider Colour:", storageKey: 'clockDividerColor', cssVariable: '--otk-clock-divider-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-divider' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Options Icon Colour:", storageKey: 'clockCogColor', cssVariable: '--otk-clock-cog-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-cog' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Background Colour:", storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Font Colour:", storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }));
 
-        const guiButtonsHeading = document.createElement('h6');
-        guiButtonsHeading.textContent = "GUI Buttons";
-        guiButtonsHeading.style.cssText = "margin-top: 20px; margin-bottom: 15px; color: #cccccc; font-size: 12px; font-weight: bold; text-align: left; padding-left: 30px;";
-        guiSectionContent.appendChild(guiButtonsHeading);
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Border:", storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Hover Background:", storageKey: 'guiButtonHoverBgColor', cssVariable: '--otk-button-hover-bg-color', defaultValue: '#666666', inputType: 'color', idSuffix: 'gui-button-hover-bg' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Active Background:", storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Button Background Colour:", storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Button Mouseover Background Colour:", storageKey: 'guiButtonHoverBgColor', cssVariable: '--otk-button-hover-bg-color', defaultValue: '#666666', inputType: 'color', idSuffix: 'gui-button-hover-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Button Clicked Background Colour:", storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Button Font Colour:", storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Button Border Colour:", storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' }));
 
         function createDropdownRow(options) {
             const group = document.createElement('div');
@@ -8211,10 +8211,6 @@ function applyThemeSettings(options = {}) {
 
         // --- Custom Themes Section ---
         // themeOptionsContainer.appendChild(createDivider()); // Removed divider
-        const customThemesSectionHeading = createSectionHeading('Custom Themes');
-        customThemesSectionHeading.style.marginTop = "22px"; // Increased top margin
-        customThemesSectionHeading.style.marginBottom = "18px"; // Increased bottom margin
-        themeOptionsContainer.appendChild(customThemesSectionHeading);
 
         const customThemeActionsWrapper = document.createElement('div');
         customThemeActionsWrapper.style.cssText = `
@@ -8629,23 +8625,20 @@ function applyThemeSettings(options = {}) {
 
         // Event Listeners for cog and close
         const toggleOptionsPanelAndOverlays = (show) => {
-            const clockElement = document.getElementById('otk-clock');
-            const countdownElement = document.getElementById('otk-countdown-timer-movable');
-
             if (show) {
                 optionsWindow.style.display = 'flex';
-                if (clockElement) clockElement.style.display = 'none';
-                // Keep countdown timer visible
-                // if (countdownElement) countdownElement.style.display = 'none';
+                setTimeout(() => {
+                    optionsWindow.style.left = '0';
+                }, 10);
             } else {
-                optionsWindow.style.display = 'none';
-                if (clockElement && localStorage.getItem('otkClockEnabled') === 'true') {
-                    clockElement.style.display = 'flex';
-                }
-                // Keep countdown timer visible
-                // if (countdownElement) countdownElement.style.display = 'flex';
+                optionsWindow.style.left = '-50%';
+                setTimeout(() => {
+                    if (optionsWindow.style.left === '-50%') {
+                        optionsWindow.style.display = 'none';
+                    }
+                }, 300); // Match CSS transition duration
             }
-            consoleLog(`Toggled options window visibility to: ${show ? 'flex' : 'none'}`);
+            consoleLog(`Toggled options window visibility to: ${show}`);
         };
 
         const cogIcon = document.getElementById('otk-settings-cog');
@@ -8655,7 +8648,7 @@ function applyThemeSettings(options = {}) {
                 toggleOptionsPanelAndOverlays(isHidden);
             });
         } else {
-                    consoleError("Cog icon not found for options window toggle.");
+            consoleError("Cog icon not found for options window toggle.");
         }
 
         closeButton.addEventListener('click', () => {
