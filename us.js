@@ -5401,12 +5401,10 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
 
     // Hide search if clicking outside
     document.addEventListener('click', (e) => {
-        const optionsWindow = document.getElementById('otk-options-window');
-        if (
-            !clockElement.contains(e.target) &&
-            !timezoneSearchContainer.contains(e.target) &&
-            (!optionsWindow || !optionsWindow.contains(e.target))
-        ) {
+        if (timezoneSearchContainer.style.display === 'block' && !timezoneSearchContainer.contains(e.target)) {
+            // The 'Change' button's click handler uses e.stopPropagation(),
+            // so we don't need an extra check for it here. Any click that
+            // reaches the document and is outside the search container should close it.
             timezoneSearchContainer.style.display = 'none';
         }
     });
@@ -5780,7 +5778,6 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         footerControls.style.cssText = `
             display: flex;
             justify-content: flex-end;
-            padding-right: 83px; /* Align with the 'Change' button above */
         `;
 
         const addClockBtn = createTrackerButton('Add New Clock');
@@ -6700,28 +6697,31 @@ function applyThemeSettings(options = {}) {
         optionsTab.style.cursor = 'pointer';
         optionsTab.style.display = 'inline-block';
 
-        const clockOptionsTab = document.createElement('span');
-        clockOptionsTab.id = 'otk-options-tab-clock';
-        clockOptionsTab.innerHTML = '&nbsp;|&nbsp;Clock Options';
-        clockOptionsTab.style.cursor = 'pointer';
-        clockOptionsTab.style.display = 'inline-block';
+        const clockOptionsText = document.createElement('span');
+        clockOptionsText.id = 'otk-options-tab-clock';
+        clockOptionsText.textContent = 'Clock Options';
+        clockOptionsText.style.cursor = 'pointer';
+
+        const clockOptionsDivider = document.createElement('span');
+        clockOptionsDivider.innerHTML = '&nbsp;|&nbsp;';
 
         titleContainer.appendChild(optionsTab);
-        titleContainer.appendChild(clockOptionsTab);
+        titleContainer.appendChild(clockOptionsDivider);
+        titleContainer.appendChild(clockOptionsText);
         titleBar.appendChild(titleContainer);
 
         optionsTab.addEventListener('click', () => {
             document.getElementById('otk-main-options-panel').style.display = 'block';
             document.getElementById('otk-clock-options-panel').style.display = 'none';
             optionsTab.style.textDecoration = 'underline';
-            clockOptionsTab.style.textDecoration = 'none';
+            clockOptionsText.style.textDecoration = 'none';
         });
 
-        clockOptionsTab.addEventListener('click', () => {
+        clockOptionsText.addEventListener('click', () => {
             document.getElementById('otk-main-options-panel').style.display = 'none';
             document.getElementById('otk-clock-options-panel').style.display = 'block';
             optionsTab.style.textDecoration = 'none';
-            clockOptionsTab.style.textDecoration = 'underline';
+            clockOptionsText.style.textDecoration = 'underline';
             renderClockOptions();
         });
 
