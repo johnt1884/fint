@@ -5224,6 +5224,34 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
     }
 
     // --- Button Implementations & Event Listeners ---
+
+    // Timezone Search Container (declared globally to avoid redeclaration)
+    const timezoneSearchContainer = document.createElement('div');
+    timezoneSearchContainer.id = 'otk-timezone-search-container';
+    timezoneSearchContainer.style.cssText = `
+        position: fixed;
+        /* Position will be set dynamically based on clock position */
+        background-color: var(--otk-clock-search-bg-color, #333);
+        border: 1px solid #555;
+        border-radius: 4px;
+        z-index: 100003; /* Above options window */
+        display: none;
+        padding: 8px;
+        width: 250px;
+    `;
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.id = 'otk-timezone-search-input';
+    searchInput.placeholder = 'Search for a city/region...';
+    searchInput.style.cssText = 'width: 100%; box-sizing: border-box; margin-bottom: 5px;';
+    timezoneSearchContainer.appendChild(searchInput);
+
+    const searchResultsDiv = document.createElement('div');
+    searchResultsDiv.id = 'otk-timezone-search-results';
+    searchResultsDiv.style.cssText = 'max-height: 200px; overflow-y: auto;';
+    timezoneSearchContainer.appendChild(searchResultsDiv);
+    document.body.appendChild(timezoneSearchContainer);
+
     const clockElement = document.createElement('div');
     clockElement.id = 'otk-clock';
     clockElement.style.cssText = `
@@ -5243,34 +5271,6 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
     `;
 
     document.body.appendChild(clockElement);
-
-    // Timezone Search Container
-    const timezoneSearchContainer = document.createElement('div');
-    timezoneSearchContainer.id = 'otk-timezone-search-container';
-    timezoneSearchContainer.style.cssText = `
-        position: fixed;
-        /* Position will be set dynamically based on clock position */
-        background-color: var(--otk-clock-search-bg-color, #333);
-        border: 1px solid #555;
-        border-radius: 4px;
-        z-index: 100002; /* Above clock */
-        display: none;
-        padding: 8px;
-        width: 250px;
-    `;
-    const searchInput = document.createElement('input');
-    searchInput.type = 'text';
-    searchInput.id = 'otk-timezone-search-input';
-    searchInput.placeholder = 'Search for a city/region...';
-    searchInput.style.cssText = 'width: 100%; box-sizing: border-box; margin-bottom: 5px;';
-    timezoneSearchContainer.appendChild(searchInput);
-
-    const searchResultsDiv = document.createElement('div');
-    searchResultsDiv.id = 'otk-timezone-search-results';
-    searchResultsDiv.style.cssText = 'max-height: 200px; overflow-y: auto;';
-    timezoneSearchContainer.appendChild(searchResultsDiv);
-
-    document.body.appendChild(timezoneSearchContainer);
 
     // Make clock draggable
     let isClockDragging = false;
@@ -5401,11 +5401,11 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
 
     // Hide search if clicking outside
     document.addEventListener('click', (e) => {
-        const clockOptionsWindow = document.getElementById('otk-clock-options-window');
+        const optionsWindow = document.getElementById('otk-options-window');
         if (
             !clockElement.contains(e.target) &&
             !timezoneSearchContainer.contains(e.target) &&
-            (!clockOptionsWindow || !clockOptionsWindow.contains(e.target))
+            (!optionsWindow || !optionsWindow.contains(e.target))
         ) {
             timezoneSearchContainer.style.display = 'none';
         }
@@ -5625,7 +5625,7 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
     let activeClockSearchId = null;
 
     function renderClockOptions() {
-        const contentArea = document.getElementById('otk-clock-options-content');
+        const contentArea = document.getElementById('otk-clock-options-panel');
         if (!contentArea) return;
 
         contentArea.innerHTML = ''; // Clear previous content
@@ -5638,16 +5638,10 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
 
         clocks.forEach((clock, index) => {
             const clockRow = document.createElement('div');
+            clockRow.classList.add('otk-option-row');
             clockRow.draggable = true;
             clockRow.dataset.clockId = clock.id;
-            clockRow.style.cssText = `
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                padding: 8px 0;
-                border-bottom: 1px solid #444;
-                cursor: grab;
-            `;
+            clockRow.style.cursor = 'grab';
 
             clockRow.addEventListener('dragstart', (e) => {
                 draggedClockId = clock.id;
@@ -5680,28 +5674,54 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
                 }
             });
 
-            const clockName = document.createElement('span');
-            clockName.textContent = clock.displayPlace || clock.timezone;
+            const clockName = document.createElement('label');
+            clockName.innerHTML = `<b>Clock ${index + 1} -</b> ${clock.displayPlace || clock.timezone}`;
             clockRow.appendChild(clockName);
 
             const buttonsWrapper = document.createElement('div');
+            buttonsWrapper.style.cssText = `
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                justify-content: flex-end;
+            `;
 
             const changeBtn = createTrackerButton('Change');
+            changeBtn.style.padding = '2px 8px';
+            changeBtn.style.fontSize = '11px';
+            changeBtn.style.height = '25px';
+            changeBtn.style.boxSizing = 'border-box';
             changeBtn.dataset.clockId = clock.id;
             changeBtn.addEventListener('click', (e) => {
+                e.stopPropagation(); // Prevent the global click listener from hiding the search box
                 activeClockSearchId = clock.id;
                 const timezoneSearchContainer = document.getElementById('otk-timezone-search-container');
                 if (timezoneSearchContainer) {
+                    // Temporarily display off-screen to calculate width
+                    timezoneSearchContainer.style.visibility = 'hidden';
+                    timezoneSearchContainer.style.display = 'block';
+                    const containerWidth = timezoneSearchContainer.offsetWidth;
+
                     const buttonRect = e.target.getBoundingClientRect();
                     timezoneSearchContainer.style.top = `${buttonRect.bottom + 5}px`;
-                    timezoneSearchContainer.style.left = `${buttonRect.left - timezoneSearchContainer.offsetWidth + buttonRect.width}px`;
-                    timezoneSearchContainer.style.display = 'block';
+                    timezoneSearchContainer.style.left = `${buttonRect.right - containerWidth}px`;
+                    timezoneSearchContainer.style.visibility = 'visible';
+
+                // Focus the input when the search box appears
+                const searchInput = document.getElementById('otk-timezone-search-input');
+                if (searchInput) {
+                    searchInput.focus();
+                }
                 }
             });
             buttonsWrapper.appendChild(changeBtn);
 
             if (index > 0) { // Don't allow removing the first (primary) clock
                 const removeBtn = createTrackerButton('Remove');
+                removeBtn.style.padding = '2px 8px';
+                removeBtn.style.fontSize = '11px';
+                removeBtn.style.height = '25px';
+                removeBtn.style.boxSizing = 'border-box';
                 removeBtn.dataset.clockId = clock.id;
                 removeBtn.style.marginLeft = '5px';
                 removeBtn.addEventListener('click', () => {
@@ -5749,16 +5769,25 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             draggedClockId = null;
         });
 
-        const footerWrapper = document.createElement('div');
-        footerWrapper.style.cssText = `
+        const footerRow = document.createElement('div');
+        footerRow.classList.add('otk-option-row');
+        footerRow.style.marginTop = '15px';
+
+        const footerLabel = document.createElement('label'); // Empty label for spacing
+        footerRow.appendChild(footerLabel);
+
+        const footerControls = document.createElement('div');
+        footerControls.style.cssText = `
             display: flex;
-            justify-content: space-between;
-            margin-top: 15px;
-            gap: 10px;
+            justify-content: flex-end;
+            padding-right: 83px; /* Align with the 'Change' button above */
         `;
 
         const addClockBtn = createTrackerButton('Add New Clock');
-        addClockBtn.style.flex = '1';
+        addClockBtn.style.padding = '2px 8px';
+        addClockBtn.style.fontSize = '11px';
+        addClockBtn.style.height = '25px';
+        addClockBtn.style.boxSizing = 'border-box';
         addClockBtn.addEventListener('click', () => {
             const currentClocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
             const newClock = {
@@ -5772,36 +5801,9 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             renderClocks();
         });
 
-        const closeBtn = createTrackerButton('Close');
-        closeBtn.style.flex = '1';
-        closeBtn.addEventListener('click', () => {
-            document.getElementById('otk-clock-options-window').style.display = 'none';
-        });
-
-        const cogPositionWrapper = document.createElement('div');
-        cogPositionWrapper.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-top: 10px;';
-        const cogPositionLabel = document.createElement('label');
-        cogPositionLabel.textContent = 'Cog Position:';
-        const cogPositionSelect = document.createElement('select');
-        const options = ['Before Clocks', 'After Clocks'];
-        options.forEach(opt => {
-            const optionEl = document.createElement('option');
-            optionEl.value = opt.toLowerCase().replace(' ', '-');
-            optionEl.textContent = opt;
-            cogPositionSelect.appendChild(optionEl);
-        });
-        cogPositionSelect.value = localStorage.getItem('otkClockCogPosition') || 'after-clocks';
-        cogPositionSelect.addEventListener('change', () => {
-            localStorage.setItem('otkClockCogPosition', cogPositionSelect.value);
-            renderClocks();
-        });
-        cogPositionWrapper.appendChild(cogPositionLabel);
-        cogPositionWrapper.appendChild(cogPositionSelect);
-
-        footerWrapper.appendChild(addClockBtn);
-        footerWrapper.appendChild(closeBtn);
-        contentArea.appendChild(cogPositionWrapper);
-        contentArea.appendChild(footerWrapper);
+        footerControls.appendChild(addClockBtn);
+        footerRow.appendChild(footerControls);
+        clockListContainer.appendChild(footerRow);
     }
 
     function renderClocks() {
@@ -5835,28 +5837,6 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             }
         });
 
-        const cogIcon = document.createElement('span');
-        cogIcon.id = 'otk-clock-cog';
-        cogIcon.innerHTML = '&#x2699;';
-        cogIcon.style.cssText = 'font-size: 16px; margin: 0 10px; cursor: pointer; display: inline-block; color: var(--otk-clock-cog-color);';
-        cogIcon.title = "Edit Clocks";
-        cogIcon.addEventListener('click', () => {
-            const clockOptionsWindow = document.getElementById('otk-clock-options-window');
-            if (clockOptionsWindow) {
-                const isHidden = clockOptionsWindow.style.display === 'none';
-                clockOptionsWindow.style.display = isHidden ? 'flex' : 'none';
-                if (isHidden) {
-                    renderClockOptions();
-                }
-            }
-        });
-
-        const cogPosition = localStorage.getItem('otkClockCogPosition') || 'after-clocks';
-        if (cogPosition === 'before-clocks') {
-            clockContainer.insertBefore(cogIcon, clockContainer.firstChild);
-        } else {
-            clockContainer.appendChild(cogIcon);
-        }
 
         updateClockTimes();
     }
@@ -6310,11 +6290,6 @@ function applyThemeSettings(options = {}) {
             document.documentElement.style.setProperty('--otk-clock-search-text-color', settings.clockSearchTextColor);
             updateColorInputs('clock-search-text', settings.clockSearchTextColor);
         }
-        if (settings.clockCogColor) {
-            document.documentElement.style.setProperty('--otk-clock-cog-color', settings.clockCogColor);
-            updateColorInputs('clock-cog', settings.clockCogColor);
-        }
-
         // GUI Button Colors
         const buttonColorConfigs = [
             { key: 'guiButtonBgColor', cssVar: '--otk-button-bg-color', idSuffix: 'gui-button-bg' },
@@ -6716,7 +6691,42 @@ function applyThemeSettings(options = {}) {
             justify-content: space-between;
             align-items: center;
         `;
-        titleBar.textContent = 'Options'; // Changed title
+        const titleContainer = document.createElement('div');
+        titleContainer.style.display = 'flex';
+
+        const optionsTab = document.createElement('span');
+        optionsTab.id = 'otk-options-tab-main';
+        optionsTab.textContent = 'Main Options';
+        optionsTab.style.cursor = 'pointer';
+        optionsTab.style.display = 'inline-block';
+
+        const clockOptionsTab = document.createElement('span');
+        clockOptionsTab.id = 'otk-options-tab-clock';
+        clockOptionsTab.innerHTML = '&nbsp;|&nbsp;Clock Options';
+        clockOptionsTab.style.cursor = 'pointer';
+        clockOptionsTab.style.display = 'inline-block';
+
+        titleContainer.appendChild(optionsTab);
+        titleContainer.appendChild(clockOptionsTab);
+        titleBar.appendChild(titleContainer);
+
+        optionsTab.addEventListener('click', () => {
+            document.getElementById('otk-main-options-panel').style.display = 'block';
+            document.getElementById('otk-clock-options-panel').style.display = 'none';
+            optionsTab.style.textDecoration = 'underline';
+            clockOptionsTab.style.textDecoration = 'none';
+        });
+
+        clockOptionsTab.addEventListener('click', () => {
+            document.getElementById('otk-main-options-panel').style.display = 'none';
+            document.getElementById('otk-clock-options-panel').style.display = 'block';
+            optionsTab.style.textDecoration = 'none';
+            clockOptionsTab.style.textDecoration = 'underline';
+            renderClockOptions();
+        });
+
+        // Set initial state
+        optionsTab.style.textDecoration = 'underline';
 
         const titleBarButtons = document.createElement('div');
         titleBarButtons.style.display = 'flex';
@@ -6769,15 +6779,24 @@ function applyThemeSettings(options = {}) {
         const contentArea = document.createElement('div');
         contentArea.id = 'otk-options-content';
         contentArea.style.cssText = `
-            padding: 15px 0; /* Let child elements handle horizontal padding */
-            flex-grow: 1; /* Allows content to fill space */
-            overflow-y: auto; /* If content gets too long */
-            box-sizing: border-box; /* Ensure padding is included in width/height */
-            /* display: flex; Will be handled by section container */
-            /* flex-direction: column; */
-            /* gap: 10px; */
+            flex-grow: 1;
+            overflow-y: auto;
+            box-sizing: border-box;
         `;
         optionsWindow.appendChild(contentArea);
+
+        const mainOptionsPanel = document.createElement('div');
+        mainOptionsPanel.id = 'otk-main-options-panel';
+        mainOptionsPanel.style.cssText = 'padding: 15px 0; display: block;';
+
+        const clockOptionsPanel = document.createElement('div');
+        clockOptionsPanel.id = 'otk-clock-options-panel';
+        clockOptionsPanel.style.cssText = 'padding: 15px 0; display: none;';
+
+        contentArea.appendChild(mainOptionsPanel);
+        contentArea.appendChild(clockOptionsPanel);
+
+        renderClockOptions();
 
         // --- Main Sections Container (for tabs or collapsible sections later) ---
         // This container might not be strictly necessary anymore if we are just stacking sections.
@@ -6790,7 +6809,7 @@ function applyThemeSettings(options = {}) {
             padding: 0;
             box-sizing: border-box;
         `;
-        contentArea.appendChild(generalSettingsContainer);
+        mainOptionsPanel.appendChild(generalSettingsContainer);
 
         const generalSettingsHeading = createSectionHeading('General Settings');
         generalSettingsHeading.style.position = 'relative'; // For icon positioning
@@ -7254,7 +7273,7 @@ function applyThemeSettings(options = {}) {
         // The 'sectionsContainer' might be redundant if themeSection is the only thing in it.
         // Let's append themeSection directly to contentArea as well, after generalSettingsSection.
         const sectionsContainer = document.createElement('div'); // Keep for potential future use if more sections are added here
-        contentArea.appendChild(sectionsContainer);
+        mainOptionsPanel.appendChild(sectionsContainer);
 
 
         const themeSection = document.createElement('div');
@@ -7852,7 +7871,6 @@ function applyThemeSettings(options = {}) {
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Font Colour:", storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Border Colour:", storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-border' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Divider Colour:", storageKey: 'clockDividerColor', cssVariable: '--otk-clock-divider-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-divider' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Options Icon Colour:", storageKey: 'clockCogColor', cssVariable: '--otk-clock-cog-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-cog' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Background Colour:", storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock Search Font Colour:", storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' }));
 
@@ -8432,7 +8450,6 @@ function applyThemeSettings(options = {}) {
                 { storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' },
                 { storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'clock-border' },
                 { storageKey: 'clockSearchBgColor', cssVariable: '--otk-clock-search-bg-color', defaultValue: '#333', inputType: 'color', idSuffix: 'clock-search-bg' },
-                { storageKey: 'clockCogColor', cssVariable: '--otk-clock-cog-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'clock-cog' },
                 { storageKey: 'clockSearchTextColor', cssVariable: '--otk-clock-search-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-search-text' },
 
                 // QR Theming
@@ -9151,108 +9168,6 @@ function setupFilterWindow() {
 
 
 
-function setupClockOptionsWindow() {
-    consoleLog("Setting up Clock Options Window...");
-
-    if (document.getElementById('otk-clock-options-window')) {
-        consoleLog("Clock Options window already exists.");
-        return;
-    }
-
-    const clockOptionsWindow = document.createElement('div');
-    clockOptionsWindow.id = 'otk-clock-options-window';
-    clockOptionsWindow.style.cssText = `
-        position: fixed;
-        top: 150px;
-        left: 150px;
-        width: 350px;
-        min-height: 150px;
-        max-height: 400px;
-        background-color: #2c2c2c;
-        border: 1px solid #444;
-        border-radius: 5px;
-        z-index: 10001; /* Above main options window */
-        display: none;
-        flex-direction: column;
-        box-shadow: 0 5px 15px rgba(0,0,0,0.5);
-        color: var(--otk-options-text-color);
-    `;
-
-    const titleBar = document.createElement('div');
-    titleBar.id = 'otk-clock-options-title-bar';
-    titleBar.style.cssText = `
-        padding: 8px 12px;
-        background-color: #383838;
-        color: #f0f0f0;
-        font-weight: bold;
-        cursor: move;
-        border-bottom: 1px solid #444;
-        border-top-left-radius: 5px;
-        border-top-right-radius: 5px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    `;
-    titleBar.textContent = 'Clock Options';
-
-    const closeButton = document.createElement('span');
-    closeButton.id = 'otk-clock-options-close-btn';
-    closeButton.innerHTML = '&#x2715;';
-    closeButton.style.cssText = `
-        cursor: pointer;
-        font-size: 16px;
-        padding: 0 5px;
-    `;
-    closeButton.title = "Close Clock Settings";
-
-    closeButton.addEventListener('click', () => {
-        clockOptionsWindow.style.display = 'none';
-    });
-
-    titleBar.appendChild(closeButton);
-    clockOptionsWindow.appendChild(titleBar);
-
-    const contentArea = document.createElement('div');
-    contentArea.id = 'otk-clock-options-content';
-    contentArea.style.cssText = `
-        padding: 15px;
-        flex-grow: 1;
-        overflow-y: auto;
-    `;
-    clockOptionsWindow.appendChild(contentArea);
-
-    document.body.appendChild(clockOptionsWindow);
-
-    // Make window draggable
-    let isDragging = false;
-    let offsetX, offsetY;
-
-    titleBar.addEventListener('mousedown', (e) => {
-        if (e.target === closeButton) return;
-        isDragging = true;
-        offsetX = e.clientX - clockOptionsWindow.offsetLeft;
-        offsetY = e.clientY - clockOptionsWindow.offsetTop;
-        titleBar.style.userSelect = 'none';
-        document.body.style.userSelect = 'none';
-    });
-
-    document.addEventListener('mousemove', (e) => {
-        if (isDragging) {
-            let newLeft = e.clientX - offsetX;
-            let newTop = e.clientY - offsetY;
-            clockOptionsWindow.style.left = newLeft + 'px';
-            clockOptionsWindow.style.top = newTop + 'px';
-        }
-    });
-
-    document.addEventListener('mouseup', () => {
-        if (isDragging) {
-            isDragging = false;
-            titleBar.style.userSelect = '';
-            document.body.style.userSelect = '';
-        }
-    });
-}
 
     // --- Initial Actions / Main Execution ---
     async function main() {
@@ -9412,7 +9327,7 @@ function setupClockOptionsWindow() {
                 --otk-media-controls-bg-color-odd: rgba(255, 255, 255, 0.8);
                 --otk-media-controls-bg-color-even: rgba(217, 217, 217, 0.8);
                 --otk-media-menu-icon-color: #ff8040;
-                --otk-options-main-bg-color: transparent;
+                --otk-options-main-bg-color: #2C2C2C;
                 --otk-options-alt-bg-color: #383838;
             }
 
@@ -9578,7 +9493,6 @@ function setupClockOptionsWindow() {
 
         await applyMainTheme();
         setupOptionsWindow(); // Call to create the options window shell and event listeners
-        setupClockOptionsWindow(); // Create the new clock options window
         setupFilterWindow();
         applyThemeSettings(); // Apply any saved theme settings
         await fetchTimezones();
