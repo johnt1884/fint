@@ -6693,7 +6693,7 @@ function applyThemeSettings(options = {}) {
             left: -50%;
             width: 50%;
             height: 100vh;
-            background-color: #2c2c2c; /* Slightly lighter than GUI for distinction */
+            background-color: var(--otk-options-main-bg-color);
             border: none;
             border-radius: 0;
             z-index: 100002; /* Above clock, loading screen, etc. */
@@ -6707,7 +6707,7 @@ function applyThemeSettings(options = {}) {
         const titleBar = document.createElement('div');
         titleBar.id = 'otk-options-title-bar';
         titleBar.style.cssText = `
-            padding: 8px 30px;
+            padding: 8px 15px 8px 30px;
             background-color: var(--otk-gui-bg-color);
             color: #f0f0f0;
             font-weight: bold;
@@ -8056,57 +8056,57 @@ function applyThemeSettings(options = {}) {
         });
 
         blurControlsWrapper.appendChild(blurInput);
-        blurControlsWrapper.appendChild(blurDefaultBtn);
         blurControlsWrapper.appendChild(clearBlurredBtn);
+        blurControlsWrapper.appendChild(blurDefaultBtn);
         blurGroup.appendChild(blurLabel);
         blurGroup.appendChild(blurControlsWrapper);
         imageBlurSection.appendChild(blurGroup);
 
         // --- Quick Reply Theming Section ---
         const qrThemingSection = createCollapsibleSubSection('Quick Reply Window');
-        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'qrBgColor', cssVariable: '--otk-qr-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'qr-bg' }));
-        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Border:", storageKey: 'qrBorderColor', cssVariable: '--otk-qr-border-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'qr-border' }));
-        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Header Background:", storageKey: 'qrHeaderBgColor', cssVariable: '--otk-qr-header-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'qr-header-bg' }));
-        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Header Text:", storageKey: 'qrHeaderTextColor', cssVariable: '--otk-qr-header-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'qr-header-text' }));
-        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Textarea Background:", storageKey: 'qrTextareaBgColor', cssVariable: '--otk-qr-textarea-bg-color', defaultValue: '#222222', inputType: 'color', idSuffix: 'qr-textarea-bg' }));
-        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Textarea Text:", storageKey: 'qrTextareaTextColor', cssVariable: '--otk-qr-textarea-text-color', defaultValue: '#eeeeee', inputType: 'color', idSuffix: 'qr-textarea-text' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Header Background Colour:", storageKey: 'qrHeaderBgColor', cssVariable: '--otk-qr-header-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'qr-header-bg' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Header Font Colour:", storageKey: 'qrHeaderTextColor', cssVariable: '--otk-qr-header-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'qr-header-text' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Background Colour:", storageKey: 'qrBgColor', cssVariable: '--otk-qr-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'qr-bg' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Border Colour:", storageKey: 'qrBorderColor', cssVariable: '--otk-qr-border-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'qr-border' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Text Area Background Colour:", storageKey: 'qrTextareaBgColor', cssVariable: '--otk-qr-textarea-bg-color', defaultValue: '#222222', inputType: 'color', idSuffix: 'qr-textarea-bg' }));
+        qrThemingSection.appendChild(createThemeOptionRow({ labelText: "Text Area Font Colour:", storageKey: 'qrTextareaTextColor', cssVariable: '--otk-qr-textarea-text-color', defaultValue: '#eeeeee', inputType: 'color', idSuffix: 'qr-textarea-text' }));
 
         // --- Messages (Odds) Section ---
         const oddMessagesSection = createCollapsibleSubSection('Messages (Odds)');
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Font Colour:", storageKey: 'msgDepthOddHeaderTextColor', cssVariable: '--otk-msg-depth-odd-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-odd-header-text', requiresRerender: true }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Underline Colour:", storageKey: 'viewerHeaderBorderColorOdd', cssVariable: '--otk-viewer-header-border-color-odd', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border-odd', requiresRerender: true }));
         oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepthOddContentFontSize', cssVariable: '--otk-msg-depth-odd-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-odd-content-fontsize', requiresRerender: true }));
-        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepthOddBgColor', cssVariable: '--otk-msg-depth-odd-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth-odd-bg', requiresRerender: true }));
-        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepthOddTextColor', cssVariable: '--otk-msg-depth-odd-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-odd-text', requiresRerender: true }));
-        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepthOddHeaderTextColor', cssVariable: '--otk-msg-depth-odd-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-odd-header-text', requiresRerender: true }));
-        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Underline:", storageKey: 'viewerHeaderBorderColorOdd', cssVariable: '--otk-viewer-header-border-color-odd', defaultValue: '#000000', inputType: 'color', idSuffix: 'viewer-header-border-odd', requiresRerender: true }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Background Colour:", storageKey: 'msgDepthOddBgColor', cssVariable: '--otk-msg-depth-odd-bg-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'msg-depth-odd-bg', requiresRerender: true }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Content Font Colour:", storageKey: 'msgDepthOddTextColor', cssVariable: '--otk-msg-depth-odd-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-odd-text', requiresRerender: true }));
 
         // --- Messages (Evens) Section ---
         const evenMessagesSection = createCollapsibleSubSection('Messages (Evens)');
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Font Colour:", storageKey: 'msgDepthEvenHeaderTextColor', cssVariable: '--otk-msg-depth-even-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-even-header-text', requiresRerender: true }));
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Underline Colour:", storageKey: 'viewerHeaderBorderColorEven', cssVariable: '--otk-viewer-header-border-color-even', defaultValue: '#777777', inputType: 'color', idSuffix: 'viewer-header-border-even', requiresRerender: true }));
         evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Font Size (px):", storageKey: 'msgDepthEvenContentFontSize', cssVariable: '--otk-msg-depth-even-content-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'msg-depth-even-content-fontsize', requiresRerender: true }));
-        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'msgDepthEvenBgColor', cssVariable: '--otk-msg-depth-even-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'msg-depth-even-bg', requiresRerender: true }));
-        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Content Font:", storageKey: 'msgDepthEvenTextColor', cssVariable: '--otk-msg-depth-even-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-even-text', requiresRerender: true }));
-        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Header Font:", storageKey: 'msgDepthEvenHeaderTextColor', cssVariable: '--otk-msg-depth-even-header-text-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'msg-depth-even-header-text', requiresRerender: true }));
-
-        // --- Message Icons Section ---
-        const messageIconsSection = createCollapsibleSubSection('Message Icons');
-        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Block Icon (Odd):", storageKey: 'blockIconColorOdd', cssVariable: '--otk-block-icon-color-odd', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-odd' }));
-        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Block Icon (Even):", storageKey: 'blockIconColorEven', cssVariable: '--otk-block-icon-color-even', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-even' }));
-        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Odd):", storageKey: 'pinIconColorOdd', cssVariable: '--otk-pin-icon-color-odd', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-odd' }));
-        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Even):", storageKey: 'pinIconColorEven', cssVariable: '--otk-pin-icon-color-even', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-even' }));
-        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Active):", storageKey: 'pinIconColorActive', cssVariable: '--otk-pin-icon-color-active', defaultValue: '#ff0000', inputType: 'color', idSuffix: 'pin-icon-active' }));
-        messageIconsSection.appendChild(createThemeOptionRow({ labelText: "Media Menu Icon:", storageKey: 'mediaMenuIconColor', cssVariable: '--otk-media-menu-icon-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'media-menu-icon' }));
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Background Colour:", storageKey: 'msgDepthEvenBgColor', cssVariable: '--otk-msg-depth-even-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'msg-depth-even-bg', requiresRerender: true }));
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Content Font Colour:", storageKey: 'msgDepthEvenTextColor', cssVariable: '--otk-msg-depth-even-text-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'msg-depth-even-text', requiresRerender: true }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Filter Icon:", storageKey: 'blockIconColorOdd', cssVariable: '--otk-block-icon-color-odd', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-odd' }));
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Filter Icon:", storageKey: 'blockIconColorEven', cssVariable: '--otk-block-icon-color-even', defaultValue: '#999999', inputType: 'color', idSuffix: 'block-icon-even' }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon:", storageKey: 'pinIconColorOdd', cssVariable: '--otk-pin-icon-color-odd', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-odd' }));
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon:", storageKey: 'pinIconColorEven', cssVariable: '--otk-pin-icon-color-even', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-even' }));
+        oddMessagesSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Active):", storageKey: 'pinIconColorActive', cssVariable: '--otk-pin-icon-color-active', defaultValue: '#ff0000', inputType: 'color', idSuffix: 'pin-icon-active' }));
+        evenMessagesSection.appendChild(createThemeOptionRow({ labelText: "Pin Icon (Active):", storageKey: 'pinIconColorActive', cssVariable: '--otk-pin-icon-color-active', defaultValue: '#ff0000', inputType: 'color', idSuffix: 'pin-icon-active' }));
 
         // --- Options Panel Section ---
         const optionsPanelSection = createCollapsibleSubSection('Options Panel');
         optionsPanelSection.appendChild(createThemeOptionRow({ labelText: "Panel Text:", storageKey: 'optionsTextColor', cssVariable: '--otk-options-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'options-text' }));
+        optionsPanelSection.appendChild(createThemeOptionRow({ labelText: "Main Background Colour:", storageKey: 'optionsMainBgColor', cssVariable: '--otk-options-main-bg-color', defaultValue: '#2c2c2c', inputType: 'color', idSuffix: 'options-main-bg', requiresRerender: false }));
+        optionsPanelSection.appendChild(createThemeOptionRow({ labelText: "Alternate Background Colour:", storageKey: 'optionsAltBgColor', cssVariable: '--otk-options-alt-bg-color', defaultValue: '#383838', inputType: 'color', idSuffix: 'options-alt-bg', requiresRerender: false }));
 
         // --- Loading Screen Sub-Section (within Theme) ---
         const loadingScreenSection = createCollapsibleSubSection('Loading Screen');
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Overlay Background Colour:", storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' }));
         loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Overlay Opacity:", storageKey: 'loadingOverlayOpacity', cssVariable: '--otk-loading-overlay-opacity', defaultValue: '0.8', inputType: 'number', min:0.0, max:1.0, step:0.05, idSuffix: 'loading-overlay-opacity' }));
-        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Overlay Base:", storageKey: 'loadingOverlayBaseHexColor', cssVariable: '--otk-loading-overlay-base-hex-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'loading-overlay-base-hex' }));
-        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Text:", storageKey: 'loadingTextColor', cssVariable: '--otk-loading-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-text' }));
-        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Progress Bar Background:", storageKey: 'loadingProgressBarBgColor', cssVariable: '--otk-loading-progress-bar-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'loading-progress-bg' }));
-        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Progress Bar Fill:", storageKey: 'loadingProgressBarFillColor', cssVariable: '--otk-loading-progress-bar-fill-color', defaultValue: '#4CAF50', inputType: 'color', idSuffix: 'loading-progress-fill' }));
-        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Progress Bar Text:", storageKey: 'loadingProgressBarTextColor', cssVariable: '--otk-loading-progress-bar-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-progress-text' }));
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Font Colour:", storageKey: 'loadingTextColor', cssVariable: '--otk-loading-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-text' }));
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Progress Bar Background colour:", storageKey: 'loadingProgressBarBgColor', cssVariable: '--otk-loading-progress-bar-bg-color', defaultValue: '#333333', inputType: 'color', idSuffix: 'loading-progress-bg' }));
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Progress Bar Fill Colour:", storageKey: 'loadingProgressBarFillColor', cssVariable: '--otk-loading-progress-bar-fill-color', defaultValue: '#4CAF50', inputType: 'color', idSuffix: 'loading-progress-fill' }));
+        loadingScreenSection.appendChild(createThemeOptionRow({ labelText: "Progress Bar Font Colour:", storageKey: 'loadingProgressBarTextColor', cssVariable: '--otk-loading-progress-bar-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'loading-progress-text' }));
 
         // --- Custom Themes Section ---
         // themeOptionsContainer.appendChild(createDivider()); // Removed divider
@@ -8449,7 +8449,8 @@ function applyThemeSettings(options = {}) {
                 { storageKey: 'pinIconColorOdd', cssVariable: '--otk-pin-icon-color-odd', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-odd' },
                 { storageKey: 'pinIconColorEven', cssVariable: '--otk-pin-icon-color-even', defaultValue: '#666666', inputType: 'color', idSuffix: 'pin-icon-even' },
                 { storageKey: 'pinIconColorActive', cssVariable: '--otk-pin-icon-color-active', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'pin-icon-active' },
-                { storageKey: 'mediaMenuIconColor', cssVariable: '--otk-media-menu-icon-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'media-menu-icon' }
+                { storageKey: 'optionsMainBgColor', cssVariable: '--otk-options-main-bg-color', defaultValue: '#2c2c2c', inputType: 'color', idSuffix: 'options-main-bg' },
+                { storageKey: 'optionsAltBgColor', cssVariable: '--otk-options-alt-bg-color', defaultValue: '#383838', inputType: 'color', idSuffix: 'options-alt-bg' }
             ];
         }
 
@@ -9411,6 +9412,8 @@ function setupClockOptionsWindow() {
                 --otk-media-controls-bg-color-odd: rgba(255, 255, 255, 0.8);
                 --otk-media-controls-bg-color-even: rgba(217, 217, 217, 0.8);
                 --otk-media-menu-icon-color: #ff8040;
+                --otk-options-main-bg-color: transparent;
+                --otk-options-alt-bg-color: #383838;
             }
 
             /* Refined Chrome Scrollbar Styling for Overlay Effect */
@@ -9562,8 +9565,11 @@ function setupClockOptionsWindow() {
             .otk-option-row > label {
                 white-space: nowrap;
             }
+            .otk-option-row {
+                background-color: var(--otk-options-main-bg-color);
+            }
             .otk-option-row:nth-child(even) {
-                background-color: #383838;
+                background-color: var(--otk-options-alt-bg-color);
                 border-radius: 4px;
             }
         `;
