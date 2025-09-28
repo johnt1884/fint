@@ -3620,7 +3620,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                     plusIcon.classList.add('otk-plus-icon');
                     plusIcon.id = `otk-plus-icon-${message.id}`;
                     plusIcon.textContent = '+';
-                    plusIcon.style.color = '#000000';
+                    plusIcon.style.color = 'var(--otk-plus-icon-color)';
                     plusIcon.title = 'Load next reply in truncated chain';
                     plusIcon.style.fontWeight = 'bold';
                     plusIcon.style.fontSize = '18px';
@@ -6793,7 +6793,6 @@ function applyThemeSettings(options = {}) {
         contentArea.appendChild(generalSettingsContainer);
 
         const generalSettingsHeading = createSectionHeading('General Settings');
-        generalSettingsHeading.style.cursor = 'pointer';
         generalSettingsHeading.style.position = 'relative'; // For icon positioning
         generalSettingsHeading.style.marginTop = "10px";
         generalSettingsHeading.style.marginBottom = "6px";
@@ -6801,51 +6800,18 @@ function applyThemeSettings(options = {}) {
         generalSettingsHeading.style.display = 'flex';
         generalSettingsHeading.style.alignItems = 'center';
 
-
-        const generalSettingsIcon = document.createElement('span');
-        generalSettingsIcon.style.cssText = 'position: absolute; left: 13px; top: 50%; transform: translateY(-50%);';
-        generalSettingsIcon.textContent = '▼ '; // Default to open
-        generalSettingsHeading.insertBefore(generalSettingsIcon, generalSettingsHeading.firstChild);
-
         const generalSettingsSection = document.createElement('div');
         generalSettingsSection.id = 'otk-general-settings-section';
         generalSettingsSection.style.cssText = `
-            display: flex; /* Default to open */
+            display: flex; /* Always open */
             flex-direction: column;
             gap: 2px;
             padding: 0;
             box-sizing: border-box;
         `;
 
-        const storageKey = 'otkCollapsibleStates';
-        const generalSectionId = 'otk-section-general-settings';
-
-        const restoreGeneralSettingsState = () => {
-            let states = {};
-            try {
-                states = JSON.parse(localStorage.getItem(storageKey)) || {};
-            } catch (e) { consoleError(e); }
-            const isCollapsed = states[generalSectionId] === 'closed'; // Default to open
-            generalSettingsSection.style.display = isCollapsed ? 'none' : 'flex';
-            generalSettingsIcon.textContent = isCollapsed ? '► ' : '▼ ';
-        };
-
-        generalSettingsHeading.addEventListener('click', () => {
-            const isHidden = generalSettingsSection.style.display === 'none';
-            generalSettingsSection.style.display = isHidden ? 'flex' : 'none';
-            generalSettingsIcon.textContent = isHidden ? '▼ ' : '► ';
-
-            let states = {};
-            try {
-                states = JSON.parse(localStorage.getItem(storageKey)) || {};
-            } catch (e) { consoleError(e); }
-            states[generalSectionId] = isHidden ? 'open' : 'closed';
-            localStorage.setItem(storageKey, JSON.stringify(states));
-        });
-
         generalSettingsContainer.appendChild(generalSettingsHeading);
         generalSettingsContainer.appendChild(generalSettingsSection);
-        restoreGeneralSettingsState();
 
         // --- Tracked Keyword(s) Option ---
         const trackedKeywordsGroup = document.createElement('div');
@@ -7760,7 +7726,7 @@ function applyThemeSettings(options = {}) {
             requiresRerender: false
         }));
 
-        guiSectionContent.appendChild(createColorOrNoneOptionRow({ labelText: "Thread Title Box Outline:", storageKey: 'guiThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'gui-thread-box-outline' }));
+        guiSectionContent.appendChild(createColorOrNoneOptionRow({ labelText: "Thread Title Box Outline Colour:", storageKey: 'guiThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'gui-thread-box-outline' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Thread Titles Text:", storageKey: 'guiThreadListTitleColor', cssVariable: '--otk-gui-threadlist-title-color', defaultValue: '#e0e0e0', inputType: 'color', idSuffix: 'threadlist-title' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Thread Times Text:", storageKey: 'guiThreadListTimeColor', cssVariable: '--otk-gui-threadlist-time-color', defaultValue: '#aaa', inputType: 'color', idSuffix: 'threadlist-time' }));
 
@@ -7895,6 +7861,7 @@ function applyThemeSettings(options = {}) {
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Button Clicked Background Colour:", storageKey: 'guiButtonActiveBgColor', cssVariable: '--otk-button-active-bg-color', defaultValue: '#444444', inputType: 'color', idSuffix: 'gui-button-active-bg' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Button Font Colour:", storageKey: 'guiButtonTextColor', cssVariable: '--otk-button-text-color', defaultValue: '#ffffff', inputType: 'color', idSuffix: 'gui-button-text' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Button Border Colour:", storageKey: 'guiButtonBorderColor', cssVariable: '--otk-button-border-color', defaultValue: '#777777', inputType: 'color', idSuffix: 'gui-button-border' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Bottom Border:", storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'gui-bottom-border' }));
 
         function createDropdownRow(options) {
             const group = document.createElement('div');
@@ -7925,124 +7892,108 @@ function applyThemeSettings(options = {}) {
             return group;
         }
 
-        // --- Viewer Background Section ---
-        const viewerBgSection = createCollapsibleSubSection('Viewer Background');
-        viewerBgSection.appendChild(createImagePickerRow({
-            labelText: 'Background Image URL:',
+        // --- Viewer Section ---
+        const viewerSectionContent = createCollapsibleSubSection('Viewer');
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Viewer Background Colour:", storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' }));
+        viewerSectionContent.appendChild(createImagePickerRow({
+            labelText: 'Viewer Background Image:',
             storageKey: 'viewerBackgroundImageUrl',
             idSuffix: 'viewer-bg'
         }));
-        viewerBgSection.appendChild(createDropdownRow({
-            labelText: 'Background Size:',
+        viewerSectionContent.appendChild(createDropdownRow({
+            labelText: 'Viewer Background Image Size:',
             storageKey: 'viewerBgSize',
             options: ['auto', 'cover', 'contain'],
             defaultValue: 'cover',
             requiresRerender: false
         }));
-        viewerBgSection.appendChild(createDropdownRow({
-            labelText: 'Background Repeat:',
+        viewerSectionContent.appendChild(createDropdownRow({
+            labelText: 'Viewer Background Image Repeat Mode:',
             storageKey: 'viewerBgRepeat',
             options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
             defaultValue: 'no-repeat',
             requiresRerender: false
         }));
-        viewerBgSection.appendChild(createDropdownRow({
-            labelText: 'Background Position:',
+        viewerSectionContent.appendChild(createDropdownRow({
+            labelText: 'Viewer Background Image Position:',
             storageKey: 'viewerBgPosition',
             options: ['center', 'top', 'bottom', 'left', 'right'],
             defaultValue: 'center',
             requiresRerender: false
         }));
+        viewerSectionContent.appendChild(createColorOrNoneOptionRow({ labelText: "Thread Title Box Outline Colour:", storageKey: 'viewerThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'viewer-thread-box-outline' }));
+        viewerSectionContent.appendChild(createDropdownRow({
+            labelText: 'New Messages Indicator Position:',
+            storageKey: 'otkNewMessagesSeparatorAlignment',
+            options: ['Left', 'Center', 'Right'],
+            defaultValue: 'Left',
+            requiresRerender: false
+        }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "New Messages Indicator Divider Colour:", storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-divider' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "New Messages Indicator Font Size:", storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: false }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "New Messages Indicator Font Colour:", storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-font' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Blocked Content Indicator Font Colour:", storageKey: 'blockedContentFontColor', cssVariable: '--otk-blocked-content-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'blocked-content-font' }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Pinned Message Highlight Colour:", storageKey: 'pinHighlightBgColor', cssVariable: '--otk-pin-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'pin-bg', requiresRerender: true }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Pinned Message Outline Colour:", storageKey: 'pinHighlightBorderColor', cssVariable: '--otk-pin-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'pin-border', requiresRerender: true }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Next Message Icon Background Colour:", storageKey: 'plusIconBgColor', cssVariable: '--otk-plus-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'plus-icon-bg-color', requiresRerender: false }));
+        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Next Message Icon Colour:", storageKey: 'plusIconColor', cssVariable: '--otk-plus-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'plus-icon-color', requiresRerender: false }));
 
-        // --- PiP Background Section ---
-        const pipBgSection = createCollapsibleSubSection('PiP Background');
-        pipBgSection.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'pipBackgroundColor', cssVariable: '--otk-pip-bg-color', defaultValue: '#1a1a1a', inputType: 'color', idSuffix: 'pip-bg' }));
+        // --- PiP Mode Section ---
+        const pipBgSection = createCollapsibleSubSection('PiP Mode');
+        pipBgSection.appendChild(createThemeOptionRow({ labelText: "PiP Mode Background Colour:", storageKey: 'pipBackgroundColor', cssVariable: '--otk-pip-bg-color', defaultValue: '#1a1a1a', inputType: 'color', idSuffix: 'pip-bg' }));
         pipBgSection.appendChild(createImagePickerRow({
-            labelText: 'Background Image URL:',
+            labelText: 'Pip Mode Background Image URL:',
             storageKey: 'pipBackgroundImageUrl',
             idSuffix: 'pip-bg'
         }));
         pipBgSection.appendChild(createDropdownRow({
-            labelText: 'Background Size:',
+            labelText: 'PiP Mode Background Image Size:',
             storageKey: 'pipBgSize',
             options: ['auto', 'cover', 'contain'],
             defaultValue: 'cover',
             requiresRerender: false
         }));
         pipBgSection.appendChild(createDropdownRow({
-            labelText: 'Background Repeat:',
+            labelText: 'PiP Mode Background Repeat Mode:',
             storageKey: 'pipBgRepeat',
             options: ['no-repeat', 'repeat', 'repeat-x', 'repeat-y'],
             defaultValue: 'no-repeat',
             requiresRerender: false
         }));
         pipBgSection.appendChild(createDropdownRow({
-            labelText: 'Background Position:',
+            labelText: 'PiP Mode Background Position:',
             storageKey: 'pipBgPosition',
             options: ['center', 'top', 'bottom', 'left', 'right'],
             defaultValue: 'center',
             requiresRerender: false
         }));
 
-        // --- Viewer Section ---
-        const viewerSectionContent = createCollapsibleSubSection('Viewer');
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Background:", storageKey: 'viewerBgColor', cssVariable: '--otk-viewer-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'viewer-bg' }));
-        viewerSectionContent.appendChild(createColorOrNoneOptionRow({ labelText: "Viewer Thread Box Outline:", storageKey: 'viewerThreadBoxOutlineColor', defaultValue: 'none', idSuffix: 'viewer-thread-box-outline' }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "GUI Bottom Border:", storageKey: 'guiBottomBorderColor', cssVariable: '--otk-gui-bottom-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'gui-bottom-border' }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "New Messages Divider:", storageKey: 'newMessagesDividerColor', cssVariable: '--otk-new-messages-divider-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-divider' }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "New Messages Text:", storageKey: 'newMessagesFontColor', cssVariable: '--otk-new-messages-font-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'new-msg-font' }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "'Blocked Content' Font:", storageKey: 'blockedContentFontColor', cssVariable: '--otk-blocked-content-font-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'blocked-content-font' }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "New Messages Font Size (px):", storageKey: 'newMessagesFontSize', cssVariable: '--otk-new-messages-font-size', defaultValue: '16px', inputType: 'number', unit: 'px', min: 8, max: 24, idSuffix: 'new-msg-font-size', requiresRerender: false }));
-        viewerSectionContent.appendChild(createDropdownRow({
-            labelText: 'New Msgs Separator Align:',
-            storageKey: 'otkNewMessagesSeparatorAlignment',
-            options: ['Left', 'Center', 'Right'],
-            defaultValue: 'Left',
-            requiresRerender: false
-        }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Pin Highlight Background:", storageKey: 'pinHighlightBgColor', cssVariable: '--otk-pin-highlight-bg-color', defaultValue: '#4a4a3a', inputType: 'color', idSuffix: 'pin-bg', requiresRerender: true }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Pin Highlight Border:", storageKey: 'pinHighlightBorderColor', cssVariable: '--otk-pin-highlight-border-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'pin-border', requiresRerender: true }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "'+' Icon Background:", storageKey: 'plusIconBgColor', cssVariable: '--otk-plus-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'plus-icon-bg-color', requiresRerender: false }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Blur Icon Color:", storageKey: 'blurIconColor', cssVariable: '--otk-blur-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'blur-icon' }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Blur Icon Background:", storageKey: 'blurIconBgColor', cssVariable: '--otk-blur-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'blur-icon-bg' }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Resize Icon Color:", storageKey: 'resizeIconColor', cssVariable: '--otk-resize-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'resize-icon' }));
-        viewerSectionContent.appendChild(createThemeOptionRow({ labelText: "Resize Icon Background:", storageKey: 'resizeIconBgColor', cssVariable: '--otk-resize-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'resize-icon-bg' }));
-
         // --- Image Blurring Section ---
-        const imageBlurSection = createCollapsibleSubSection('Image Blurring');
+        const imageBlurSection = createCollapsibleSubSection('Image Blur');
         const blurGroup = document.createElement('div');
-        blurGroup.style.cssText = `
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            width: 100%;
-            margin-bottom: 5px;
-        `;
+        blurGroup.classList.add('otk-option-row');
+
         const blurLabel = document.createElement('label');
         blurLabel.textContent = "Blur Amount (%):";
         blurLabel.htmlFor = `otk-image-blur-amount`;
-        blurLabel.style.cssText = `
-            font-size: 12px;
-            text-align: left;
-            flex-basis: 230px;
-            flex-shrink: 0;
-        `;
+
         const blurControlsWrapper = document.createElement('div');
         blurControlsWrapper.style.cssText = `
             display: flex;
-            flex-grow: 1;
             align-items: center;
             gap: 8px;
-            min-width: 0;
+            justify-content: flex-end;
+            width: 100%;
         `;
+
         const blurInput = document.createElement('input');
         blurInput.type = 'number';
         blurInput.id = 'otk-image-blur-amount';
         blurInput.min = 0;
         blurInput.max = 100;
         blurInput.style.cssText = `
-            flex: 1 1 60px;
-            min-width: 40px;
+            flex: 1 1 70px;
+            min-width: 50px;
             height: 25px;
             box-sizing: border-box;
             font-size: 12px;
@@ -8058,6 +8009,7 @@ function applyThemeSettings(options = {}) {
             localStorage.setItem(IMAGE_BLUR_AMOUNT_KEY, value);
             consoleLog(`Image blur amount saved: ${value}%`);
         });
+
         const blurDefaultBtn = document.createElement('button');
         blurDefaultBtn.textContent = 'Default';
         blurDefaultBtn.style.cssText = `
@@ -8067,15 +8019,14 @@ function applyThemeSettings(options = {}) {
             height: 25px;
             font-size: 11px;
             box-sizing: border-box;
-            width: auto;
+            width: 70px;
         `;
         blurDefaultBtn.addEventListener('click', () => {
             blurInput.value = '60';
             localStorage.setItem(IMAGE_BLUR_AMOUNT_KEY, '60');
             consoleLog(`Image blur amount reset to default: 60%`);
         });
-        blurControlsWrapper.appendChild(blurInput);
-        blurControlsWrapper.appendChild(blurDefaultBtn);
+
         const clearBlurredBtn = document.createElement('button');
         clearBlurredBtn.textContent = 'Clear All';
         clearBlurredBtn.style.cssText = `
@@ -8085,7 +8036,7 @@ function applyThemeSettings(options = {}) {
             height: 25px;
             font-size: 11px;
             box-sizing: border-box;
-            width: auto;
+            width: 70px;
             background-color: #803333;
             color: white;
         `;
@@ -8103,65 +8054,13 @@ function applyThemeSettings(options = {}) {
                 alert("All blurred images have been cleared.");
             }
         });
+
+        blurControlsWrapper.appendChild(blurInput);
+        blurControlsWrapper.appendChild(blurDefaultBtn);
         blurControlsWrapper.appendChild(clearBlurredBtn);
         blurGroup.appendChild(blurLabel);
         blurGroup.appendChild(blurControlsWrapper);
         imageBlurSection.appendChild(blurGroup);
-
-        // --- Tweet Embeds Section ---
-        const tweetEmbedsSection = createCollapsibleSubSection('Tweet Embeds');
-        const tweetEmbedModeGroup = document.createElement('div');
-        tweetEmbedModeGroup.style.cssText = `
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            width: 100%;
-            margin-bottom: 5px;
-        `;
-        const tweetEmbedModeLabel = document.createElement('label');
-        tweetEmbedModeLabel.textContent = "Tweet Embeds:";
-        tweetEmbedModeLabel.htmlFor = 'otk-tweet-embed-mode-dropdown';
-        tweetEmbedModeLabel.style.cssText = `
-            font-size: 12px;
-            text-align: left;
-            flex-basis: 230px;
-            flex-shrink: 0;
-        `;
-        const tweetEmbedModeControlsWrapper = document.createElement('div');
-        tweetEmbedModeControlsWrapper.style.cssText = `
-            display: flex;
-            flex-grow: 1;
-            align-items: center;
-        `;
-        const tweetEmbedModeDropdown = document.createElement('select');
-        tweetEmbedModeDropdown.id = 'otk-tweet-embed-mode-dropdown';
-        tweetEmbedModeDropdown.style.cssText = `
-            flex-grow: 1;
-            height: 25px;
-            box-sizing: border-box;
-            font-size: 12px;
-            text-align: right;
-            text-align-last: right;
-        `;
-        const tweetEmbedOptions = [
-            { label: 'Disabled', value: 'disabled' },
-            { label: 'Default', value: 'default' },
-            { label: 'Dark Mode', value: 'dark' }
-        ];
-        tweetEmbedOptions.forEach(opt => {
-            const optionElement = document.createElement('option');
-            optionElement.value = opt.value;
-            optionElement.textContent = opt.label;
-            tweetEmbedModeDropdown.appendChild(optionElement);
-        });
-        tweetEmbedModeDropdown.value = localStorage.getItem(TWEET_EMBED_MODE_KEY) || 'default';
-        tweetEmbedModeDropdown.addEventListener('change', () => {
-            saveThemeSetting(TWEET_EMBED_MODE_KEY, tweetEmbedModeDropdown.value, true);
-        });
-        tweetEmbedModeGroup.appendChild(tweetEmbedModeLabel);
-        tweetEmbedModeControlsWrapper.appendChild(tweetEmbedModeDropdown);
-        tweetEmbedModeGroup.appendChild(tweetEmbedModeControlsWrapper);
-        tweetEmbedsSection.appendChild(tweetEmbedModeGroup);
 
         // --- Quick Reply Theming Section ---
         const qrThemingSection = createCollapsibleSubSection('Quick Reply Window');
@@ -8511,12 +8410,7 @@ function applyThemeSettings(options = {}) {
 
                 // '+' Icon Background
                 { storageKey: 'plusIconBgColor', cssVariable: '--otk-plus-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'plus-icon-bg-color' },
-
-                // Icon Colors
-                { storageKey: 'blurIconColor', cssVariable: '--otk-blur-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'blur-icon' },
-                { storageKey: 'blurIconBgColor', cssVariable: '--otk-blur-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'blur-icon-bg' },
-                { storageKey: 'resizeIconColor', cssVariable: '--otk-resize-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'resize-icon' },
-                { storageKey: 'resizeIconBgColor', cssVariable: '--otk-resize-icon-bg-color', defaultValue: '#d9d9d9', inputType: 'color', idSuffix: 'resize-icon-bg' },
+                { storageKey: 'plusIconColor', cssVariable: '--otk-plus-icon-color', defaultValue: '#000000', inputType: 'color', idSuffix: 'plus-icon-color' },
 
                 // GUI Button Colours
                 { storageKey: 'guiButtonBgColor', cssVariable: '--otk-button-bg-color', defaultValue: '#555555', inputType: 'color', idSuffix: 'gui-button-bg' },
@@ -9493,6 +9387,7 @@ function setupClockOptionsWindow() {
 
                 /* Icon Colors */
                 --otk-plus-icon-bg-color: #d9d9d9;
+                --otk-plus-icon-color: #000000;
                 --otk-resize-icon-color: #000000;
                 --otk-resize-icon-bg-color: #d9d9d9;
                 --otk-blur-icon-color: #000000;
