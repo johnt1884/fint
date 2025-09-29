@@ -5767,17 +5767,14 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             draggedClockId = null;
         });
 
-        const footerRow = document.createElement('div');
-        footerRow.classList.add('otk-option-row');
-        footerRow.style.marginTop = '15px';
+        const addClockRow = document.createElement('div');
+        addClockRow.classList.add('otk-option-row');
+        addClockRow.style.marginTop = '15px';
 
-        const footerLabel = document.createElement('label'); // Empty label for spacing
-        footerRow.appendChild(footerLabel);
-
-        const footerControls = document.createElement('div');
-        footerControls.style.cssText = `
+        const addClockControls = document.createElement('div');
+        addClockControls.style.cssText = `
             display: flex;
-            justify-content: flex-end;
+            grid-column: 1 / -1;
         `;
 
         const addClockBtn = createTrackerButton('Add New Clock');
@@ -5785,6 +5782,7 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         addClockBtn.style.fontSize = '11px';
         addClockBtn.style.height = '25px';
         addClockBtn.style.boxSizing = 'border-box';
+        addClockBtn.style.width = '100%';
         addClockBtn.addEventListener('click', () => {
             const currentClocks = JSON.parse(localStorage.getItem('otkClocks') || '[]');
             const newClock = {
@@ -5798,9 +5796,9 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             renderClocks();
         });
 
-        footerControls.appendChild(addClockBtn);
-        footerRow.appendChild(footerControls);
-        clockListContainer.appendChild(footerRow);
+        addClockControls.appendChild(addClockBtn);
+        addClockRow.appendChild(addClockControls);
+        clockListContainer.appendChild(addClockRow);
     }
 
     function renderClocks() {
