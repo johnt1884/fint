@@ -2043,7 +2043,7 @@ function renderThreadList() {
     threadDisplayContainer.style.height = '';
     threadDisplayContainer.style.overflow = 'visible';
     threadDisplayContainer.style.justifyContent = 'center';
-    threadDisplayContainer.style.padding = '';
+    threadDisplayContainer.style.padding = '3px 0 5px 10px';
     threadDisplayContainer.style.boxSizing = '';
 
 
@@ -3580,8 +3580,8 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                     const colorSquare = document.createElement('span');
                     colorSquare.style.cssText = `
                         display: inline-block;
-                        width: 10px; /* Adjust size as needed */
-                        height: 10px; /* Adjust size as needed */
+                        width: 12px; /* Adjust size as needed */
+                        height: 12px; /* Adjust size as needed */
                         background-color: ${threadColor};
                         margin-right: 6px; /* Space between square and '#' */
                         border-radius: 2px; /* Optional: for rounded corners */
