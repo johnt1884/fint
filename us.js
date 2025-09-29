@@ -136,6 +136,7 @@ document.addEventListener("visibilitychange", () => {
     const BLOCKED_THREADS_KEY = 'otkBlockedThreads';
     const FILTER_RULES_V2_KEY = 'otkFilterRulesV2';
     const OTK_BLOCKED_KEYWORDS_KEY = 'otkBlockedKeywords';
+    const THREAD_TITLE_COLORS_KEY = 'otkThreadTitleColors';
 
     // --- Global variables ---
     let threadTitleAnimationInterval = null;
@@ -1416,6 +1417,13 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
         return title.substr(0, maxLength - 3) + '...'; // Fallback if no good space
     }
 
+    function truncateFilename(filename, maxLength) {
+        if (filename.length <= maxLength) {
+            return filename;
+        }
+        return filename.substring(0, maxLength - 3) + '...';
+    }
+
     // --- Color Similarity Functions ---
     const SIMILARITY_THRESHOLD = 20; // Lower is more similar. 1-5 is imperceptible, >10 is distinct.
 
@@ -1459,8 +1467,11 @@ function animateStatIncrease(statEl, plusNEl, from, to) {
             return threadColors[threadId];
         }
 
+        // Use custom colors from localStorage if available, otherwise fall back to default COLORS
+        const customColors = JSON.parse(localStorage.getItem(THREAD_TITLE_COLORS_KEY)) || COLORS;
+
         const usedColorHexes = new Set(Object.values(threadColors));
-        const availableColors = COLORS.filter(c => !usedColorHexes.has(c));
+        const availableColors = customColors.filter(c => !usedColorHexes.has(c));
 
         if (availableColors.length === 0) {
             // All colors from the palette are used, assign a fallback.
@@ -3248,7 +3259,9 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
         );
 
         const filenameLink = document.createElement('a');
-        filenameLink.textContent = `${message.attachment.filename} (${message.attachment.ext.substring(1)})`;
+        const truncatedFilename = truncateFilename(message.attachment.filename, 50);
+        filenameLink.textContent = `${truncatedFilename} (${message.attachment.ext.substring(1)})`;
+        filenameLink.title = message.attachment.filename; // Show full filename on hover
         filenameLink.href = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${message.attachment.ext}`;
         filenameLink.target = "_blank";
         filenameLink.style.cssText = "color: #60a5fa;";
@@ -3261,6 +3274,20 @@ function _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashe
 }
     // Signature now includes parentMessageId and ancestors
 function _createMessageHeaderIcons(message, messageDiv, isFiltered, headerContainer) {
+    const blockIcon = document.createElement('span');
+    blockIcon.classList.add('block-icon');
+    blockIcon.innerHTML = '&#128711;';
+    blockIcon.style.cssText = 'margin-left: 8px; cursor: pointer; font-size: 16px;';
+
+    if (isFiltered) {
+        blockIcon.style.color = 'red';
+        blockIcon.title = 'This message is blocked by your filters.';
+    } else {
+        blockIcon.style.visibility = 'hidden';
+        blockIcon.title = 'Create filter for this message';
+    }
+    headerContainer.appendChild(blockIcon);
+
     const multiQuoteWrapper = document.createElement('div');
     multiQuoteWrapper.className = 'otk-multiquote-checkbox-wrapper';
     const multiQuoteCheckbox = document.createElement('input');
@@ -3287,17 +3314,6 @@ function _createMessageHeaderIcons(message, messageDiv, isFiltered, headerContai
     multiQuoteWrapper.appendChild(multiQuoteCheckbox);
     headerContainer.appendChild(multiQuoteWrapper);
 
-    headerContainer.addEventListener('mouseenter', () => {
-        if (!multiQuoteWrapper.classList.contains('selected')) {
-            multiQuoteWrapper.classList.add('visible');
-        }
-    });
-    headerContainer.addEventListener('mouseleave', () => {
-        if (!multiQuoteWrapper.classList.contains('selected')) {
-            multiQuoteWrapper.classList.remove('visible');
-        }
-    });
-
     const pinIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     pinIcon.setAttribute('class', 'otk-pin-icon');
     pinIcon.setAttribute('title', 'Pin this message');
@@ -3308,19 +3324,6 @@ function _createMessageHeaderIcons(message, messageDiv, isFiltered, headerContai
     pinIcon.appendChild(pinPath);
     headerContainer.appendChild(pinIcon);
 
-    const blockIcon = document.createElement('span');
-    blockIcon.classList.add('block-icon');
-    blockIcon.innerHTML = '&#128711;';
-    blockIcon.style.cssText = 'margin-left: 8px; cursor: pointer; font-size: 16px;';
-
-    if (isFiltered) {
-        blockIcon.style.color = 'red';
-        blockIcon.title = 'This message is blocked by your filters.';
-    } else {
-        blockIcon.style.visibility = 'hidden';
-        blockIcon.title = 'Create filter for this message';
-    }
-
     // Attach hover listeners regardless of filter status to handle pin icon visibility
     headerContainer.addEventListener('mouseenter', () => {
         if (!isFiltered) { // Only toggle block icon if not filtered
@@ -3328,6 +3331,9 @@ function _createMessageHeaderIcons(message, messageDiv, isFiltered, headerContai
         }
         if (pinIcon) {
             pinIcon.style.visibility = 'visible';
+        }
+        if (!multiQuoteWrapper.classList.contains('selected')) {
+            multiQuoteWrapper.classList.add('visible');
         }
     });
 
@@ -3338,8 +3344,10 @@ function _createMessageHeaderIcons(message, messageDiv, isFiltered, headerContai
         if (pinIcon && !messageDiv.classList.contains(PINNED_MESSAGE_CLASS)) {
             pinIcon.style.visibility = 'hidden';
         }
+        if (!multiQuoteWrapper.classList.contains('selected')) {
+            multiQuoteWrapper.classList.remove('visible');
+        }
     });
-    headerContainer.appendChild(blockIcon);
 
     blockIcon.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -3633,7 +3641,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                     plusIcon.style.alignItems = 'center';
                     plusIcon.style.justifyContent = 'center';
                     plusIcon.style.borderRadius = '4px';
-                    plusIcon.style.backgroundColor = 'var(--otk-plus-icon-bg-color)';
+                    plusIcon.style.backgroundColor = 'transparent';
 
                     plusIcon.addEventListener('click', async (e) => {
                         e.stopPropagation();
@@ -3790,13 +3798,21 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                     messageDiv.appendChild(collapsibleContainer);
                 } else {
                     // Case 2: Has unfiltered content or quotes. Show processed content with an eye icon to toggle original.
-                    const blockIcon = messageHeader.querySelector('span[title*="blocked"]');
-                    if (blockIcon) {
-                        const eyeIcon = document.createElement('span');
-                        eyeIcon.innerHTML = '👁️';
-                        eyeIcon.style.cssText = 'margin-left: 5px; cursor: pointer;';
-                        eyeIcon.title = 'Show filtered content';
-                        blockIcon.parentNode.insertBefore(eyeIcon, blockIcon.nextSibling);
+                    // Case 2: Has unfiltered content or quotes. Show processed content with a toggle link.
+                    if (pinIcon) { // pinIcon is the SVG element
+                        const showFilteredLink = document.createElement('span');
+                        showFilteredLink.textContent = 'Show filtered content';
+                        showFilteredLink.style.cssText = 'margin-left: 8px; cursor: pointer; text-decoration: underline; visibility: hidden;';
+                        showFilteredLink.title = 'Toggle between filtered and original message content';
+
+                        pinIcon.parentNode.insertBefore(showFilteredLink, pinIcon.nextSibling);
+
+                        messageHeader.addEventListener('mouseenter', () => {
+                            showFilteredLink.style.visibility = 'visible';
+                        });
+                        messageHeader.addEventListener('mouseleave', () => {
+                            showFilteredLink.style.visibility = 'hidden';
+                        });
 
                         const bodyContainer = document.createElement('div');
                         const processedBodyContainer = document.createElement('div');
@@ -3814,7 +3830,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
 
                         let originalBodyGenerated = false;
 
-                        eyeIcon.addEventListener('click', (e) => {
+                        showFilteredLink.addEventListener('click', (e) => {
                             e.stopPropagation();
                             if (!originalBodyGenerated) {
                                 const [originalTextElement, originalAttachmentDiv] = _populateMessageBody(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisplayFilenames, shouldDisableUnderline);
@@ -3826,7 +3842,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                             const isProcessedVisible = processedBodyContainer.style.display !== 'none';
                             processedBodyContainer.style.display = isProcessedVisible ? 'none' : 'block';
                             originalBodyContainer.style.display = isProcessedVisible ? 'block' : 'none';
-                            eyeIcon.title = isProcessedVisible ? 'Hide filtered content' : 'Show filtered content';
+                            showFilteredLink.textContent = isProcessedVisible ? 'Show original content' : 'Show filtered content';
                         });
                     } else {
                         // Fallback if block icon isn't found for some reason
@@ -5867,6 +5883,113 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
         });
     }
 
+    function renderThreadTitleColorsOptions() {
+        const contentArea = document.getElementById('otk-thread-title-colors-panel');
+        if (!contentArea) return;
+
+        contentArea.innerHTML = ''; // Clear previous content
+
+        let titleColors = JSON.parse(localStorage.getItem(THREAD_TITLE_COLORS_KEY)) || [...COLORS];
+
+        const colorListContainer = document.createElement('div');
+        contentArea.appendChild(colorListContainer);
+
+        titleColors.forEach((color, index) => {
+            const colorRow = document.createElement('div');
+            colorRow.classList.add('otk-option-row');
+            colorRow.style.display = 'flex';
+            colorRow.style.alignItems = 'center';
+            colorRow.style.gap = '10px';
+
+            const colorBar = document.createElement('div');
+            colorBar.style.flexGrow = '1';
+            colorBar.style.height = '25px';
+            colorBar.style.backgroundColor = color;
+            colorBar.style.border = '1px solid #555';
+            colorBar.style.borderRadius = '3px';
+
+            const buttonsWrapper = document.createElement('div');
+            buttonsWrapper.style.cssText = `
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                justify-content: flex-end;
+            `;
+
+            const changeBtn = createTrackerButton('Change');
+            changeBtn.style.padding = '2px 8px';
+            changeBtn.style.fontSize = '11px';
+            changeBtn.style.height = '25px';
+            changeBtn.style.boxSizing = 'border-box';
+
+            const colorPicker = document.createElement('input');
+            colorPicker.type = 'color';
+            colorPicker.value = color;
+            colorPicker.style.display = 'none'; // Hide the actual picker, trigger it from the button
+            colorRow.appendChild(colorPicker);
+
+
+            changeBtn.addEventListener('click', () => colorPicker.click());
+
+            colorPicker.addEventListener('input', (e) => {
+                titleColors[index] = e.target.value;
+                localStorage.setItem(THREAD_TITLE_COLORS_KEY, JSON.stringify(titleColors));
+                renderThreadTitleColorsOptions(); // Re-render to show change
+            });
+
+            buttonsWrapper.appendChild(changeBtn);
+
+            const removeBtn = createTrackerButton('Remove');
+            removeBtn.style.padding = '2px 8px';
+            removeBtn.style.fontSize = '11px';
+            removeBtn.style.height = '25px';
+            removeBtn.style.boxSizing = 'border-box';
+            if (titleColors.length <= 2) {
+                removeBtn.disabled = true;
+            }
+            removeBtn.addEventListener('click', () => {
+                titleColors.splice(index, 1);
+                localStorage.setItem(THREAD_TITLE_COLORS_KEY, JSON.stringify(titleColors));
+                renderThreadTitleColorsOptions();
+            });
+            buttonsWrapper.appendChild(removeBtn);
+
+            colorRow.appendChild(colorBar);
+            colorRow.appendChild(buttonsWrapper);
+            colorListContainer.appendChild(colorRow);
+        });
+
+        const controlsContainer = document.createElement('div');
+        controlsContainer.style.cssText = `
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-top: 15px;
+            padding: 0 10px 0 30px; /* Align with option rows */
+        `;
+
+        const addColorBtn = createTrackerButton('Add Colour');
+        addColorBtn.style.width = '100%';
+        addColorBtn.addEventListener('click', () => {
+            titleColors.push('#ffffff'); // Add white as a default new color
+            localStorage.setItem(THREAD_TITLE_COLORS_KEY, JSON.stringify(titleColors));
+            renderThreadTitleColorsOptions();
+        });
+        controlsContainer.appendChild(addColorBtn);
+
+        const defaultColorsBtn = createTrackerButton('Default thread title colours');
+        defaultColorsBtn.style.width = '100%';
+        defaultColorsBtn.addEventListener('click', () => {
+            if (confirm("Are you sure you want to revert to the default thread title colours?")) {
+                localStorage.removeItem(THREAD_TITLE_COLORS_KEY);
+                renderThreadTitleColorsOptions();
+            }
+        });
+        controlsContainer.appendChild(defaultColorsBtn);
+
+        contentArea.appendChild(controlsContainer);
+    }
+
 function startAutoEmbedReloader() {
     setInterval(() => {
         if (!otkViewer || otkViewer.style.display === 'none') {
@@ -6695,30 +6818,53 @@ function applyThemeSettings(options = {}) {
         optionsTab.style.cursor = 'pointer';
         optionsTab.style.display = 'inline-block';
 
+        const threadTitleColorsTab = document.createElement('span');
+        threadTitleColorsTab.id = 'otk-options-tab-thread-title-colors';
+        threadTitleColorsTab.textContent = 'Thread Title Colours';
+        threadTitleColorsTab.style.cursor = 'pointer';
+
         const clockOptionsText = document.createElement('span');
         clockOptionsText.id = 'otk-options-tab-clock';
         clockOptionsText.textContent = 'Clock Options';
         clockOptionsText.style.cursor = 'pointer';
 
-        const clockOptionsDivider = document.createElement('span');
-        clockOptionsDivider.innerHTML = '&nbsp;|&nbsp;';
+        const divider1 = document.createElement('span');
+        divider1.innerHTML = '&nbsp;|&nbsp;';
+        const divider2 = document.createElement('span');
+        divider2.innerHTML = '&nbsp;|&nbsp;';
 
         titleContainer.appendChild(optionsTab);
-        titleContainer.appendChild(clockOptionsDivider);
+        titleContainer.appendChild(divider1);
+        titleContainer.appendChild(threadTitleColorsTab);
+        titleContainer.appendChild(divider2);
         titleContainer.appendChild(clockOptionsText);
         titleBar.appendChild(titleContainer);
 
         optionsTab.addEventListener('click', () => {
             document.getElementById('otk-main-options-panel').style.display = 'block';
+            document.getElementById('otk-thread-title-colors-panel').style.display = 'none';
             document.getElementById('otk-clock-options-panel').style.display = 'none';
             optionsTab.style.textDecoration = 'underline';
+            threadTitleColorsTab.style.textDecoration = 'none';
             clockOptionsText.style.textDecoration = 'none';
+        });
+
+        threadTitleColorsTab.addEventListener('click', () => {
+            document.getElementById('otk-main-options-panel').style.display = 'none';
+            document.getElementById('otk-thread-title-colors-panel').style.display = 'block';
+            document.getElementById('otk-clock-options-panel').style.display = 'none';
+            optionsTab.style.textDecoration = 'none';
+            threadTitleColorsTab.style.textDecoration = 'underline';
+            clockOptionsText.style.textDecoration = 'none';
+            renderThreadTitleColorsOptions();
         });
 
         clockOptionsText.addEventListener('click', () => {
             document.getElementById('otk-main-options-panel').style.display = 'none';
+            document.getElementById('otk-thread-title-colors-panel').style.display = 'none';
             document.getElementById('otk-clock-options-panel').style.display = 'block';
             optionsTab.style.textDecoration = 'none';
+            threadTitleColorsTab.style.textDecoration = 'none';
             clockOptionsText.style.textDecoration = 'underline';
             renderClockOptions();
         });
@@ -6787,11 +6933,16 @@ function applyThemeSettings(options = {}) {
         mainOptionsPanel.id = 'otk-main-options-panel';
         mainOptionsPanel.style.cssText = 'padding: 15px 0; display: block;';
 
+        const threadTitleColorsPanel = document.createElement('div');
+        threadTitleColorsPanel.id = 'otk-thread-title-colors-panel';
+        threadTitleColorsPanel.style.cssText = 'padding: 15px 0; display: none;';
+
         const clockOptionsPanel = document.createElement('div');
         clockOptionsPanel.id = 'otk-clock-options-panel';
         clockOptionsPanel.style.cssText = 'padding: 15px 0; display: none;';
 
         contentArea.appendChild(mainOptionsPanel);
+        contentArea.appendChild(threadTitleColorsPanel);
         contentArea.appendChild(clockOptionsPanel);
 
         renderClockOptions();
@@ -9409,7 +9560,7 @@ function setupFilterWindow() {
             .otk-message-depth-even .otk-pin-icon {
                 color: var(--otk-pin-icon-color-even);
             }
-            .${PINNED_MESSAGE_CLASS} .otk-pin-icon {
+            .${PINNED_MESSAGE_CLASS} > div:first-child .otk-pin-icon {
                 color: var(--otk-pin-icon-color-active);
             }
                 .otk-youtube-embed-wrapper.otk-embed-inline {
