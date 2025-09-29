@@ -2071,7 +2071,7 @@ function renderThreadList() {
         threadDisplayContainer.style.overflow = 'hidden';
         threadDisplayContainer.style.justifyContent = 'flex-start';
         threadDisplayContainer.style.boxSizing = 'border-box';
-        threadDisplayContainer.style.padding = '0';
+        threadDisplayContainer.style.padding = '0 0 0 2px';
 
         const scroller = document.createElement('div');
         scroller.style.transition = 'transform 0.5s ease-in-out';
