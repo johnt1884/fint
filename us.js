@@ -2043,7 +2043,7 @@ function renderThreadList() {
     threadDisplayContainer.style.height = '';
     threadDisplayContainer.style.overflow = 'visible';
     threadDisplayContainer.style.justifyContent = 'center';
-    threadDisplayContainer.style.padding = '3px 0 5px 10px';
+    threadDisplayContainer.style.padding = '3px 0 5px 11px';
     threadDisplayContainer.style.boxSizing = '';
 
 
@@ -2071,7 +2071,7 @@ function renderThreadList() {
         threadDisplayContainer.style.overflow = 'hidden';
         threadDisplayContainer.style.justifyContent = 'flex-start';
         threadDisplayContainer.style.boxSizing = 'border-box';
-        threadDisplayContainer.style.padding = '0 0 0 2px';
+        threadDisplayContainer.style.padding = '0';
 
         const scroller = document.createElement('div');
         scroller.style.transition = 'transform 0.5s ease-in-out';
@@ -8013,9 +8013,9 @@ function applyThemeSettings(options = {}) {
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Font Colour:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
 
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Options Icon Colour:", storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Background Colour:", storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Main Font Colour:", storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Timer Font Colour:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Background Colour:", storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Label Text Colour:", storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Timer Text Colour:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Background Colour:", storageKey: 'clockBgColor', cssVariable: '--otk-clock-bg-color', defaultValue: '', inputType: 'color', idSuffix: 'clock-bg' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Font Colour:", storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Border Colour:", storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-border' }));
