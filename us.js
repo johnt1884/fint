@@ -1901,7 +1901,7 @@ function createThreadListItemElement(thread, isForTooltip = false) {
     threadItemDiv.style.cssText = `
         display: flex;
         align-items: center;
-        padding: 4px;
+        padding: 4px 4px 4px 5.5px;
         border-radius: 3px;
         height: 28px; /* Fixed height for animation calculations */
         box-sizing: border-box;
@@ -2043,7 +2043,7 @@ function renderThreadList() {
     threadDisplayContainer.style.height = '';
     threadDisplayContainer.style.overflow = 'visible';
     threadDisplayContainer.style.justifyContent = 'center';
-    threadDisplayContainer.style.padding = '3px 0 5px 11px';
+    threadDisplayContainer.style.padding = '3px 0 5px 0px';
     threadDisplayContainer.style.boxSizing = '';
 
 
@@ -2058,9 +2058,14 @@ function renderThreadList() {
             firstMessageTime = messages[0].time;
         }
         return { id: threadId, title, firstMessageTime, color: getThreadColor(threadId), url: `https://boards.4chan.org/b/thread/${threadId}` };
-    }).filter(thread => thread.firstMessageTime !== null);
+    });
 
-    threadDisplayObjects.sort((a, b) => b.firstMessageTime - a.firstMessageTime);
+    threadDisplayObjects.sort((a, b) => {
+        if (a.firstMessageTime === null && b.firstMessageTime === null) return 0;
+        if (a.firstMessageTime === null) return 1;
+        if (b.firstMessageTime === null) return -1;
+        return b.firstMessageTime - a.firstMessageTime;
+    });
 
     const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
     const animationSpeed = parseFloat(themeSettings.otkThreadTitleAnimationSpeed || '0');
@@ -4340,6 +4345,16 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             if (threadsBeforePruning > threadsAfterPruning) {
                 consoleLog(`[BG] Pruned ${threadsBeforePruning - threadsAfterPruning} non-live threads from the active list.`);
             }
+
+            // Cleanup color map
+            const activeThreadIdsSet = new Set(activeThreads);
+            for (const threadId in threadColors) {
+                if (!activeThreadIdsSet.has(Number(threadId))) {
+                    delete threadColors[threadId];
+                }
+            }
+            consoleLog(`[BG] Cleaned up color map. Retaining colors for ${Object.keys(threadColors).length} active threads.`);
+
             consoleLog(`[BG] Active threads after catalog sync: ${activeThreads.length}`, activeThreads);
 
             const fetchPromisesBg = activeThreads.map(threadId => {
@@ -4567,6 +4582,15 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             if (threadsBeforePruning > threadsAfterPruning) {
                 consoleLog(`[Manual] Pruned ${threadsBeforePruning - threadsAfterPruning} non-live threads from the active list.`);
             }
+
+            // Cleanup color map
+            const activeThreadIdsSet = new Set(activeThreads);
+            for (const threadId in threadColors) {
+                if (!activeThreadIdsSet.has(Number(threadId))) {
+                    delete threadColors[threadId];
+                }
+            }
+            consoleLog(`[Manual] Cleaned up color map. Retaining colors for ${Object.keys(threadColors).length} active threads.`);
 
             // threadsToFetch should be all live threads to ensure they are all updated.
             threadsToFetch = Array.from(liveThreadIds);
@@ -8013,9 +8037,9 @@ function applyThemeSettings(options = {}) {
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Stats Font Colour:", storageKey: 'backgroundUpdatesStatsTextColor', cssVariable: '--otk-background-updates-stats-text-color', defaultValue: '#FFD700', inputType: 'color', idSuffix: 'background-updates-stats-text' }));
 
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Options Icon Colour:", storageKey: 'cogIconColor', cssVariable: '--otk-cog-icon-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'cog-icon' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Background Colour:", storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Label Text Colour:", storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' }));
-        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Countdown Timer Text Colour:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Background Colour:", storageKey: 'countdownBgColor', cssVariable: '--otk-countdown-bg-color', defaultValue: '#181818', inputType: 'color', idSuffix: 'countdown-bg' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Main Font Colour:", storageKey: 'countdownLabelTextColor', cssVariable: '--otk-countdown-label-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-label-text' }));
+        guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Background Updates Timer Font Colour:", storageKey: 'countdownTimerTextColor', cssVariable: '--otk-countdown-timer-text-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'countdown-timer-text' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Background Colour:", storageKey: 'clockBgColor', cssVariable: '--otk-clock-bg-color', defaultValue: '', inputType: 'color', idSuffix: 'clock-bg' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Font Colour:", storageKey: 'clockTextColor', cssVariable: '--otk-clock-text-color', defaultValue: '#e6e6e6', inputType: 'color', idSuffix: 'clock-text' }));
         guiSectionContent.appendChild(createThemeOptionRow({ labelText: "Clock(s) Border Colour:", storageKey: 'clockBorderColor', cssVariable: '--otk-clock-border-color', defaultValue: '#ff8040', inputType: 'color', idSuffix: 'clock-border' }));
