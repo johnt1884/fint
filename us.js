@@ -2040,11 +2040,15 @@ function renderThreadList() {
     if (!threadDisplayContainer) return;
 
     threadDisplayContainer.innerHTML = '';
+    // Reset styles that might be changed for the > 3 case
     threadDisplayContainer.style.height = '';
     threadDisplayContainer.style.overflow = 'visible';
     threadDisplayContainer.style.justifyContent = 'center';
     threadDisplayContainer.style.padding = '3px 0 5px 0px';
     threadDisplayContainer.style.boxSizing = '';
+    threadDisplayContainer.style.position = '';
+    threadDisplayContainer.style.flexDirection = 'column';
+    threadDisplayContainer.style.maxWidth = ''; // Reset maxWidth
 
 
     if (activeThreads.length === 0) return;
@@ -2070,29 +2074,105 @@ function renderThreadList() {
     const themeSettings = JSON.parse(localStorage.getItem(THEME_SETTINGS_KEY)) || {};
     const animationSpeed = parseFloat(themeSettings.otkThreadTitleAnimationSpeed || '0');
 
-    if (animationSpeed > 0 && threadDisplayObjects.length > 3) {
+    if (threadDisplayObjects.length > 3) {
         const itemHeight = 28;
+        const hoverPadding = 25; // Space for arrows and hover buffer
+
+        // Configure the main container for relative positioning and visible overflow
         threadDisplayContainer.style.height = `${itemHeight * 3}px`;
-        threadDisplayContainer.style.overflow = 'hidden';
+        threadDisplayContainer.style.overflow = 'visible'; // Allow arrows to be visible outside
         threadDisplayContainer.style.justifyContent = 'flex-start';
         threadDisplayContainer.style.boxSizing = 'border-box';
-        threadDisplayContainer.style.padding = '0';
+        threadDisplayContainer.style.padding = `0 0 0 ${hoverPadding}px`; // Add padding for hover area
+        threadDisplayContainer.style.position = 'relative';
+        threadDisplayContainer.style.maxWidth = `calc(450px + ${hoverPadding}px)`; // Expand container width
+
+        // Create an inner container for clipping the scroller
+        const clippingContainer = document.createElement('div');
+        clippingContainer.style.height = '100%';
+        clippingContainer.style.overflow = 'hidden';
+        clippingContainer.style.marginLeft = `-${hoverPadding}px`; // Pull content back to original position
+        threadDisplayContainer.appendChild(clippingContainer);
 
         const scroller = document.createElement('div');
         scroller.style.transition = 'transform 0.5s ease-in-out';
         scroller.style.position = 'relative';
         scroller.style.top = '-4px';
-        threadDisplayContainer.appendChild(scroller);
+        clippingContainer.appendChild(scroller); // Scroller goes inside the clipping container
 
-        const itemsToRender = [...threadDisplayObjects, ...threadDisplayObjects.slice(0, 3)];
+        const itemsToRender = (animationSpeed > 0)
+            ? [...threadDisplayObjects, ...threadDisplayObjects.slice(0, 3)]
+            : [...threadDisplayObjects];
         itemsToRender.forEach(thread => scroller.appendChild(createThreadListItemElement(thread, false)));
 
         let isResetting = false;
         threadTitleAnimationIndex = 0;
-        const intervalDuration = 4000 / animationSpeed;
+        const intervalDuration = animationSpeed > 0 ? 4000 / animationSpeed : 0;
+
+        const arrowContainer = document.createElement('div');
+        arrowContainer.style.cssText = `
+            position: absolute;
+            left: -20px;
+            top: 50%;
+            transform: translateY(calc(-50% - 4px));
+            display: flex;
+            flex-direction: column;
+            z-index: 10;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s ease-in-out;
+        `;
+        threadDisplayContainer.appendChild(arrowContainer); // Arrows are children of the main container
+
+        const upArrow = document.createElement('div');
+        upArrow.innerHTML = '&#9650;';
+        upArrow.style.cssText = 'cursor: pointer;';
+        arrowContainer.appendChild(upArrow);
+
+        const downArrow = document.createElement('div');
+        downArrow.innerHTML = '&#9660;';
+        downArrow.style.cssText = 'cursor: pointer;';
+        arrowContainer.appendChild(downArrow);
+
+        const stopAnimation = () => {
+            if (threadTitleAnimationInterval) {
+                clearInterval(threadTitleAnimationInterval);
+                threadTitleAnimationInterval = null;
+            }
+        };
+
+        const moveManually = (direction) => {
+            if (animationSpeed > 0 && isResetting) return;
+            stopAnimation();
+            threadTitleAnimationIndex += direction;
+
+            const totalItems = threadDisplayObjects.length;
+            const looping = animationSpeed > 0;
+
+            if (looping) {
+                if (threadTitleAnimationIndex >= totalItems) {
+                    threadTitleAnimationIndex = 0;
+                } else if (threadTitleAnimationIndex < 0) {
+                    threadTitleAnimationIndex = totalItems - 1;
+                }
+            } else {
+                const maxIndex = totalItems > 3 ? totalItems - 3 : 0;
+                if (threadTitleAnimationIndex > maxIndex) {
+                    threadTitleAnimationIndex = maxIndex;
+                }
+                if (threadTitleAnimationIndex < 0) {
+                    threadTitleAnimationIndex = 0;
+                }
+            }
+            scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+        };
+
+        upArrow.addEventListener('click', () => moveManually(-1));
+        downArrow.addEventListener('click', () => moveManually(1));
 
         const startAnimation = () => {
-            if (threadTitleAnimationInterval) clearInterval(threadTitleAnimationInterval);
+            if (animationSpeed <= 0) return;
+            stopAnimation();
             threadTitleAnimationInterval = setInterval(() => {
                 if (isResetting) return;
 
@@ -2113,12 +2193,17 @@ function renderThreadList() {
             }, intervalDuration);
         };
 
-        const stopAnimation = () => {
-            clearInterval(threadTitleAnimationInterval);
-        };
+        threadDisplayContainer.addEventListener('mouseenter', () => {
+            stopAnimation();
+            arrowContainer.style.opacity = '1';
+            arrowContainer.style.pointerEvents = 'auto';
+        });
 
-        threadDisplayContainer.addEventListener('mouseenter', stopAnimation);
-        threadDisplayContainer.addEventListener('mouseleave', startAnimation);
+        threadDisplayContainer.addEventListener('mouseleave', () => {
+            startAnimation();
+            arrowContainer.style.opacity = '0';
+            arrowContainer.style.pointerEvents = 'none';
+        });
 
         startAnimation();
     } else {
