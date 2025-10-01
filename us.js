@@ -2193,17 +2193,43 @@ function renderThreadList() {
             }, intervalDuration);
         };
 
-        threadDisplayContainer.addEventListener('mouseenter', () => {
+        const hoverZone = document.createElement('div');
+        hoverZone.style.cssText = `
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: ${hoverPadding}px;
+            height: 100%;
+            z-index: 9;
+        `;
+        threadDisplayContainer.appendChild(hoverZone);
+
+        let hideArrowsTimeout = null;
+
+        const showArrows = () => {
+            clearTimeout(hideArrowsTimeout);
             stopAnimation();
             arrowContainer.style.opacity = '1';
             arrowContainer.style.pointerEvents = 'auto';
-        });
+        };
 
-        threadDisplayContainer.addEventListener('mouseleave', () => {
-            startAnimation();
-            arrowContainer.style.opacity = '0';
-            arrowContainer.style.pointerEvents = 'none';
+        const hideArrows = () => {
+            hideArrowsTimeout = setTimeout(() => {
+                startAnimation();
+                arrowContainer.style.opacity = '0';
+                arrowContainer.style.pointerEvents = 'none';
+            }, 300); // 300ms delay
+        };
+
+        threadDisplayContainer.addEventListener('mouseenter', showArrows);
+        threadDisplayContainer.addEventListener('mouseleave', hideArrows);
+
+        // Keep arrows visible when hovering over them
+        arrowContainer.addEventListener('mouseenter', () => {
+            clearTimeout(hideArrowsTimeout);
         });
+        arrowContainer.addEventListener('mouseleave', hideArrows);
+
 
         startAnimation();
     } else {
