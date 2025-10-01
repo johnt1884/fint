@@ -2151,11 +2151,38 @@ function renderThreadList() {
 
             if (looping) {
                 if (threadTitleAnimationIndex >= totalItems) {
-                    threadTitleAnimationIndex = 0;
+                    // Animate to the first duplicate item
+                    scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+                    // After animation, reset to the top
+                    isResetting = true;
+                    setTimeout(() => {
+                        scroller.style.transition = 'none';
+                        threadTitleAnimationIndex = 0;
+                        scroller.style.transform = 'translateY(0)';
+                        void scroller.offsetWidth; // Force reflow
+                        scroller.style.transition = 'transform 0.5s ease-in-out';
+                        isResetting = false;
+                    }, 500); // Corresponds to transition duration
                 } else if (threadTitleAnimationIndex < 0) {
-                    threadTitleAnimationIndex = totalItems - 1;
+                    isResetting = true;
+                    // Jump to the end (duplicate of first item) without animation
+                    scroller.style.transition = 'none';
+                    threadTitleAnimationIndex = totalItems;
+                    scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+                    void scroller.offsetWidth; // Force reflow
+
+                    // Then, animate to the last "real" item almost immediately
+                    setTimeout(() => {
+                        scroller.style.transition = 'transform 0.5s ease-in-out';
+                        threadTitleAnimationIndex = totalItems - 1;
+                        scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+                        isResetting = false;
+                    }, 20);
+                } else {
+                    // Normal move
+                    scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
                 }
-            } else {
+            } else { // non-looping logic
                 const maxIndex = totalItems > 3 ? totalItems - 3 : 0;
                 if (threadTitleAnimationIndex > maxIndex) {
                     threadTitleAnimationIndex = maxIndex;
@@ -2163,8 +2190,8 @@ function renderThreadList() {
                 if (threadTitleAnimationIndex < 0) {
                     threadTitleAnimationIndex = 0;
                 }
+                scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
             }
-            scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
         };
 
         upArrow.addEventListener('click', () => moveManually(-1));
@@ -2174,6 +2201,7 @@ function renderThreadList() {
             if (animationSpeed <= 0) return;
             stopAnimation();
             threadTitleAnimationInterval = setInterval(() => {
+                if (document.hidden) return; // Do not animate if tab is not visible
                 if (isResetting) return;
 
                 threadTitleAnimationIndex++;
