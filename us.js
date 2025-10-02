@@ -154,6 +154,9 @@ document.addEventListener("visibilitychange", () => {
     let viewerActiveVideoCount = null; // For viewer-specific unique video count
     let backgroundRefreshIntervalId = null;
     let isManualRefreshInProgress = false;
+    let handleGuiMouseMoveForArrows = null;
+    let handleGuiMouseLeaveForArrows = null;
+    let handleGuiMouseEnterForArrows = null;
     let isSuspended = false;
     const BACKGROUND_REFRESH_INTERVAL = 30000; // 30 seconds
     let lastViewerScrollTop = 0; // To store scroll position
@@ -2050,6 +2053,12 @@ function renderThreadList() {
     threadDisplayContainer.style.flexDirection = 'column';
     threadDisplayContainer.style.maxWidth = ''; // Reset maxWidth
 
+    const gui = document.getElementById('otk-tracker-gui');
+    if (gui) {
+        if (handleGuiMouseMoveForArrows) gui.removeEventListener('mousemove', handleGuiMouseMoveForArrows);
+        if (handleGuiMouseLeaveForArrows) gui.removeEventListener('mouseleave', handleGuiMouseLeaveForArrows);
+        if (handleGuiMouseEnterForArrows) gui.removeEventListener('mouseenter', handleGuiMouseEnterForArrows);
+    }
 
     if (activeThreads.length === 0) return;
 
@@ -2076,29 +2085,27 @@ function renderThreadList() {
 
     if (threadDisplayObjects.length > 3) {
         const itemHeight = 28;
-        const hoverPadding = 25; // Space for arrows and hover buffer
+        const hoverPadding = 25;
 
-        // Configure the main container for relative positioning and visible overflow
         threadDisplayContainer.style.height = `${itemHeight * 3}px`;
-        threadDisplayContainer.style.overflow = 'visible'; // Allow arrows to be visible outside
+        threadDisplayContainer.style.overflow = 'visible';
         threadDisplayContainer.style.justifyContent = 'flex-start';
         threadDisplayContainer.style.boxSizing = 'border-box';
-        threadDisplayContainer.style.padding = `0 0 0 ${hoverPadding}px`; // Add padding for hover area
+        threadDisplayContainer.style.padding = `0 0 0 ${hoverPadding}px`;
         threadDisplayContainer.style.position = 'relative';
-        threadDisplayContainer.style.maxWidth = `calc(450px + ${hoverPadding}px)`; // Expand container width
+        threadDisplayContainer.style.maxWidth = `calc(450px + ${hoverPadding}px)`;
 
-        // Create an inner container for clipping the scroller
         const clippingContainer = document.createElement('div');
         clippingContainer.style.height = '100%';
         clippingContainer.style.overflow = 'hidden';
-        clippingContainer.style.marginLeft = `-${hoverPadding}px`; // Pull content back to original position
+        clippingContainer.style.marginLeft = `-${hoverPadding}px`;
         threadDisplayContainer.appendChild(clippingContainer);
 
         const scroller = document.createElement('div');
         scroller.style.transition = 'transform 0.5s ease-in-out';
         scroller.style.position = 'relative';
         scroller.style.top = '-4px';
-        clippingContainer.appendChild(scroller); // Scroller goes inside the clipping container
+        clippingContainer.appendChild(scroller);
 
         const itemsToRender = (animationSpeed > 0)
             ? [...threadDisplayObjects, ...threadDisplayObjects.slice(0, 3)]
@@ -2111,18 +2118,13 @@ function renderThreadList() {
 
         const arrowContainer = document.createElement('div');
         arrowContainer.style.cssText = `
-            position: absolute;
-            left: -20px;
-            top: 50%;
+            position: absolute; left: -20px; top: 50%;
             transform: translateY(calc(-50% - 4px));
-            display: flex;
-            flex-direction: column;
-            z-index: 10;
-            opacity: 0;
-            pointer-events: none;
+            display: flex; flex-direction: column; z-index: 10;
+            opacity: 0; pointer-events: none;
             transition: opacity 0.2s ease-in-out;
         `;
-        threadDisplayContainer.appendChild(arrowContainer); // Arrows are children of the main container
+        threadDisplayContainer.appendChild(arrowContainer);
 
         const upArrow = document.createElement('div');
         upArrow.innerHTML = '&#9650;';
@@ -2141,79 +2143,19 @@ function renderThreadList() {
             }
         };
 
-        const moveManually = (direction) => {
-            if (animationSpeed > 0 && isResetting) return;
-            stopAnimation();
-            threadTitleAnimationIndex += direction;
-
-            const totalItems = threadDisplayObjects.length;
-            const looping = animationSpeed > 0;
-
-            if (looping) {
-                if (threadTitleAnimationIndex >= totalItems) {
-                    // Animate to the first duplicate item
-                    scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
-                    // After animation, reset to the top
-                    isResetting = true;
-                    setTimeout(() => {
-                        scroller.style.transition = 'none';
-                        threadTitleAnimationIndex = 0;
-                        scroller.style.transform = 'translateY(0)';
-                        void scroller.offsetWidth; // Force reflow
-                        scroller.style.transition = 'transform 0.5s ease-in-out';
-                        isResetting = false;
-                    }, 500); // Corresponds to transition duration
-                } else if (threadTitleAnimationIndex < 0) {
-                    isResetting = true;
-                    // Jump to the end (duplicate of first item) without animation
-                    scroller.style.transition = 'none';
-                    threadTitleAnimationIndex = totalItems;
-                    scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
-                    void scroller.offsetWidth; // Force reflow
-
-                    // Then, animate to the last "real" item almost immediately
-                    setTimeout(() => {
-                        scroller.style.transition = 'transform 0.5s ease-in-out';
-                        threadTitleAnimationIndex = totalItems - 1;
-                        scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
-                        isResetting = false;
-                    }, 20);
-                } else {
-                    // Normal move
-                    scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
-                }
-            } else { // non-looping logic
-                const maxIndex = totalItems > 3 ? totalItems - 3 : 0;
-                if (threadTitleAnimationIndex > maxIndex) {
-                    threadTitleAnimationIndex = maxIndex;
-                }
-                if (threadTitleAnimationIndex < 0) {
-                    threadTitleAnimationIndex = 0;
-                }
-                scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
-            }
-        };
-
-        upArrow.addEventListener('click', () => moveManually(-1));
-        downArrow.addEventListener('click', () => moveManually(1));
-
         const startAnimation = () => {
-            if (animationSpeed <= 0) return;
-            stopAnimation();
+            if (animationSpeed <= 0 || threadTitleAnimationInterval) return;
             threadTitleAnimationInterval = setInterval(() => {
-                if (document.hidden) return; // Do not animate if tab is not visible
-                if (isResetting) return;
-
+                if (document.hidden || isResetting) return;
                 threadTitleAnimationIndex++;
                 scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
-
                 if (threadTitleAnimationIndex >= threadDisplayObjects.length) {
                     isResetting = true;
                     setTimeout(() => {
                         scroller.style.transition = 'none';
                         threadTitleAnimationIndex = 0;
                         scroller.style.transform = 'translateY(0)';
-                        void scroller.offsetWidth; // Force reflow
+                        void scroller.offsetWidth;
                         scroller.style.transition = 'transform 0.5s ease-in-out';
                         isResetting = false;
                     }, 500);
@@ -2221,19 +2163,51 @@ function renderThreadList() {
             }, intervalDuration);
         };
 
-        const hoverZone = document.createElement('div');
-        hoverZone.style.cssText = `
-            position: absolute;
-            left: 0;
-            top: 0;
-            width: ${hoverPadding}px;
-            height: 100%;
-            z-index: 9;
-        `;
-        threadDisplayContainer.appendChild(hoverZone);
+        const moveManually = (direction) => {
+            if (animationSpeed > 0 && isResetting) return;
+            stopAnimation();
+            threadTitleAnimationIndex += direction;
+            const totalItems = threadDisplayObjects.length;
+            const looping = animationSpeed > 0;
+
+            if (looping) {
+                if (threadTitleAnimationIndex >= totalItems) {
+                    scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+                    isResetting = true;
+                    setTimeout(() => {
+                        scroller.style.transition = 'none';
+                        threadTitleAnimationIndex = 0;
+                        scroller.style.transform = 'translateY(0)';
+                        void scroller.offsetWidth;
+                        scroller.style.transition = 'transform 0.5s ease-in-out';
+                        isResetting = false;
+                    }, 500);
+                } else if (threadTitleAnimationIndex < 0) {
+                    isResetting = true;
+                    scroller.style.transition = 'none';
+                    threadTitleAnimationIndex = totalItems;
+                    scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+                    void scroller.offsetWidth;
+                    setTimeout(() => {
+                        scroller.style.transition = 'transform 0.5s ease-in-out';
+                        threadTitleAnimationIndex = totalItems - 1;
+                        scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+                        isResetting = false;
+                    }, 20);
+                } else {
+                    scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+                }
+            } else {
+                const maxIndex = totalItems > 3 ? totalItems - 3 : 0;
+                threadTitleAnimationIndex = Math.max(0, Math.min(threadTitleAnimationIndex, maxIndex));
+                scroller.style.transform = `translateY(-${threadTitleAnimationIndex * itemHeight}px)`;
+            }
+        };
+
+        upArrow.addEventListener('click', () => moveManually(-1));
+        downArrow.addEventListener('click', () => moveManually(1));
 
         let hideArrowsTimeout = null;
-
         const showArrows = () => {
             clearTimeout(hideArrowsTimeout);
             stopAnimation();
@@ -2243,21 +2217,31 @@ function renderThreadList() {
 
         const hideArrows = () => {
             hideArrowsTimeout = setTimeout(() => {
-                startAnimation();
                 arrowContainer.style.opacity = '0';
                 arrowContainer.style.pointerEvents = 'none';
-            }, 300); // 300ms delay
+                startAnimation();
+            }, 300);
         };
 
-        threadDisplayContainer.addEventListener('mouseenter', showArrows);
-        threadDisplayContainer.addEventListener('mouseleave', hideArrows);
+        if (gui) {
+            const statsWrapper = document.getElementById('otk-stats-wrapper');
+            handleGuiMouseMoveForArrows = (e) => {
+                if (statsWrapper) {
+                    const statsRect = statsWrapper.getBoundingClientRect();
+                    if (e.clientX < statsRect.left) {
+                        showArrows();
+                    } else {
+                        hideArrows();
+                    }
+                }
+            };
+            handleGuiMouseLeaveForArrows = hideArrows;
+            handleGuiMouseEnterForArrows = () => clearTimeout(hideArrowsTimeout);
 
-        // Keep arrows visible when hovering over them
-        arrowContainer.addEventListener('mouseenter', () => {
-            clearTimeout(hideArrowsTimeout);
-        });
-        arrowContainer.addEventListener('mouseleave', hideArrows);
-
+            gui.addEventListener('mousemove', handleGuiMouseMoveForArrows);
+            gui.addEventListener('mouseleave', handleGuiMouseLeaveForArrows);
+            arrowContainer.addEventListener('mouseenter', handleGuiMouseEnterForArrows);
+        }
 
         startAnimation();
     } else {
