@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Post Button & Network Logger (Persistent)
+// @name         Post Button & Network Logger (Persistent + PID Saver)
 // @namespace    yournamespace
-// @version      1.4
-// @description  Logs all post data and responses on 4chan, keeps watching for Post buttons
+// @version      1.5
+// @description  Logs all post data and responses on 4chan, keeps watching for Post buttons, saves PIDs/TIDs to localStorage
 // @match        *://boards.4chan.org/*
 // @match        *://sys.4chan.org/*
 // @match        *://*/post*
@@ -13,6 +13,38 @@
     'use strict';
     console.log("[PostLogger] Script loaded in window:", window.location.href);
 
+    // ---- Utility: save to localStorage history ----
+    function savePostIds(json) {
+        if (!json || !json.pid) return;
+
+        // Retrieve history from localStorage (or start new)
+        let history = [];
+        try {
+            history = JSON.parse(localStorage.getItem("postHistory") || "[]");
+        } catch (e) {
+            console.warn("[PostLogger] Failed to parse existing history, resetting.");
+        }
+
+        const entry = {
+            tid: json.tid || null,
+            pid: json.pid,
+            time: new Date().toISOString(),
+            url: window.location.href
+        };
+
+        history.push(entry);
+
+        // Keep history in localStorage
+        localStorage.setItem("postHistory", JSON.stringify(history, null, 2));
+
+        // Also store latest separately
+        if (json.pid) localStorage.setItem("lastPostPid", json.pid);
+        if (json.tid) localStorage.setItem("lastPostTid", json.tid);
+
+        console.log("[PostLogger] Saved post IDs:", entry);
+        console.log("[PostLogger] Current history length:", history.length);
+    }
+
     // ---- Patch fetch ----
     const origFetch = window.fetch;
     window.fetch = async function(...args) {
@@ -20,8 +52,13 @@
         try {
             const response = await origFetch.apply(this, args);
             console.log("[PostLogger] fetch() response object:", response);
-            response.clone().text().then(t => {
-                console.log("[PostLogger] fetch() response text:", t);
+            const clone = response.clone();
+            clone.text().then(text => {
+                console.log("[PostLogger] fetch() response text:", text);
+                try {
+                    const json = JSON.parse(text);
+                    savePostIds(json);
+                } catch (err) { /* ignore non-JSON */ }
             });
             return response;
         } catch (err) {
@@ -45,6 +82,10 @@
         if (this._postLogger) {
             this.addEventListener("load", function() {
                 console.log("[PostLogger] XHR response from", this._postLogger.url, ":", this.responseText);
+                try {
+                    const json = JSON.parse(this.responseText);
+                    savePostIds(json);
+                } catch (err) { /* ignore non-JSON */ }
             });
         }
         return origSend.call(this, body);
