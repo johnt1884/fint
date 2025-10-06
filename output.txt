@@ -1,0 +1,10 @@
+Post Button & Network Logger (Persistent).user.js:14 [PostLogger] Script loaded in window: https://boards.4chan.org/b/
+Post Button & Network Logger (Persistent).user.js:63 [PostLogger] Found Post button: <input type=​"submit" value=​"Post" tabindex=​"10">​
+Post Button & Network Logger (Persistent).user.js:92 [PostLogger] MutationObserver started: will catch future buttons too.
+Post Button & Network Logger (Persistent).user.js:63 [PostLogger] Found Post button: <input type=​"submit" value=​"Post" tabindex=​"0">​
+Post Button & Network Logger (Persistent).user.js:63 [PostLogger] Found Post button: <input type=​"submit" value=​"Post" tabindex=​"0">​
+Post Button & Network Logger (Persistent).user.js:65 [PostLogger] Post button clicked: <input type=​"submit" value=​"Sending" tabindex=​"0">​
+Post Button & Network Logger (Persistent).user.js:71 [PostLogger] Form data at click: {MAX_FILE_SIZE: '2097152', mode: 'regist', resto: '940758784', name: '', email: '', …}
+Post Button & Network Logger (Persistent).user.js:39 [PostLogger] XHR.open() → POST https://sys.4chan.org/b/post
+Post Button & Network Logger (Persistent).user.js:44 [PostLogger] XHR.send() → body: FormData {}
+Post Button & Network Logger (Persistent).user.js:47 [PostLogger] XHR response from https://sys.4chan.org/b/post : {"tid":940758784,"pid":940760808}
